@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>P2-D discovery fixture</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", sans-serif; width: 1280px; }
+    .col { width: 720px; padding: 16px; }
+    #main_price { color: #e4393c; font-size: 28px; margin: 12px 0; }
+    .title-wrap { margin: 8px 0; }
+    .title-wrap .inner { font-size: 16px; }
+    .spec { margin: 12px 0; padding: 8px; background: #f7f7f7; }
+    .promo { margin: 8px 0; }
+    .shop-real { margin: 16px 0; font-weight: 600; }
+    .boilerplate { margin-top: 40px; color: #666; font-size: 13px; line-height: 1.5; }
+    .recommend {
+      position: absolute; left: 900px; top: 80px; width: 320px;
+      border-left: 1px solid #eee; padding: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="col">
+    <div id="main_price">¥168.00</div>
+    <!-- Nested same-title: parent + child both contain B913A (should dedupe). -->
+    <div class="title-wrap" id="title_parent">
+      <div class="inner" id="title_child">清风 B913A 1层三折200张擦手纸</div>
+    </div>
+    <div class="spec">
+      <!-- Label node separate from option/qty siblings (matches real JD failure mode). -->
+      <div class="spec-core">
+        <span class="label">已选</span>
+        <span class="option">1层200抽*20包【超大尺寸】，1个</span>
+      </div>
+      <div class="spec-side">本商品支持京东保障服务，点击可选服务</div>
+    </div>
+    <div class="promo">优惠 满送 满129元即赠热销商品，赠完即止</div>
+    <div class="shop-real">清风京东自营旗舰店</div>
+    <div class="ship">送至 北京朝阳区三环到四环之间</div>
+    <div class="boilerplate">
+      服务承诺 京东商城向您保证所售商品均为正品行货，京东自营商品开具机打发票或电子发票。
+      凭质保证书及京东商城发票，可享受全国联保服务。
+    </div>
+  </div>
+  <!-- Off-main-column recommend also contains B913A — must not win title. -->
+  <div class="recommend">
+    <div>推荐商品</div>
+    <div>其他纸巾 B913A 试用装</div>
+    <div>某某专营店</div>
+  </div>
+</body>
+</html>

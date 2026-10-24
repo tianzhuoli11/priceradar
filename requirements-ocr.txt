@@ -1,0 +1,5 @@
+# Optional OCR stack for P4-A (install into project .venv only).
+# Browser/base deps remain in requirements.txt (playwright).
+rapidocr==3.10.0
+onnxruntime==1.31.0
+Pillow==13.0.0

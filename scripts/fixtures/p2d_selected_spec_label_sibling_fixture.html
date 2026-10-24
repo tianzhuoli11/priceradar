@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>P2-D selected-spec label + sibling fixture</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", sans-serif; width: 780px; }
+    #main_price { color: #e4393c; font-size: 24px; margin: 16px; }
+    .row { margin: 12px 16px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+    .label { color: #666; }
+    .option { color: #111; }
+    .warranty { margin: 8px 16px; color: #888; font-size: 13px; }
+    .ship { margin: 8px 16px; color: #888; }
+    .promo { margin: 8px 16px; }
+  </style>
+</head>
+<body>
+  <div id="main_price">¥168.00</div>
+  <div class="title">清风 B913A 擦手纸</div>
+  <!-- Real JD-like: 「已选」label is its own node; option+qty are siblings. -->
+  <div class="row" id="spec_row">
+    <span class="label" id="spec_label">已选</span>
+    <span class="option" id="spec_option">1层200抽*20包【超大尺寸】，1个</span>
+  </div>
+  <div class="warranty" id="warranty" hidden>本商品支持京东保障服务，点击可选服务</div>
+  <div class="promo">优惠 满送 满129元即赠</div>
+  <div class="ship">送至 北京朝阳区三环到四环之间</div>
+  <script>
+    // Async warranty appearance (must not change core selection).
+    setTimeout(() => {
+      const w = document.getElementById('warranty');
+      if (w) w.hidden = false;
+    }, 80);
+  </script>
+</body>
+</html>

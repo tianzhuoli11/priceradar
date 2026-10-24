@@ -1,0 +1,9 @@
+.venv/
+browser_profiles/
+artifacts/
+models/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example

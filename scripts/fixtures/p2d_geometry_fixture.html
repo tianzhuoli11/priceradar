@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>P2-D geometry fixture</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    .spacer { height: 900px; background: #f3f3f3; }
+    .wrap { padding: 24px; }
+    #main_price {
+      display: inline-block;
+      color: #e4393c;
+      font-size: 28px;
+      line-height: 1;
+      /* Intentional: layout box shorter than ink so overflow must be padded. */
+      height: 22px;
+      overflow: visible;
+    }
+    #main_price em { font-style: normal; font-size: 34px; }
+    #main_price .price_decimals { font-size: 18px; }
+    .marker {
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      background: lime;
+    }
+  </style>
+</head>
+<body>
+  <div class="spacer">scroll spacer</div>
+  <div class="wrap">
+    <div id="main_price"><span>¥<em>168</em><span class="price_decimals">.00</span></span></div>
+  </div>
+  <div class="spacer">bottom spacer</div>
+</body>
+</html>

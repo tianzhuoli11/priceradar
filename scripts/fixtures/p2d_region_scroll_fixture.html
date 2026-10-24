@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>P2-D region scroll / safe-band fixture</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", sans-serif; }
+    .top-bar {
+      position: fixed; top: 0; left: 0; right: 0; height: 48px;
+      background: #111; color: #fff; z-index: 50; line-height: 48px; padding-left: 12px;
+    }
+    .bottom-bar {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 56px;
+      background: #c00; color: #fff; z-index: 50; line-height: 56px; padding-left: 12px;
+    }
+    .pad { height: 900px; background: #f5f5f5; }
+    #main_price { color: #e4393c; font-size: 28px; margin: 12px 16px; }
+    .title { margin: 8px 16px; }
+    .spec { margin: 12px 16px; padding: 8px; background: #fff; }
+    .promo { margin: 12px 16px; padding: 8px; background: #fff7e6; }
+    .shop {
+      margin: 40px 16px 120px;
+      padding: 12px 16px;
+      background: #fff;
+      border: 1px solid #ddd;
+      display: inline-block;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div class="top-bar">fixed top chrome</div>
+  <div class="pad">spacer above</div>
+  <div id="main_price">¥168.00</div>
+  <div class="title">清风 B913A 擦手纸</div>
+  <div class="spec">已选 1层200抽*20包【超大尺寸】，1个</div>
+  <div class="promo">优惠 满送 满129元即赠热销商品，赠完即止</div>
+  <div class="pad" style="height:400px">mid spacer</div>
+  <div class="shop" id="shop_name">清风京东自营旗舰店 100+商品</div>
+  <div class="pad" style="height:500px">bottom spacer</div>
+  <div class="bottom-bar">fixed bottom chrome</div>
+</body>
+</html>

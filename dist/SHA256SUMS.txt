@@ -1,0 +1,2 @@
+deb2e60f50b650789d43b223703b4b1766f362d444a688ec890466a80f4da696  priceradar-workbuddy-skill-v1.zip
+b542a543253cfc12d735c279b4459834c274387302aba9e33cff9dfcde2809bb  priceradar-project-v1.zip
