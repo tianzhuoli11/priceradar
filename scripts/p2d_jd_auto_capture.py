@@ -354,16 +354,47 @@ def product_paths_for_id(product_id: str) -> tuple[str, ...]:
     return (f"/product/{product_id}.html", f"/product/{product_id}")
 
 
+def extract_product_id_from_detail_url(url: str) -> str | None:
+    """Parse digits from item.jd.com/{id}.html or item.m.jd.com/product/{id}.html."""
+    parts = urlsplit(url or "")
+    host = parts.netloc.lower()
+    path = parts.path or ""
+    if host == "item.m.jd.com":
+        m = re.search(r"/product/(\d+)\.html", path, re.IGNORECASE)
+        return m.group(1) if m else None
+    if host == "item.jd.com":
+        m = re.search(r"/(\d+)\.html$", path)
+        return m.group(1) if m else None
+    return None
+
+
 def is_target_product_url(
     url: str,
     *,
     product_id: str | None = None,
-    host: str = EXPECTED_HOST,
+    host: str | None = None,
 ) -> bool:
+    """
+    Identity: allowed detail hosts + URL product id must equal expected id.
+    host=None → accept item.m.jd.com or item.jd.com (Phase A candidate adapt).
+    host set → legacy strict single-host check (CLI sample default).
+    """
     parts = urlsplit(url)
-    if parts.netloc.lower() != host.lower():
-        return False
+    netloc = parts.netloc.lower()
     pid = product_id or EXPECTED_PRODUCT_ID
+    extracted = extract_product_id_from_detail_url(url)
+    if extracted is not None and extracted == pid:
+        if host is None:
+            return netloc in {"item.m.jd.com", "item.jd.com"}
+        return netloc == host.lower()
+    # Legacy path equality for m.jd when extract failed oddly
+    if host is not None and netloc != host.lower():
+        return False
+    if host is None and netloc not in {"item.m.jd.com", "item.jd.com"}:
+        return False
+    check_host = host or EXPECTED_HOST
+    if netloc != check_host.lower():
+        return False
     allowed = set(product_paths_for_id(pid))
     allowed.update(p.rstrip("/") for p in tuple(allowed))
     path = parts.path
@@ -700,8 +731,14 @@ def locate_selected_spec_region(page: Page) -> dict[str, Any]:
     )
 
 
-def discover_regions(page: Page) -> dict[str, Any]:
-    """Semantic, evidence-based region discovery near #main_price (no invented CSS)."""
+def discover_regions(
+    page: Page, *, model_clue: str | None = None
+) -> dict[str, Any]:
+    """
+    Semantic region discovery near #main_price (no invented CSS).
+    model_clue: business expected model for title locate; default CLI sample.
+    """
+    model_clue = (model_clue or CLUE_MODEL).strip() or CLUE_MODEL
     result = page.evaluate(
         """({ model, selectedClue, promoClue, shipTo, shopHints, shopExclude, maxH, maxWRatio }) => {
             const main = document.querySelector('#main_price');
@@ -1105,7 +1142,7 @@ def discover_regions(page: Page) -> dict[str, Any]:
             return result;
         }""",
         {
-            "model": CLUE_MODEL,
+            "model": model_clue,
             "selectedClue": CLUE_SELECTED,
             "promoClue": CLUE_PROMO,
             "shipTo": CLUE_SHIP_TO,
@@ -2720,14 +2757,17 @@ def run_auto_capture(
 
                 if navigation_ok:
                     try:
+                        # Accept item.m.jd.com or item.jd.com; id must match candidate.
                         identity_ok = is_target_product_url(
-                            page.url, product_id=target_id
+                            page.url, product_id=target_id, host=None
                         )
                         final_url_safe = url_without_query_or_fragment(page.url)
                     except PlaywrightError:
                         identity_ok = False
                     if identity_ok:
-                        _log("商品身份检查: 通过（host+path 严格匹配）")
+                        _log(
+                            "商品身份检查: 通过（允许详情主机 + 商品ID一致）"
+                        )
                     else:
                         navigation_status = "WRONG_PAGE_OR_CHALLENGE"
                         error = (
@@ -2768,7 +2808,13 @@ def run_auto_capture(
 
                     _log("")
                     _log("=== 语义发现标题/规格/优惠/店铺 ===")
-                    discovery_raw = discover_regions(page)
+                    model_for_clue = str(
+                        (expected or {}).get("model") or CLUE_MODEL
+                    ).strip() or CLUE_MODEL
+                    _log(f"  标题型号线索: {model_for_clue!r}")
+                    discovery_raw = discover_regions(
+                        page, model_clue=model_for_clue
+                    )
                     for key in (
                         "product_title",
                         "selected_spec",

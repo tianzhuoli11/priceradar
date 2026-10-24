@@ -34,6 +34,10 @@ MAX_SCROLLS = 3
 SCROLL_PAUSE_MS = 800
 SCROLL_BUDGET_MS = 8_000
 EXTRACT_TIMEOUT_MS = 20_000
+# After DOMContentLoaded, wait for either goods cards or a blocking tip.
+RESULT_READY_TIMEOUT_MS = 12_000
+# New JD search UI uses div[data-sku] cards; classic item.jd.com anchors may be absent.
+RESULT_CARD_SELECTOR = "[data-sku]"
 
 # Accepted detail URL path patterns (digits = JD product id).
 RE_ITEM_JD = re.compile(
@@ -371,6 +375,76 @@ def diagnose_page_state(page: Page) -> str | None:
     return None
 
 
+def wait_for_search_content(page: Page) -> dict[str, Any]:
+    """
+    Wait briefly for goods cards or an explicit block tip.
+
+    Does not refresh or change URL. Returns wait outcome for metadata.
+    """
+    started = utc_now()
+    outcome = "timeout_no_cards_no_tip"
+    try:
+        page.wait_for_function(
+            """({ cardSel, phrases }) => {
+                if (document.querySelector(cardSel)) return 'cards';
+                const text = (document.body && document.body.innerText) || '';
+                for (const p of phrases) {
+                    if (text.includes(p)) return 'restricted_tip';
+                }
+                if (
+                    text.includes('安全验证')
+                    || text.includes('验证码')
+                    || text.includes('滑动验证')
+                    || text.includes('请完成验证')
+                ) {
+                    return 'verification';
+                }
+                return false;
+            }""",
+            arg={
+                "cardSel": RESULT_CARD_SELECTOR,
+                "phrases": list(SEARCH_RESTRICTED_PHRASES),
+            },
+            timeout=RESULT_READY_TIMEOUT_MS,
+        )
+        # Re-check which signal won (wait_for_function only tells us something matched).
+        if detect_search_restriction(page):
+            outcome = "restricted_tip"
+        else:
+            try:
+                visible = collect_visible_text(page, max_chars=4000)
+            except PlaywrightError:
+                visible = ""
+            if any(
+                k in visible
+                for k in ("安全验证", "验证码", "滑动验证", "请完成验证")
+            ):
+                outcome = "verification"
+            elif page.locator(RESULT_CARD_SELECTOR).count() > 0:
+                outcome = "cards_present"
+            else:
+                outcome = "signal_unclear"
+    except PlaywrightError as exc:
+        # Timeout or page closed — still useful as metadata.
+        if detect_search_restriction(page):
+            outcome = "restricted_tip_after_wait_error"
+        else:
+            outcome = f"wait_error:{type(exc).__name__}"
+
+    elapsed_ms = int((utc_now() - started).total_seconds() * 1000)
+    card_count = 0
+    try:
+        card_count = page.locator(RESULT_CARD_SELECTOR).count()
+    except PlaywrightError:
+        pass
+    return {
+        "result_ready_timeout_ms": RESULT_READY_TIMEOUT_MS,
+        "wait_elapsed_ms": elapsed_ms,
+        "wait_outcome": outcome,
+        "data_sku_count_after_wait": card_count,
+    }
+
+
 def limited_scroll_for_lazy_load(page: Page) -> dict[str, Any]:
     """Scroll a few times, but stop immediately if search becomes restricted."""
     scrolls = 0
@@ -423,8 +497,11 @@ def limited_scroll_for_lazy_load(page: Page) -> dict[str, Any]:
 
 def extract_raw_candidates(page: Page) -> dict[str, Any]:
     """
-    Auto-discover product anchors on the rendered search page.
-    Strategy pending real JD structure verification; based on common detail URL shapes.
+    Auto-discover product candidates on the rendered search page.
+
+    Supports:
+    - Classic item.jd.com / item.m.jd.com anchors (legacy list UI)
+    - New search cards: div[data-sku] (observed 2026-10; may lack item hrefs)
     """
     return page.evaluate(
         """() => {
@@ -460,6 +537,8 @@ def extract_raw_candidates(page: Page) -> dict[str, Any]:
             );
 
             const rows = [];
+            const seenSku = new Set();
+
             for (const a of anchors) {
                 if (isForbiddenZone(a)) continue;
                 const href = abs(a.getAttribute('href') || '');
@@ -467,7 +546,10 @@ def extract_raw_candidates(page: Page) -> dict[str, Any]:
                 // Skip obvious non-product paths
                 if (/passport|cart|order|login|mall\\.jd\\.com\\/index/i.test(href)) continue;
 
-                let card = a.closest('li') || a.closest('[class*="gl-item"]') || a.parentElement;
+                let card = a.closest('li')
+                    || a.closest('[class*="gl-item"]')
+                    || a.closest('[data-sku]')
+                    || a.parentElement;
                 let hops = 0;
                 while (card && hops < 6) {
                     const r = card.getBoundingClientRect();
@@ -481,7 +563,6 @@ def extract_raw_candidates(page: Page) -> dict[str, Any]:
                 const titleText = (a.innerText || '').replace(/\\s+/g, ' ').trim();
                 let title = titleAttr || titleText;
                 if (!title || title.length < 4) {
-                    // fallback: first long line in card
                     const lines = cardText.split(' ').filter((x) => x.length >= 6);
                     title = lines[0] || titleText || titleAttr || '';
                 }
@@ -501,8 +582,14 @@ def extract_raw_candidates(page: Page) -> dict[str, Any]:
                     || !!(card && card.querySelector('[class*="ad"], [class*="AD"]'));
 
                 const rect = a.getBoundingClientRect();
+                const skuFromCard = card && card.getAttribute
+                    ? (card.getAttribute('data-sku') || '')
+                    : '';
+                if (skuFromCard) seenSku.add(skuFromCard);
                 rows.push({
                     href,
+                    product_id_hint: skuFromCard || null,
+                    source: 'item_anchor',
                     title: title.slice(0, 200),
                     shop,
                     ad_marked,
@@ -512,10 +599,76 @@ def extract_raw_candidates(page: Page) -> dict[str, Any]:
                 });
             }
 
-            // Sort by document order (y then appearance)
+            // New JD search UI: goods cards expose data-sku without item.jd.com anchors.
+            const cards = Array.from(document.querySelectorAll('[data-sku]'));
+            for (const card of cards) {
+                if (isForbiddenZone(card)) continue;
+                const sku = (card.getAttribute('data-sku') || '').trim();
+                if (!sku || !/^\\d{5,}$/.test(sku)) continue;
+                if (seenSku.has(sku)) continue;
+                seenSku.add(sku);
+
+                const rect = card.getBoundingClientRect();
+                if (!(rect.width || rect.height)) continue;
+
+                const cardText = (card.innerText || '').replace(/\\s+/g, ' ').trim();
+                let title = '';
+                const titled = card.querySelector('[title]');
+                if (titled) {
+                    title = (titled.getAttribute('title') || '').trim();
+                }
+                if (!title || title.length < 4) {
+                    // Drop leading 广告 marker; take a long-enough phrase as title.
+                    const cleaned = cardText.replace(/^广告\\s*/, '');
+                    const parts = cleaned.split(/\\s+/).filter((x) => x.length >= 4);
+                    // Prefer a part that looks like a product name (has CJK or model).
+                    title = parts.find((p) => /[\\u4e00-\\u9fff]|B\\d/i.test(p))
+                        || parts[0]
+                        || cleaned.slice(0, 80);
+                }
+
+                let shop = null;
+                const shopEl = card.querySelector(
+                    '[class*="shop"], [class*="store"], a[href*="mall.jd.com"]'
+                );
+                if (shopEl) {
+                    const s = (shopEl.innerText || '').replace(/\\s+/g, ' ').trim();
+                    if (s && s.length <= 40) shop = s;
+                }
+                if (!shop) {
+                    // Shop name is often the last short token on the card.
+                    const tokens = cardText.split(' ').filter(Boolean);
+                    const last = tokens[tokens.length - 1] || '';
+                    if (
+                        last.length >= 2
+                        && last.length <= 30
+                        && /店|旗舰|专营|自营/.test(last)
+                    ) {
+                        shop = last;
+                    }
+                }
+
+                const ad_marked = /^广告/.test(cardText)
+                    || /广告|推广/.test(cardText.slice(0, 12));
+
+                rows.push({
+                    // Construct desktop detail URL from observed numeric sku on the card.
+                    href: 'https://item.jd.com/' + sku + '.html',
+                    product_id_hint: sku,
+                    source: 'data_sku_card',
+                    title: String(title || '').slice(0, 200),
+                    shop,
+                    ad_marked,
+                    in_forbidden_zone: false,
+                    y: rect.top + window.scrollY,
+                    visible: true,
+                });
+            }
+
             rows.sort((a, b) => a.y - b.y);
             return {
                 anchor_count_raw: anchors.length,
+                data_sku_card_count: cards.length,
                 candidate_rows: rows,
                 page_title: document.title || '',
                 final_url: location.href,
@@ -546,17 +699,37 @@ def build_candidate_records(
                 continue
         title = str(row.get("title") or "")
         ad_marked = bool(row.get("ad_marked"))
+        source = str(row.get("source") or "item_anchor")
+        normalize_status = info.get("normalize_status")
+        if source == "data_sku_card" and info.get("product_id"):
+            # Page had numeric data-sku; detail href was constructed (no item anchor).
+            normalize_status = "constructed_from_data_sku"
+        # Prefer explicit data-sku when present and consistent.
+        product_id = info.get("product_id")
+        hint = row.get("product_id_hint")
+        if hint and str(hint).isdigit():
+            if not product_id:
+                product_id = str(hint)
+            elif str(product_id) != str(hint):
+                # Keep classified id from href; record mismatch only via status.
+                normalize_status = f"{normalize_status};data_sku_mismatch"
         record = {
             "query": query,
             "rank": None,  # filled after dedupe
             "title": title,
-            "product_id": info.get("product_id"),
+            "product_id": product_id,
             "shop_name": row.get("shop"),
             "ad_marked": ad_marked,
             "ad_status": "页面有广告标识" if ad_marked else "未发现广告标识，不能断言非广告",
             "observed_url": info.get("observed_url"),
-            "normalized_url": info.get("normalized_url"),
-            "normalize_status": info.get("normalize_status"),
+            "normalized_url": info.get("normalized_url")
+            or (
+                f"https://item.jd.com/{product_id}.html"
+                if source == "data_sku_card" and product_id
+                else None
+            ),
+            "normalize_status": normalize_status,
+            "discovery_source": source,
             "source_search_url": sanitize_source_search_url(source_url),
             "discovered_at_utc": utc_iso(),
             "match_status": match_status_for_title(title, query),
@@ -596,6 +769,7 @@ def write_candidates_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
         "observed_url",
         "normalized_url",
         "normalize_status",
+        "discovery_source",
         "source_search_url",
         "discovered_at_utc",
         "match_status",
@@ -626,6 +800,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=5,
         help=f"Max unique candidates (1..{MAX_LIMIT})",
+    )
+    parser.add_argument(
+        "--auto-close",
+        action="store_true",
+        help="Close browser without waiting for Enter (for non-interactive diagnose runs)",
     )
     return parser.parse_args(argv)
 
@@ -707,6 +886,31 @@ def run_local_logic_checks() -> list[str]:
     )
     if empty:
         failures.append("empty extraction must not invent candidates")
+
+    # data-sku card path (constructed detail URL; not a hardcoded fallback list)
+    sku_rows = [
+        {
+            "title": "清风擦手纸B913A 1层200张20包",
+            "href": "https://item.jd.com/10124562600570.html",
+            "shop": "清风清洁旗舰店",
+            "ad_marked": False,
+            "source": "data_sku_card",
+            "product_id_hint": "10124562600570",
+        }
+    ]
+    sku_classified, _ = build_candidate_records(
+        sku_rows, query="清风 B913A", limit=5, source_url=build_search_url("清风 B913A")
+    )
+    if len(sku_classified) != 1:
+        failures.append("data_sku_card row should yield one candidate")
+    elif sku_classified[0].get("normalize_status") != "constructed_from_data_sku":
+        failures.append("data_sku_card normalize_status wrong")
+    elif sku_classified[0].get("product_id") != "10124562600570":
+        failures.append("data_sku_card product_id wrong")
+    elif sku_classified[0].get("discovery_source") != "data_sku_card":
+        failures.append("discovery_source should be data_sku_card")
+    elif sku_classified[0].get("price") is not None:
+        failures.append("data_sku candidate price must be null")
 
     # Restriction tip matching (local text only; not live JD).
     tip = match_search_restricted_tip(
@@ -847,117 +1051,157 @@ def main(argv: list[str] | None = None) -> int:
                                     "提取策略待真实验证。"
                                 )
 
-                            scroll_info = limited_scroll_for_lazy_load(page)
+                            wait_info = wait_for_search_content(page)
+                            scroll_info["result_wait"] = wait_info
                             print(
-                                f"有限滚动: count={scroll_info.get('scroll_count')} "
-                                f"stopped={scroll_info.get('stopped_reason')} "
-                                f"budget_ms={SCROLL_BUDGET_MS}"
+                                f"结果等待: outcome={wait_info.get('wait_outcome')} "
+                                f"data_sku={wait_info.get('data_sku_count_after_wait')} "
+                                f"elapsed_ms={wait_info.get('wait_elapsed_ms')}"
                             )
-                            if scroll_info.get("restriction"):
-                                restriction_info = scroll_info["restriction"]
+                            # Restriction / captcha may appear only after AJAX settle.
+                            restriction_info = detect_search_restriction(page)
+                            if restriction_info:
                                 run_status = STATUS_SEARCH_RESTRICTED
                                 page_diagnosis = STATUS_SEARCH_RESTRICTED
-                                status_reason = str(
-                                    scroll_info.get("stopped_reason")
-                                    or "search_restricted_during_scroll"
-                                )
-                                incomplete_due_to_restriction = bool(candidates)
+                                status_reason = "visible_search_frequency_block_after_wait"
                                 print(
-                                    f"滚动期间检测到搜索限制: "
+                                    f"等待后检测到搜索限制: "
                                     f"{restriction_info.get('observed_tip')!r}"
                                 )
-                                print("已停止继续滚动与候选提取；不重试。")
+                                print("已停止滚动与候选提取；不刷新、不重试。")
+                            elif wait_info.get("wait_outcome") == "verification":
+                                run_status = STATUS_VERIFICATION_REQUIRED
+                                page_diagnosis = STATUS_VERIFICATION_REQUIRED
+                                status_reason = "verification_after_wait"
+                                print("等待后检测到验证提示；停止提取。")
                             else:
-                                try:
-                                    raw = extract_raw_candidates(page)
-                                except PlaywrightError as exc:
-                                    run_status = STATUS_EXTRACTION_FAILED
-                                    status_reason = (
-                                        f"extract_error: {type(exc).__name__}: {exc}"
+                                scroll_info = limited_scroll_for_lazy_load(page)
+                                scroll_info["result_wait"] = wait_info
+                                print(
+                                    f"有限滚动: count={scroll_info.get('scroll_count')} "
+                                    f"stopped={scroll_info.get('stopped_reason')} "
+                                    f"budget_ms={SCROLL_BUDGET_MS}"
+                                )
+                                if scroll_info.get("restriction"):
+                                    restriction_info = scroll_info["restriction"]
+                                    run_status = STATUS_SEARCH_RESTRICTED
+                                    page_diagnosis = STATUS_SEARCH_RESTRICTED
+                                    status_reason = str(
+                                        scroll_info.get("stopped_reason")
+                                        or "search_restricted_during_scroll"
                                     )
-                                    raw = {
-                                        "anchor_count_raw": 0,
-                                        "candidate_rows": [],
-                                        "page_title": "",
-                                        "final_url": final_url,
-                                    }
+                                    incomplete_due_to_restriction = bool(candidates)
+                                    print(
+                                        f"滚动期间检测到搜索限制: "
+                                        f"{restriction_info.get('observed_tip')!r}"
+                                    )
+                                    print("已停止继续滚动与候选提取；不重试。")
                                 else:
-                                    # Restriction may appear during extract window.
-                                    restriction_info = detect_search_restriction(page)
-                                    if restriction_info:
-                                        run_status = STATUS_SEARCH_RESTRICTED
-                                        page_diagnosis = STATUS_SEARCH_RESTRICTED
+                                    try:
+                                        raw = extract_raw_candidates(page)
+                                    except PlaywrightError as exc:
+                                        run_status = STATUS_EXTRACTION_FAILED
                                         status_reason = (
-                                            "visible_search_frequency_block_before_parse"
+                                            f"extract_error: {type(exc).__name__}: {exc}"
                                         )
-                                        print(
-                                            "提取前检测到搜索限制；停止解析候选。"
-                                        )
+                                        raw = {
+                                            "anchor_count_raw": 0,
+                                            "data_sku_card_count": 0,
+                                            "candidate_rows": [],
+                                            "page_title": "",
+                                            "final_url": final_url,
+                                        }
                                     else:
-                                        again = diagnose_page_state(page)
-                                        if (
-                                            again == STATUS_NO_RESULTS
-                                            and not raw.get("candidate_rows")
-                                        ):
-                                            run_status = STATUS_NO_RESULTS
-                                            status_reason = "explicit_no_results_copy"
+                                        # Restriction may appear during extract window.
+                                        restriction_info = detect_search_restriction(
+                                            page
+                                        )
+                                        if restriction_info:
+                                            run_status = STATUS_SEARCH_RESTRICTED
+                                            page_diagnosis = STATUS_SEARCH_RESTRICTED
+                                            status_reason = (
+                                                "visible_search_frequency_block_before_parse"
+                                            )
+                                            print(
+                                                "提取前检测到搜索限制；停止解析候选。"
+                                            )
                                         else:
-                                            rows = list(
-                                                raw.get("candidate_rows") or []
-                                            )
-                                            candidates, extract_stats = (
-                                                build_candidate_records(
-                                                    rows,
-                                                    query=query,
-                                                    limit=limit,
-                                                    source_url=final_url,
+                                            again = diagnose_page_state(page)
+                                            if (
+                                                again == STATUS_NO_RESULTS
+                                                and not raw.get("candidate_rows")
+                                            ):
+                                                run_status = STATUS_NO_RESULTS
+                                                status_reason = (
+                                                    "explicit_no_results_copy"
                                                 )
-                                            )
-                                            extract_stats["anchor_count_raw"] = (
-                                                raw.get("anchor_count_raw")
-                                            )
-                                            extract_stats["page_title"] = raw.get(
-                                                "page_title"
-                                            )
-
-                                            if candidates:
-                                                if len(candidates) >= limit:
-                                                    run_status = STATUS_SUCCESS
-                                                    status_reason = (
-                                                        "collected_limit_unique_candidates_from_first_scope"
-                                                    )
-                                                else:
-                                                    run_status = STATUS_PARTIAL
-                                                    status_reason = (
-                                                        "fewer_than_limit_after_dedupe_in_first_scope"
-                                                    )
                                             else:
-                                                if again == STATUS_NO_RESULTS:
-                                                    run_status = STATUS_NO_RESULTS
-                                                    status_reason = (
-                                                        "no_results_message_and_zero_candidates"
+                                                rows = list(
+                                                    raw.get("candidate_rows") or []
+                                                )
+                                                candidates, extract_stats = (
+                                                    build_candidate_records(
+                                                        rows,
+                                                        query=query,
+                                                        limit=limit,
+                                                        source_url=final_url,
                                                     )
-                                                elif (
-                                                    int(
-                                                        raw.get("anchor_count_raw")
-                                                        or 0
-                                                    )
-                                                    > 0
-                                                ):
-                                                    run_status = (
-                                                        STATUS_EXTRACTION_FAILED
-                                                    )
-                                                    status_reason = (
-                                                        "anchors_present_but_no_reliable_detail_candidates"
-                                                    )
+                                                )
+                                                extract_stats["anchor_count_raw"] = (
+                                                    raw.get("anchor_count_raw")
+                                                )
+                                                extract_stats[
+                                                    "data_sku_card_count"
+                                                ] = raw.get("data_sku_card_count")
+                                                extract_stats["page_title"] = raw.get(
+                                                    "page_title"
+                                                )
+
+                                                if candidates:
+                                                    if len(candidates) >= limit:
+                                                        run_status = STATUS_SUCCESS
+                                                        status_reason = (
+                                                            "collected_limit_unique_candidates_from_first_scope"
+                                                        )
+                                                    else:
+                                                        run_status = STATUS_PARTIAL
+                                                        status_reason = (
+                                                            "fewer_than_limit_after_dedupe_in_first_scope"
+                                                        )
                                                 else:
-                                                    run_status = (
-                                                        STATUS_EXTRACTION_FAILED
-                                                    )
-                                                    status_reason = (
-                                                        "zero_product_anchors_without_explicit_no_results;"
-                                                        "not_asserting_NO_RESULTS"
-                                                    )
+                                                    if again == STATUS_NO_RESULTS:
+                                                        run_status = STATUS_NO_RESULTS
+                                                        status_reason = (
+                                                            "no_results_message_and_zero_candidates"
+                                                        )
+                                                    elif (
+                                                        int(
+                                                            raw.get("anchor_count_raw")
+                                                            or 0
+                                                        )
+                                                        > 0
+                                                        or int(
+                                                            raw.get(
+                                                                "data_sku_card_count"
+                                                            )
+                                                            or 0
+                                                        )
+                                                        > 0
+                                                    ):
+                                                        run_status = (
+                                                            STATUS_EXTRACTION_FAILED
+                                                        )
+                                                        status_reason = (
+                                                            "cards_or_anchors_present_but_no_reliable_detail_candidates"
+                                                        )
+                                                    else:
+                                                        run_status = (
+                                                            STATUS_EXTRACTION_FAILED
+                                                        )
+                                                        status_reason = (
+                                                            "zero_product_signals_without_explicit_no_results;"
+                                                            "not_asserting_NO_RESULTS"
+                                                        )
 
                 print()
                 print(f"运行状态: {run_status}")
@@ -974,12 +1218,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         f"  #{c['rank']} id={c.get('product_id')} "
                         f"ad={c.get('ad_marked')} "
+                        f"src={c.get('discovery_source')} "
                         f"title={str(c.get('title') or '')[:60]!r}"
                     )
 
                 print()
-                print("开发验收: 可核对窗口中的页面与终端状态；按回车关闭。")
-                read_line("按回车结束本次自动化浏览器会话… ")
+                if args.auto_close:
+                    print("auto-close: 跳过回车，即将关闭浏览器。")
+                else:
+                    print("开发验收: 可核对窗口中的页面与终端状态；按回车关闭。")
+                    read_line("按回车结束本次自动化浏览器会话… ")
             except KeyboardInterrupt:
                 print()
                 print("收到 Ctrl+C，正在关闭…")
@@ -1019,7 +1267,7 @@ def main(argv: list[str] | None = None) -> int:
         "query": query,
         "limit": limit,
         "search_entry_strategy": SEARCH_ENTRY_STRATEGY,
-        "search_entry_verification": "PENDING_REAL_RUN",
+        "search_entry_verification": "REAL_RUN_DATA_SKU_CARDS",
         "search_url_requested": search_url,
         "final_url_sanitized": (
             sanitize_source_search_url(final_url)
@@ -1044,6 +1292,8 @@ def main(argv: list[str] | None = None) -> int:
             "不使用固定商品ID/链接作为搜索成功兜底",
             "B913A 仅作关键词；标题命中≠规格已核验",
             "SEARCH_RESTRICTED 表示页面可见搜索频繁限制提示；不推断触发机制",
+            "新版搜索页可能无 item.jd.com 锚点，改为 data-sku 卡片发现并构造详情链接",
+            "候选仅搜索结果，不代表已确认同款或最低价",
         ],
     }
     try:

@@ -409,12 +409,18 @@ def image_quality_failed(ocr_result: dict[str, Any]) -> tuple[bool, list[str]]:
 
 
 def ocr_one_image(
-    image_item: dict[str, Any], ocr_dir: Path
+    image_item: dict[str, Any],
+    ocr_dir: Path,
+    *,
+    expected_model: str | None = None,
 ) -> dict[str, Any]:
     img_out = ocr_dir / Path(image_item["filename"]).stem
     img_out.mkdir(parents=True, exist_ok=True)
     result = p4a.process_single_image(
-        image_item["path"], img_out, also_preprocess=True
+        image_item["path"],
+        img_out,
+        also_preprocess=True,
+        expected_model=expected_model,
     )
     quality_failed, quality_reasons = image_quality_failed(result)
     write_json(
@@ -892,11 +898,21 @@ def process_capture_run(
         return {"run_id": run_id, "out_dir": out_dir, "row": row, "detail": detail}
 
     # OCR each existing image (fresh; no historical OCR cache).
+    # Model boundary match uses business override model when provided — not capture expected_product as evidence fill.
+    ocr_expected_model = None
+    if business_override and business_override.get("model"):
+        ocr_expected_model = str(business_override.get("model"))
+    elif isinstance(expected_product, dict) and expected_product.get("model"):
+        ocr_expected_model = str(expected_product.get("model"))
+    detail["ocr_expected_model"] = ocr_expected_model
+
     processed: list[dict[str, Any]] = []
     ocr_failures = 0
     for item in existing:
         try:
-            processed.append(ocr_one_image(item, ocr_dir))
+            processed.append(
+                ocr_one_image(item, ocr_dir, expected_model=ocr_expected_model)
+            )
         except Exception as exc:  # noqa: BLE001
             ocr_failures += 1
             detail["errors"].append(

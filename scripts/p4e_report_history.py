@@ -126,11 +126,14 @@ def atomic_write_json(path: Path, payload: Any) -> None:
 
 def verdict_zh(verdict: str | None) -> str:
     mapping = {
-        "BREAK": "破价",
-        "BREAK_PRICE": "破价",
-        "NOT_BREAK": "未破价",
+        "BREAK": "破价（旧规则）",
+        "BREAK_PRICE": "破价（旧规则）",
+        "NOT_BREAK": "未破价（旧规则）",
+        "POSSIBLE_BREAK": "疑似破价，待人工确认",
+        "NO_BREAK_IN_SCOPE": "本次已识别价格未低于红线",
         "REVIEW_REQUIRED": "待核验（非未破价）",
         "NOT_EVALUATED": "未比价",
+        "MODEL_MISMATCH_SKIPPED": "型号不符已跳过",
         "UNKNOWN": "未知",
     }
     key = str(verdict or "")
@@ -151,6 +154,7 @@ def has_reliable_price(row: dict[str, Any] | None) -> bool:
         return False
     if row.get("verdict") == "REVIEW_REQUIRED":
         return False
+    # POSSIBLE_BREAK is take-home clue pending human — not reliable confirmed price.
     if row.get("verdict") not in {"BREAK", "NOT_BREAK", "BREAK_PRICE"}:
         return False
     if row.get("comparison_status") != "EVALUATED":
@@ -915,7 +919,11 @@ code {{ background: #efeae0; padding: 1px 5px; border-radius: 4px; }}
     <p>来源：{esc(((summary.get('product_config_snapshot') or {}).get('packaging_basis') or {}).get('source_name') or 'config/products')}</p>
     <p>确认说明：{esc(((summary.get('product_config_snapshot') or {}).get('packaging_basis') or {}).get('source_note') or '用户提供截图，经对话确认')}</p>
     <p>确认日期：{esc(((summary.get('product_config_snapshot') or {}).get('packaging_basis') or {}).get('confirmed_date') or '—')}</p>
-    <p>适用型号／箱规：B913A；1层；200张／包；20包／箱；红线127元／箱（严格低于才破价）。</p>
+    <p>适用型号／箱规：{esc(expected.get('expected_model') or expected.get('business_sku') or '（配置）')}；
+       包／箱={esc(expected.get('packs_per_box'))}；
+       红线={esc(expected.get('red_line') or row.get('red_line_price'))}
+       {esc(expected.get('currency') or 'CNY')}／{esc(expected.get('comparison_unit') or '箱')}
+       （严格低于才破价；旧规则 BREAK/NOT_BREAK 保留原 rules_version）。</p>
     <p class="muted">仅当本次页面型号与已选规格匹配时才可引用；仅有配置不足以通过核验。网页「抽」与业务「张」仅在本型号已确认别名范围内互通。</p>
   </div>
 

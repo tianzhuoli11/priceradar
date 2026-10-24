@@ -34,14 +34,40 @@ PRICE_RE = re.compile(
     r"(?P<currency>¥|￥|\$)?\s*(?P<amount>\d{1,7}(?:\.\d{1,2})?)"
 )
 # Avoid Unicode \b (CJK letters are \w, so "批发B913A" would miss).
-MODEL_RE = re.compile(r"(?<![A-Za-z0-9])B913A(?![A-Za-z0-9])", re.IGNORECASE)
+# Default pattern keeps CLI/selftest sample compatibility; callers should pass expected_model.
+DEFAULT_EXPECTED_MODEL = "B913A"
+MODEL_RE = re.compile(
+    rf"(?<![A-Za-z0-9]){re.escape(DEFAULT_EXPECTED_MODEL)}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 LAYER_RE = re.compile(r"(\d+)\s*层")
 SHEET_RE = re.compile(r"(\d+)\s*(?:抽|张)")
 PACK_RE = re.compile(r"(\d+)\s*包")
 QTY_RE = re.compile(r"(\d+)\s*个")
-PROMO_HINTS = ("满", "赠", "券", "优惠", "减", "会员", "满送", "满减")
+PROMO_HINTS = (
+    "满",
+    "赠",
+    "券",
+    "优惠",
+    "减",
+    "会员",
+    "满送",
+    "满减",
+    "到手",
+    "券后",
+    "新人",
+    "预估",
+)
 SHOP_HINTS = ("旗舰店", "专营店", "自营店", "官方旗舰")
 THRESHOLD_HINTS = ("满", "赠", "即赠", "满减", "满送")
+
+
+def model_regex_for(expected_model: str | None) -> re.Pattern[str]:
+    model = (expected_model or DEFAULT_EXPECTED_MODEL).strip() or DEFAULT_EXPECTED_MODEL
+    return re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(model)}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
 
 
 def pkg_version(name: str) -> str:
@@ -184,8 +210,18 @@ def classify_price_role(block_text: str, amount: Decimal) -> str:
     if any(h in t for h in THRESHOLD_HINTS) and (
         "满" in t or "赠" in t or "减" in t
     ):
-        # Threshold / gift condition numbers are not selling price.
+        # Threshold / gift condition numbers are not selling price / take-home.
         return "promotion_threshold_or_gift"
+    # Declared / estimated take-home labels (still not auto-confirmed deal price).
+    if any(h in t for h in ("预估到手", "预计到手", "预估价")) or (
+        "预估" in t and "到手" in t
+    ):
+        return "estimated_take_home_candidate"
+    if any(
+        h in t
+        for h in ("到手价", "券后价", "券后", "会员价", "新人价", "学生价")
+    ):
+        return "declared_take_home_candidate"
     if "¥" in t or "￥" in t:
         # Currency near amount → candidate main/display price (still not unique pick).
         return "currency_tagged_price_candidate"
@@ -194,28 +230,35 @@ def classify_price_role(block_text: str, amount: Decimal) -> str:
     return "unlabeled_number_candidate"
 
 
-def extract_from_blocks(blocks: list[OcrBlock]) -> dict[str, Any]:
+def extract_from_blocks(
+    blocks: list[OcrBlock],
+    *,
+    expected_model: str | None = None,
+) -> dict[str, Any]:
     price_candidates: list[dict[str, Any]] = []
     model_candidates: list[dict[str, Any]] = []
     specification_candidates: list[dict[str, Any]] = []
     promotion_text: list[dict[str, Any]] = []
     shop_candidates: list[dict[str, Any]] = []
     review_reasons: list[str] = []
+    model_name = (expected_model or DEFAULT_EXPECTED_MODEL).strip() or DEFAULT_EXPECTED_MODEL
+    model_re = model_regex_for(model_name)
 
     for b in blocks:
         text = b.text.strip()
         if not text:
             continue
 
-        if MODEL_RE.search(text):
+        if model_re.search(text):
             model_candidates.append(
                 {
-                    "model": "B913A",
+                    "model": model_name,
                     "source_text": text,
                     "source_image": b.source_image,
                     "variant": b.variant,
                     "score": b.score,
                     "box": b.box,
+                    "match_rule": "boundary_regex",
                 }
             )
 
@@ -300,7 +343,19 @@ def extract_from_blocks(blocks: list[OcrBlock]) -> dict[str, Any]:
                 continue
             role = classify_price_role(text, amount)
             nearby_label = None
-            for h in ("满送", "满减", "优惠", "售价", "价格", "券"):
+            for h in (
+                "预估到手",
+                "到手价",
+                "券后价",
+                "会员价",
+                "新人价",
+                "满送",
+                "满减",
+                "优惠",
+                "售价",
+                "价格",
+                "券",
+            ):
                 if h in text:
                     nearby_label = h
                     break
@@ -335,7 +390,7 @@ def extract_from_blocks(blocks: list[OcrBlock]) -> dict[str, Any]:
     if not price_candidates:
         review_reasons.append("未识别到可解析金额")
     if not model_candidates:
-        review_reasons.append("未识别到型号 B913A")
+        review_reasons.append(f"未识别到边界匹配型号 {model_name}")
     if not specification_candidates:
         review_reasons.append("未识别到规格相关文本")
 
@@ -366,10 +421,12 @@ def extract_from_blocks(blocks: list[OcrBlock]) -> dict[str, Any]:
         "selected_price": None,  # never auto-pick unique selling price this phase
         "comparison_status": "NOT_EVALUATED",
         "extraction_status": status,
+        "expected_model_for_match": model_name,
         "review_reasons": review_reasons,
         "limits": [
             "不做破价判定",
-            "不输出最终到手价",
+            "不把主展示价改名为到手价",
+            "到手价线索由后续模块分类；本层只提取 OCR 候选",
             "不从 expected_product 回填缺失字段",
             "历史观察价禁止用于纠偏或选候选",
             "20包不自动等于一箱",
@@ -396,6 +453,7 @@ def process_single_image(
     out_dir: Path,
     *,
     also_preprocess: bool = True,
+    expected_model: str | None = None,
 ) -> dict[str, Any]:
     image_path = image_path.resolve()
     if not image_path.is_file():
@@ -443,7 +501,7 @@ def process_single_image(
                 + f"preprocess_ocr {type(exc).__name__}: {exc}"
             )
 
-    extraction = extract_from_blocks(all_blocks)
+    extraction = extract_from_blocks(all_blocks, expected_model=expected_model)
     if input_quality_risks:
         extraction["review_reasons"] = list(
             dict.fromkeys(extraction.get("review_reasons", []) + input_quality_risks)

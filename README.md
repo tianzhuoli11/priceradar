@@ -20,7 +20,8 @@
 - **P2-B**：单商品页面展示价读取（inspect：自定义字体不可直接解析；DOM 无普通数字价）
 - **P2-C**：商品页局部截图诊断基线（含人工框选；保留不覆盖）
 - **P2-D**：全自动商品区域截图（价格区强制视口居中并避开固定底栏；已配合 P4-D 真实验收）
-- **P3-A**：单商品关键词自动搜索与候选链接收集（**搜索受限，未通过**；本轮不宣称搜索可用）
+- **P3-A**：单商品关键词自动搜索与候选链接收集（**本机实测可收集候选**：`run_id=20261024T121849Z_799abc`，`data-sku` 卡片提取；候选≠同款/最低价已核验。历史曾出现 `SEARCH_RESTRICTED`，机制未证实）
+- **P5-A**：任意搜索候选核验适配（业务配置与候选身份分离、URL 适配、型号边界匹配、到手价线索结构）。真实：`100005149674` 候选→截图→OCR 完成；`1143036`（B913AE）标题门控跳过。无声明到手价时标记「到手价待核验」，**不**宣称到手价识别已通过
 - **P4-A**：本地 OCR 离线识图验证（无图片模型 API）
 - **P4-B**：OCR 候选 → 主售价选择 / 单位分离 / 破价比较与输出表
 - **P4-C**：单次截图任务 → OCR → 比价表一键流程（不启动浏览器）
@@ -187,12 +188,30 @@ cd C:\Users\tianz\Desktop\jasmineskill\priceradar
 .\.venv\Scripts\python.exe .\scripts\p3a_jd_search.py --query "清风 B913A" --limit 5
 ```
 
-- 使用独立 Profile 打开公开文档常见的 `search.jd.com/Search?keyword=...&enc=utf-8`（**入口与结果结构仍待本机真实验证**）。
-- 从首个结果范围内自动发现商品详情锚点，最多 5 条去重候选；不翻页刷量。
+- 使用独立 Profile 打开公开文档常见的 `search.jd.com/Search?keyword=...&enc=utf-8`（本机已实测；新版结果多为 `[data-sku]` 卡片，可能无经典 `item.jd.com` 锚点）。
+- 从首个结果范围发现候选（优先 `data-sku`，兼容旧锚点），最多 5 条去重；详情链接可由数字 SKU 规范为 `https://item.jd.com/<id>.html`；不翻页刷量。
 - `B913A` 只作搜索关键词，不当作京东数字商品 ID；不用固定商品链接兜底。
 - 输出：`artifacts/search_runs/<UTC时间戳_唯一后缀>/` 下的 `candidates.json`、`candidates.csv`、`run_metadata.json`。
+- 最小诊断（截图+脱敏 JSON，不改核价流程）：`.\.venv\Scripts\python.exe .\scripts\fixtures\p3a_search_diagnose.py --query "清风 B913A"`
 - 本轮不读搜索页价格、不调 AI、不做比价表。
-- 若页面可见「访问频繁导致无法搜索」等限制提示，状态为 `SEARCH_RESTRICTED`：立即停止滚动/提取，不刷新、不重试、不换入口；不把无锚点一律判为受限。
+- 若页面可见「访问频繁导致无法搜索」等限制提示，状态为 `SEARCH_RESTRICTED`：立即停止滚动/提取，不刷新、不重试、不换入口；HTTP 200≠成功；零锚点≠一定无商品（可能是选择器落后）。
+
+### P5-A：搜索候选核验适配（单候选）
+
+业务配置提供型号/箱规/红线；候选 ID/URL 来自 `candidates.json`（不存在则停止，无固定链接兜底）。配置中的历史商品 ID/链接/店名不覆盖本次候选。
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\p5a_verify_candidate.py --self-check
+
+.\.venv\Scripts\python.exe .\scripts\p5a_verify_candidate.py `
+  --business-config .\config\products\b913a.json `
+  --candidates .\artifacts\search_runs\<run>\candidates.json `
+  --product-id <京东数字商品ID>
+```
+
+- 输出：`artifacts/candidate_verify_runs/<UTC_商品ID_后缀>/`（`verify_result.json` / `.csv`、`price_clues.json`）。
+- 到手价：`POSSIBLE_BREAK`=疑似破价待人工确认；主展示价仅参考；`manual_verdict` 系统留空。
+- 标题明确为冲突型号（如 B913AE vs B913A）时可跳过打开详情。
 
 ### P4-A：本地 OCR（RapidOCR + ONNX Runtime）
 
@@ -285,7 +304,7 @@ cmd /c "scripts\fixtures\run_launcher_selftest.cmd 3"
 .\.venv\Scripts\python.exe .\scripts\p4d_run_product.py --product-config .\config\products\b913a.json --offline-capture-dir "artifacts\price_captures\<已有任务目录>"
 ```
 
-说明：这是「已知链接单商品自动流程」，**不是**「输入 SKU 自动搜索」。**P3-A 搜索受限仍未通过**，不得用本轮比价成功反推搜索可用。
+说明：这是「已知链接单商品自动流程」，**不是**「输入 SKU 自动搜索」。P3-A 候选收集已有本机成功样本，但仍不得用比价成功反推「同款/最低价搜索闭环」已完成。
 
 ### P4-E：中文报告与单商品历史
 
