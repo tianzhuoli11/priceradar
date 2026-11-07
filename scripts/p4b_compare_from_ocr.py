@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import secrets
 import sys
 from datetime import datetime, timezone
@@ -177,10 +178,33 @@ def select_primary_selling_price(
     }
 
 
+def _policy_allows_other_model(
+    model_scope_policy: dict[str, Any] | None,
+    *,
+    business_sku: str,
+    expected_model: str,
+) -> bool:
+    """Explicit SKU-scoped authorization only; never a global default."""
+    if not model_scope_policy:
+        return False
+    if str(model_scope_policy.get("model_scope_policy") or "") != "user_approved_include_other":
+        return False
+    policy_sku = str(
+        model_scope_policy.get("business_sku")
+        or model_scope_policy.get("expected_model")
+        or ""
+    ).upper()
+    target = str(business_sku or expected_model or "").upper()
+    if not policy_sku or not target or policy_sku != target:
+        return False
+    return True
+
+
 def analyze_spec_and_unit(
     specification_candidates: list[dict[str, Any]],
     model_candidates: list[dict[str, Any]],
     business: dict[str, Any] | None = None,
+    model_scope_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Separate observed OCR vs business packaging basis.
@@ -188,12 +212,17 @@ def analyze_spec_and_unit(
     Box compare requires this-run page evidence (model + target 20-pack spec).
     User-confirmed packaging_basis may supply 20包→1箱 without OCR「箱」,
     but config alone without page match must not pass.
+
+    Default: OCR model must equal expected_model. With an explicit
+    model_scope_policy=user_approved_include_other for this business SKU,
+    OTHER observed models may continue packaging checks — but observed model
+    is never rewritten to expected, and packs/layers/sheets still must match.
     """
     biz = business or BUSINESS
     packaging = biz.get("packaging_basis") if isinstance(biz.get("packaging_basis"), dict) else None
 
     ocr_models = sorted(
-        {m.get("model") for m in model_candidates if m.get("model")}
+        {str(m.get("model")).upper() for m in model_candidates if m.get("model")}
     )
     ocr_packs = sorted(
         {
@@ -229,7 +258,10 @@ def analyze_spec_and_unit(
     )
 
     business_packs = str(biz.get("packs_per_box") or "")
-    biz_model = str(biz.get("model") or "")
+    biz_model = str(biz.get("model") or "").upper()
+    business_sku = str(
+        biz.get("business_sku") or biz.get("sku_id") or biz_model
+    ).upper()
     biz_layers = str(biz.get("layers")) if biz.get("layers") is not None else None
     biz_sheets = (
         str(biz.get("sheets_or_pulls"))
@@ -241,13 +273,42 @@ def analyze_spec_and_unit(
     model_match = (
         len(ocr_models) == 1 and ocr_models[0] == biz_model
     )
+    allow_other = _policy_allows_other_model(
+        model_scope_policy,
+        business_sku=business_sku,
+        expected_model=biz_model,
+    )
+    other_label = ""
+    if model_scope_policy:
+        other_label = str(
+            ((model_scope_policy.get("authorization") or {}).get("other_model_label_zh"))
+            or "用户指定按业务基准比较"
+        )
+
+    if model_match:
+        model_status = "PAGE_MODEL_CONFIRMED_EXPECTED"
+        model_ok_for_packaging = True
+    elif allow_other and len(ocr_models) == 1 and ocr_models[0] != biz_model:
+        # Authorized OTHER: one clear other model, never rewrite to expected.
+        model_status = "PAGE_MODEL_OTHER_USER_AUTHORIZED"
+        model_ok_for_packaging = True
+    elif allow_other and ocr_models and biz_model not in ocr_models:
+        model_status = "PAGE_MODEL_OTHER_AUTHORIZED_AMBIGUOUS"
+        model_ok_for_packaging = False
+    elif allow_other and not ocr_models:
+        model_status = "PAGE_MODEL_OTHER_AUTHORIZED_UNCONFIRMED"
+        model_ok_for_packaging = False
+    else:
+        model_status = "PAGE_MODEL_MISMATCH_OR_MISSING"
+        model_ok_for_packaging = False
+
     layers_match = (
         bool(biz_layers)
         and ocr_layers == [biz_layers]
     )
-    # Limited alias: for confirmed B913A packaging, 抽/张 both map to sheets_per_pack.
+    # Limited alias: for confirmed packaging, 抽/张 both map to sheets_per_pack.
     alias_ok = False
-    if packaging and str(packaging.get("applicable_model")) == biz_model:
+    if packaging and str(packaging.get("applicable_model") or "").upper() == biz_model:
         aliases = packaging.get("sheet_unit_page_aliases") or []
         if aliases and biz_sheets and ocr_sheets == [biz_sheets]:
             alias_ok = True
@@ -256,22 +317,35 @@ def analyze_spec_and_unit(
     )
 
     page_spec_matched = bool(
-        model_match and packs_match_config and layers_match and sheets_match
+        model_ok_for_packaging
+        and packs_match_config
+        and layers_match
+        and sheets_match
     )
 
     packaging_applicable = False
     packaging_reason = None
-    if packaging and str(packaging.get("applicable_model")) == biz_model:
+    if packaging and str(packaging.get("applicable_model") or "").upper() == biz_model:
         if page_spec_matched and int(packaging.get("packs_per_box") or 0) == int(
             biz.get("packs_per_box") or 0
         ):
             packaging_applicable = True
-            packaging_reason = (
-                "页面型号+已选规格匹配用户确认箱规依据；"
-                f"来源={packaging.get('source_name')}；"
-                f"确认日={packaging.get('confirmed_date')}；"
-                "不要求网页OCR出现「箱」"
-            )
+            if model_match:
+                packaging_reason = (
+                    "页面型号+已选规格匹配用户确认箱规依据；"
+                    f"来源={packaging.get('source_name')}；"
+                    f"确认日={packaging.get('confirmed_date')}；"
+                    "不要求网页OCR出现「箱」"
+                )
+            else:
+                packaging_reason = (
+                    f"{other_label}；"
+                    f"页面实际型号={ocr_models}（禁止写成页面型号核验通过期望型号{biz_model}）；"
+                    f"页面OCR包数/层数/张数匹配业务目标规格后按基准折算；"
+                    f"来源={packaging.get('source_name')}；"
+                    f"确认日={packaging.get('confirmed_date')}；"
+                    "未自动继承异型号箱规、未改写页面型号"
+                )
         else:
             packaging_reason = (
                 "存在箱规依据，但本次页面型号/规格未核验匹配，不得仅凭配置换算"
@@ -291,6 +365,7 @@ def analyze_spec_and_unit(
         },
         "business_config": {
             "model": biz.get("model"),
+            "business_sku": business_sku or biz.get("model"),
             "spec_label": biz.get("spec_label", biz.get("target_spec")),
             "packs_per_box": biz.get("packs_per_box"),
             "layers": biz.get("layers"),
@@ -299,11 +374,17 @@ def analyze_spec_and_unit(
         "packaging_basis": packaging,
         "packs_match_business_config": packs_match_config,
         "model_match_business_config": model_match,
+        "model_status": model_status,
+        "model_authorized_other": bool(allow_other and not model_match),
+        "model_scope_policy_id": (
+            (model_scope_policy or {}).get("policy_id") if model_scope_policy else None
+        ),
         "layers_match_business_config": layers_match,
         "sheets_match_business_config": sheets_match,
         "page_spec_matched": page_spec_matched,
         "packaging_basis_applicable": packaging_applicable,
         "packaging_basis_note": packaging_reason,
+        "page_model_rewritten": False,
         "box_comparable": False,
         "unit_status": "PENDING_VERIFY",
         "unit_review_reasons": [],
@@ -311,10 +392,19 @@ def analyze_spec_and_unit(
     }
 
     reasons: list[str] = []
+    if allow_other and not model_match:
+        reasons.append("MODEL_SCOPE_USER_APPROVED_INCLUDE_OTHER")
+        if other_label:
+            reasons.append(f"OTHER_LABEL:{other_label}")
     if not ocr_models:
         reasons.append("OCR 未识别到型号")
-    elif not model_match:
+    elif not model_match and not (allow_other and model_ok_for_packaging):
         reasons.append(f"OCR型号{ocr_models}与业务型号{biz_model}未核验匹配")
+    elif not model_match and allow_other and model_ok_for_packaging:
+        reasons.append(
+            f"OCR实际型号{ocr_models}≠业务期望{biz_model}；"
+            f"{other_label or '已授权按业务基准比较'}（禁止写成页面型号核验通过期望型号）"
+        )
     if not ocr_packs:
         reasons.append("OCR 未识别到包数")
     elif not packs_match_config:
@@ -326,7 +416,7 @@ def analyze_spec_and_unit(
     if not sheets_match:
         reasons.append(
             f"OCR张/抽数{ocr_sheets}与业务{biz_sheets}未匹配"
-            "（抽/张仅在已确认B913A箱规别名范围内互通）"
+            "（抽/张仅在已确认箱规别名范围内互通）"
         )
     if not box_evidence and not packaging_applicable:
         reasons.append(
@@ -337,8 +427,8 @@ def analyze_spec_and_unit(
             f"识别到购买数量{ocr_qty}个；不解释为包数或箱数"
         )
 
-    # Comparable when: page model+target-20-pack spec matched, AND
-    # (OCR has 箱 OR user packaging basis applies for this matched page).
+    # Comparable when: packaging gate passed (strict model OR authorized other
+    # with packs/layers/sheets match), AND (OCR has 箱 OR packaging basis applies).
     if page_spec_matched and (box_evidence or packaging_applicable):
         unit["box_comparable"] = True
         unit["unit_status"] = "MATCHED_FOR_BOX_COMPARE"
@@ -357,10 +447,16 @@ def analyze_spec_and_unit(
             ),
             "note": packaging_reason
             or "网页规格含箱单位证据且与目标20包装匹配",
+            "observed_model_unchanged": True,
         }
-        # Keep informational reasons that are non-blocking (e.g. 个).
+        # Keep informational reasons that are non-blocking (e.g. 个 / auth note).
         unit["unit_review_reasons"] = [
-            r for r in reasons if "购买数量" in r
+            r
+            for r in reasons
+            if ("购买数量" in r)
+            or r.startswith("MODEL_SCOPE_")
+            or r.startswith("OTHER_LABEL:")
+            or ("禁止写成页面型号核验通过" in r)
         ]
     else:
         unit["box_comparable"] = False
@@ -646,6 +742,92 @@ def run_self_tests() -> list[str]:
         "packaging_basis_applicable"
     ):
         failures.append("config-only must not apply packaging basis")
+
+    # Default strict: OTHER model without policy → not comparable
+    unit_other_strict = analyze_spec_and_unit(
+        [{"packs": "20", "layers": "1", "sheets_or_pulls": "200"}],
+        [{"model": "B913AC"}],
+        business=basis_biz,
+    )
+    if unit_other_strict["box_comparable"] or unit_other_strict.get(
+        "model_match_business_config"
+    ):
+        failures.append("OTHER without policy must stay non-comparable")
+    if unit_other_strict.get("model_status") != "PAGE_MODEL_MISMATCH_OR_MISSING":
+        failures.append("OTHER without policy must keep mismatch status")
+
+    auth_policy = {
+        "policy_id": "test_b913a_include_other",
+        "model_scope_policy": "user_approved_include_other",
+        "business_sku": "B913A",
+        "authorization": {
+            "other_model_label_zh": "用户指定按B913A基准比较",
+        },
+    }
+    # Explicit auth: OTHER with matching packs/layers/sheets may compare,
+    # but observed model must stay B913AC (never rewritten).
+    unit_other_auth = analyze_spec_and_unit(
+        [{"packs": "20", "layers": "1", "sheets_or_pulls": "200"}],
+        [{"model": "B913AC"}],
+        business=basis_biz,
+        model_scope_policy=auth_policy,
+    )
+    if not unit_other_auth["box_comparable"]:
+        failures.append("authorized OTHER with matched packaging should be comparable")
+    if unit_other_auth.get("model_match_business_config"):
+        failures.append("authorized OTHER must not claim model_match_business_config")
+    if unit_other_auth.get("model_status") != "PAGE_MODEL_OTHER_USER_AUTHORIZED":
+        failures.append("authorized OTHER should use PAGE_MODEL_OTHER_USER_AUTHORIZED")
+    if unit_other_auth.get("page_model_rewritten"):
+        failures.append("authorized OTHER must not rewrite page model")
+    if "B913AC" not in str(unit_other_auth.get("ocr_recognized", {}).get("models")):
+        failures.append("authorized OTHER must keep observed B913AC")
+    note = str(unit_other_auth.get("packaging_basis_note") or "")
+    if (
+        "页面型号+已选规格匹配" in note
+        or "页面OCR确认型号=B913A" in note
+        or re.search(r"页面实际型号=.*已确认B913A", note)
+    ):
+        failures.append("authorized OTHER note must not claim page confirmed B913A")
+
+    # Auth does not waive packaging: wrong layers still not comparable
+    unit_other_bad_layers = analyze_spec_and_unit(
+        [{"packs": "20", "layers": "2", "sheets_or_pulls": "200"}],
+        [{"model": "B913AC"}],
+        business=basis_biz,
+        model_scope_policy=auth_policy,
+    )
+    if unit_other_bad_layers["box_comparable"]:
+        failures.append("authorized OTHER with layer mismatch must not be comparable")
+
+    # Auth does not waive unknown packs
+    unit_other_no_packs = analyze_spec_and_unit(
+        [{"layers": "1", "sheets_or_pulls": "200"}],
+        [{"model": "B913AC"}],
+        business=basis_biz,
+        model_scope_policy=auth_policy,
+    )
+    if unit_other_no_packs["box_comparable"]:
+        failures.append("authorized OTHER without packs must not fabricate box price")
+
+    # Auth must not leak to another business SKU
+    other_sku_biz = {
+        **basis_biz,
+        "model": "OTHERSKU",
+        "business_sku": "OTHERSKU",
+        "packaging_basis": {
+            **basis_biz["packaging_basis"],
+            "applicable_model": "OTHERSKU",
+        },
+    }
+    unit_leak = analyze_spec_and_unit(
+        [{"packs": "20", "layers": "1", "sheets_or_pulls": "200"}],
+        [{"model": "B913AC"}],
+        business=other_sku_biz,
+        model_scope_policy=auth_policy,
+    )
+    if unit_leak["box_comparable"] or unit_leak.get("model_authorized_other"):
+        failures.append("B913A policy must not authorize other business SKUs")
 
     cmp_ok = compare_to_red_line(
         "168.00", box_comparable=True, selection_status="SELECTED"

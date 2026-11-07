@@ -1,0 +1,40 @@
+{
+  "policy_id": "b913a_model_scope_include_other_20261027",
+  "rules_version": "model-scope-policy-v1",
+  "model_scope_policy": "user_approved_include_other",
+  "business_sku": "B913A",
+  "expected_model": "B913A",
+  "business_config": "config/products/b913a.json",
+  "source_classify_audit": "20261027T055454Z_modelcls_b4e4a0",
+  "source_collect_run": "20261027T052248Z_collect_134737",
+  "include_classifications": [
+    "TARGET_MODEL_CANDIDATE",
+    "OTHER_MODEL"
+  ],
+  "exclude_classifications": [
+    "MULTI_MODEL_OR_UNKNOWN"
+  ],
+  "authorization": {
+    "approved_by": "user",
+    "approved_at_local": "2026-10-27",
+    "statement_zh": "TARGET_MODEL_CANDIDATE与OTHER_MODEL均纳入B913A业务基准，按配置红线（箱）比较，最后人工判断是否真的破价。",
+    "other_model_label_zh": "用户指定按B913A基准比较",
+    "scope_note_zh": "此授权仅针对本次B913A候选清单，不作为其他SKU的全局默认规则。"
+  },
+  "constraints": {
+    "keep_observed_model_tokens": true,
+    "never_rewrite_other_model_as_expected": true,
+    "allow_model_mismatch_for_browse": true,
+    "allow_model_mismatch_for_packaging_when_packs_layers_sheets_match": true,
+    "forbid_id_mismatch": true,
+    "forbid_unknown_pack_qty_fabricated_box_price": true,
+    "forbid_auto_inherit_packs_per_box_without_page_evidence": true,
+    "red_line_from_business_config_only": true,
+    "manual_verdict_default_null": true
+  },
+  "sample_limits": {
+    "max_total": 10,
+    "max_target": 5,
+    "max_other": 5
+  }
+}

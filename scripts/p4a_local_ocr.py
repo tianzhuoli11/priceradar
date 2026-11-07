@@ -63,11 +63,11 @@ THRESHOLD_HINTS = ("满", "赠", "即赠", "满减", "满送")
 
 
 def model_regex_for(expected_model: str | None) -> re.Pattern[str]:
+    """Complete-token regex via shared matcher (B913A ⊄ B913AC)."""
+    from priceradar_model_match import model_boundary_regex
+
     model = (expected_model or DEFAULT_EXPECTED_MODEL).strip() or DEFAULT_EXPECTED_MODEL
-    return re.compile(
-        rf"(?<![A-Za-z0-9]){re.escape(model)}(?![A-Za-z0-9])",
-        re.IGNORECASE,
-    )
+    return model_boundary_regex(model)
 
 
 def pkg_version(name: str) -> str:
@@ -219,7 +219,17 @@ def classify_price_role(block_text: str, amount: Decimal) -> str:
         return "estimated_take_home_candidate"
     if any(
         h in t
-        for h in ("到手价", "券后价", "券后", "会员价", "新人价", "学生价")
+        for h in (
+            "首单到手价",
+            "首单到手",
+            "首单",
+            "到手价",
+            "券后价",
+            "券后",
+            "会员价",
+            "新人价",
+            "学生价",
+        )
     ):
         return "declared_take_home_candidate"
     if "¥" in t or "￥" in t:
@@ -249,18 +259,66 @@ def extract_from_blocks(
         if not text:
             continue
 
-        if model_re.search(text):
-            model_candidates.append(
-                {
-                    "model": model_name,
-                    "source_text": text,
-                    "source_image": b.source_image,
-                    "variant": b.variant,
-                    "score": b.score,
-                    "box": b.box,
-                    "match_rule": "boundary_regex",
-                }
-            )
+        # Shared classifier: never truncate longer codes (B913AC) into expected.
+        try:
+            from priceradar_model_match import classify_title_models
+
+            cls = classify_title_models(text, expected_model=model_name)
+            if cls.get("classification") == "TARGET_MODEL_CANDIDATE":
+                model_candidates.append(
+                    {
+                        "model": model_name,
+                        "source_text": text,
+                        "source_image": b.source_image,
+                        "variant": b.variant,
+                        "score": b.score,
+                        "box": b.box,
+                        "match_rule": "complete_model_token_v1",
+                        "observed_model_tokens": cls.get("observed_model_tokens"),
+                    }
+                )
+            elif cls.get("classification") == "OTHER_MODEL":
+                review_reasons.append(
+                    f"OCR完整型号为其他型号({cls.get('conflict_token')})，"
+                    f"不得截短为 {model_name}"
+                )
+                # Keep actual observed OTHER models for authorized compare paths.
+                # Never rewrite OTHER as expected_model.
+                for tok in cls.get("observed_model_tokens") or []:
+                    if tok.get("context_kind") != "product" or not tok.get("raw"):
+                        continue
+                    model_candidates.append(
+                        {
+                            "model": str(tok.get("raw")).upper(),
+                            "source_text": text,
+                            "source_image": b.source_image,
+                            "variant": b.variant,
+                            "score": b.score,
+                            "box": b.box,
+                            "match_rule": "complete_other_model_token_v1",
+                            "observed_model_tokens": cls.get("observed_model_tokens"),
+                        }
+                    )
+            elif cls.get("reason") in {
+                "multi_model_join_ambiguous",
+                "target_and_other_product_models",
+                "expected_only_in_compat_or_negation",
+            }:
+                review_reasons.append(f"OCR型号歧义:{cls.get('reason')}")
+        except Exception:
+            # Fallback: legacy boundary only (still no substring of longer codes)
+            if model_re.search(text):
+                model_candidates.append(
+                    {
+                        "model": model_name,
+                        "source_text": text,
+                        "source_image": b.source_image,
+                        "variant": b.variant,
+                        "score": b.score,
+                        "box": b.box,
+                        "match_rule": "boundary_regex_fallback",
+                    }
+                )
 
         if any(h in text for h in PROMO_HINTS):
             promotion_text.append(

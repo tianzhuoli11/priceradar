@@ -24,6 +24,8 @@ ENGINE_IMPL = "rapidocr+p4a_extract+p4b_select_unit_compare+selection_core"
 
 KNOWN_CAPTURE_FILENAMES = (
     "price.png",
+    "price_context.png",
+    "promo_detail.png",
     "product_context.png",
     "product_title.png",
     "selected_spec.png",
@@ -56,6 +58,7 @@ def load_sibling(module_stem: str) -> Any:
 p4a = load_sibling("p4a_local_ocr")
 p4b = load_sibling("p4b_compare_from_ocr")
 p2d = load_sibling("p2d_jd_auto_capture")
+sel_spec = load_sibling("priceradar_selected_spec")
 
 
 def normalize_selection_snapshot(snap: dict[str, Any] | None) -> dict[str, Any]:
@@ -79,6 +82,138 @@ def normalize_selection_snapshot(snap: dict[str, Any] | None) -> dict[str, Any]:
     out.update(parsed)
     out["selected_spec_text"] = parsed.get("core_selected_spec")
     return out
+
+
+def load_selection_state_from_capture_files(run_dir: Path) -> dict[str, Any] | None:
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    for fname, slot in (
+        ("selection_state_before.json", "before"),
+        ("selection_state_after.json", "after"),
+    ):
+        path = run_dir / fname
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            if slot == "before":
+                before = payload
+            else:
+                after = payload
+    if before is None and after is None:
+        return None
+    return {"before": before, "after": after}
+
+
+def enrich_selection_snapshot_from_discover(
+    run_dir: Path, snap: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """
+    Only attach discover text as selected when discover targeted a selected node.
+    Full .page-right-spec panel text (often 10包+20包) must NOT become selected_spec_text.
+    """
+    if not isinstance(snap, dict):
+        return snap
+    if snap.get("selected_status") == "SELECTED_SPEC_EXTRACTED" and snap.get(
+        "selected_spec_text"
+    ):
+        return snap
+    if snap.get("selected_options"):
+        return snap
+    rd = run_dir / "region_discover.json"
+    if not rd.is_file():
+        return snap
+    try:
+        data = json.loads(rd.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return snap
+    spec = data.get("selected_spec") if isinstance(data, dict) else None
+    if not isinstance(spec, dict) or not spec.get("text"):
+        return snap
+    selector = str(spec.get("selector") or "")
+    text = str(spec["text"])
+    # Evidence-based: only --selected node text is current selection.
+    if "selected" in selector and "page-right-spec" not in selector.replace(
+        "specification-item-sku--selected", "X"
+    ):
+        out = dict(snap)
+        out["selected_spec_text"] = text
+        out["selected_status"] = "SELECTED_SPEC_EXTRACTED"
+        out["selected_spec_source"] = f"region_discover:{selector}"
+        return out
+    if selector.endswith("--selected") or "sku--selected" in selector:
+        out = dict(snap)
+        out["selected_spec_text"] = text
+        out["selected_status"] = "SELECTED_SPEC_EXTRACTED"
+        out["selected_spec_source"] = f"region_discover:{selector}"
+        return out
+    # Full panel / ambiguous: keep available hint only; do not claim selected.
+    out = dict(snap)
+    out.setdefault("selected_status", "SELECTED_SPEC_UNKNOWN")
+    out["available_panel_text"] = text
+    out["selected_spec_source_rejected"] = (
+        f"discover selector={selector!r} is not selected-item; "
+        "panel text retained as available_panel_text only"
+    )
+    return out
+
+
+def supplement_model_candidates_from_capture(
+    run_dir: Path,
+    model_candidates: list[dict[str, Any]],
+    *,
+    expected_model: str | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """When OCR crops miss title/model, use capture selection title_text tokens."""
+    notes: list[str] = []
+    if model_candidates:
+        return model_candidates, notes
+    exp = str(expected_model or "").strip().upper()
+    if not exp:
+        return model_candidates, notes
+    try:
+        from priceradar_model_match import classify_title_models
+    except ImportError:
+        return model_candidates, notes
+    out = list(model_candidates)
+    for fname in ("selection_state_after.json", "selection_state_before.json"):
+        path = run_dir / fname
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        title = str(data.get("title_text") or "").strip()
+        if not title:
+            continue
+        cls = classify_title_models(title, expected_model=exp)
+        if cls.get("classification") != "TARGET_MODEL_CANDIDATE":
+            notes.append(
+                f"{fname} title_text 未形成 TARGET 型号 token；"
+                f"classification={cls.get('classification')}"
+            )
+            continue
+        out.append(
+            {
+                "model": exp,
+                "source_text": title[:240],
+                "source_image": fname,
+                "variant": "capture_selection",
+                "match_rule": "capture_selection_title_text",
+                "observed_model_tokens": cls.get("observed_model_tokens"),
+            }
+        )
+        notes.append(
+            "分区 OCR 无 model_candidates；"
+            "由 capture selection_state.title_text（DOM 文本）补入已观测型号 token；"
+            "非图片 OCR 识别，亦非把 OTHER 改写为业务期望型号"
+        )
+        break
+    return out, notes
 
 
 def reevaluate_selection_state(
@@ -278,6 +413,13 @@ def resolve_registered_images(
             if status not in CAPTURED_STATUSES:
                 warnings.append(
                     f"regions.{region_key} status={status} 非已截取，跳过"
+                )
+                continue
+            if str(filename) == "viewport_diagnostic.png" or str(
+                entry.get("capture_method") or ""
+            ).startswith("viewport"):
+                warnings.append(
+                    f"regions.{region_key} 诊断视口图，不参与正式 OCR"
                 )
                 continue
             raw_path = entry.get("path")
@@ -792,10 +934,12 @@ def process_capture_run(
     run_dir: Path,
     *,
     business_override: dict[str, Any] | None = None,
+    model_scope_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     OCR + compare for one exact capture directory.
     business_override: optional packs/model/red_line from product config (not OCR evidence).
+    model_scope_policy: optional auditable OTHER-model authorization for this SKU only.
     """
     started = utc_now()
     run_dir = run_dir.resolve()
@@ -968,6 +1112,13 @@ def process_capture_run(
             spec_candidates.append(enriched)
 
     model_candidates = aggregate_candidates(processed, "model_candidates")
+    model_candidates, model_supplement_notes = supplement_model_candidates_from_capture(
+        run_dir,
+        model_candidates,
+        expected_model=ocr_expected_model,
+    )
+    if model_supplement_notes:
+        detail["model_candidate_supplement"] = model_supplement_notes
     shop_pick = pick_field_from_roles(
         processed,
         preferred_roles=["shop", "product_context", "product_title"],
@@ -984,6 +1135,20 @@ def process_capture_run(
     selection_state_raw = (
         metadata.get("selection_state") if isinstance(metadata, dict) else None
     )
+    if selection_state_raw is None:
+        selection_state_raw = load_selection_state_from_capture_files(run_dir)
+    if isinstance(selection_state_raw, dict):
+        b = enrich_selection_snapshot_from_discover(
+            run_dir, selection_state_raw.get("before")
+        )
+        a = enrich_selection_snapshot_from_discover(
+            run_dir, selection_state_raw.get("after")
+        )
+        if b is not None or a is not None:
+            selection_state_raw = {
+                "before": b if b is not None else selection_state_raw.get("before"),
+                "after": a if a is not None else selection_state_raw.get("after"),
+            }
     selection_state = reevaluate_selection_state(selection_state_raw)
     if isinstance(selection_state, dict):
         detail["selection_state_reevaluated"] = {
@@ -1011,9 +1176,78 @@ def process_capture_run(
                 + "; ".join(selection_state.get("inconsistency_reasons") or [])
             )
 
-    unit_info = p4b.analyze_spec_and_unit(
-        spec_candidates, model_candidates, business=biz
+    # Prefer DOM selected options; never treat full-panel OCR packs as selected.
+    current_selection = sel_spec.prefer_selection_side(selection_state_raw)
+    detail["current_selection"] = {
+        "selected_status": current_selection.get("selected_status"),
+        "selected_spec_text": current_selection.get("selected_spec_text"),
+        "selected_options": current_selection.get("selected_options"),
+        "available_options": current_selection.get("available_options"),
+        "variant_id": current_selection.get("variant_id"),
+        "purchase_quantity": current_selection.get("purchase_quantity"),
+        "purchase_quantity_status": current_selection.get("purchase_quantity_status"),
+        "selection_evidence": current_selection.get("selection_evidence"),
+        "snapshot_side": current_selection.get("snapshot_side"),
+        "rules_version": sel_spec.RULES_VERSION_SELECTED_SPEC,
+    }
+    selected_cands, selected_meta = sel_spec.selected_spec_candidates_for_unit(
+        current_selection
     )
+    detail["selected_spec_unit_input"] = selected_meta
+    unit_spec_input = (
+        selected_cands
+        if current_selection.get("selected_status") == sel_spec.SELECTED_EXTRACTED
+        else []
+    )
+    if (
+        current_selection.get("selected_status") != sel_spec.SELECTED_EXTRACTED
+        and spec_candidates
+    ):
+        detail["warnings"].append(
+            "OCR/面板规格候选含未确认选中项，已忽略用于包装匹配；"
+            f"raw_spec_candidate_count={len(spec_candidates)}"
+        )
+
+    unit_info = p4b.analyze_spec_and_unit(
+        unit_spec_input,
+        model_candidates,
+        business=biz,
+        model_scope_policy=model_scope_policy,
+    )
+    unit_info = dict(unit_info)
+    unit_info["selected_status"] = current_selection.get("selected_status")
+    unit_info["available_options_count"] = len(
+        current_selection.get("available_options") or []
+    )
+    sel_tokens = sel_spec.parse_spec_tokens(
+        current_selection.get("selected_spec_text")
+    )
+    pack_label, pack_reasons = sel_spec.classify_packaging_match(
+        selected_status=str(current_selection.get("selected_status") or ""),
+        page_spec_matched=bool(unit_info.get("page_spec_matched")),
+        selected_tokens=sel_tokens,
+        business_packs=str(biz.get("packs_per_box") or ""),
+        business_layers=str(biz.get("layers")) if biz.get("layers") is not None else None,
+        business_sheets=(
+            str(biz.get("sheets_or_pulls"))
+            if biz.get("sheets_or_pulls") is not None
+            else None
+        ),
+    )
+    unit_info["packaging_match_label"] = pack_label
+    packaging_match_value = pack_label
+    if pack_label != sel_spec.PACKAGING_PASSED:
+        unit_info["page_spec_matched"] = False
+        unit_info["box_comparable"] = False
+        unit_info["unit_status"] = "PENDING_VERIFY"
+        reasons = list(unit_info.get("unit_review_reasons") or [])
+        reasons.extend(pack_reasons)
+        unit_info["unit_review_reasons"] = list(dict.fromkeys(reasons))
+    if model_scope_policy:
+        detail["model_scope_policy_id"] = model_scope_policy.get("policy_id")
+        detail["model_scope_policy"] = str(
+            model_scope_policy.get("model_scope_policy") or ""
+        )
     if isinstance(selection_state, dict) and selection_consistent is not True:
         # Only enforce when capture recorded a selection_state block.
         if (
@@ -1028,8 +1262,29 @@ def process_capture_run(
             if selection_consistent is False:
                 reasons.append("核心已选规格/商品状态在截图前后变化，证据不可合并")
             else:
-                reasons.append("核心已选规格状态未知，证据不可合并")
-            unit_info["unit_review_reasons"] = reasons
+                # Purchase qty UNKNOWN on both sides is OK for single-box unit price;
+                # only block when selected option text cannot be compared.
+                sel_before = sel_spec.selection_snapshot_from_state(
+                    selection_state.get("before")
+                    if isinstance(selection_state.get("before"), dict)
+                    else None
+                )
+                sel_after = sel_spec.selection_snapshot_from_state(
+                    selection_state.get("after")
+                    if isinstance(selection_state.get("after"), dict)
+                    else None
+                )
+                if (
+                    sel_before.get("selected_status") == sel_spec.SELECTED_EXTRACTED
+                    and sel_after.get("selected_status") == sel_spec.SELECTED_EXTRACTED
+                    and sel_before.get("selected_spec_text")
+                    == sel_after.get("selected_spec_text")
+                ):
+                    # Selected text stable; do not force-block solely on qty UNKNOWN.
+                    pass
+                else:
+                    reasons.append("核心已选规格状态未知，证据不可合并")
+            unit_info["unit_review_reasons"] = list(dict.fromkeys(reasons))
 
     comparison = p4b.compare_to_red_line(
         price_selection.get("selected_price"),
@@ -1042,6 +1297,7 @@ def process_capture_run(
         price_selection, comparison, box_comparable=box_ok
     )
     red = red_line
+    # packaging_match_value set above via classify_packaging_match
 
     # Consistency: model conflicts among OCR
     ocr_models = sorted(
@@ -1142,7 +1398,9 @@ def process_capture_run(
         "spec_raw": spec_raw,
         "spec_normalized": spec_norm,
         "unit_verify_basis": "; ".join(unit_basis_parts),
-        "packaging_match": (
+        "packaging_match": packaging_match_value
+        if "packaging_match_value" in locals()
+        else (
             "PASSED" if unit_info.get("page_spec_matched") else "FAILED"
         ),
         "box_comparable": box_ok,

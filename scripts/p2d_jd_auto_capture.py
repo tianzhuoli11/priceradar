@@ -76,6 +76,12 @@ SELECTION_STABLE_REQUIRED_POLLS = 2
 # not hard-coded page absolute coordinates.
 PRICE_PAD_X_PX = 40
 PRICE_PAD_Y_PX = 36
+# Broader context around #main_price (labels / promo hints); keep digits crop separate.
+PRICE_CONTEXT_PAD_X_PX = 28
+PRICE_CONTEXT_MAX_WIDTH_PX = 480
+PRICE_CONTEXT_MAX_HEIGHT_PX = 260
+PRICE_CONTEXT_EXPAND_TOP_PX = 72
+PRICE_CONTEXT_EXPAND_BOTTOM_PX = 88
 REGION_PAD_X_PX = 12
 REGION_PAD_Y_PX = 10
 MAX_REGION_HEIGHT_PX = 420
@@ -449,7 +455,18 @@ def parse_core_selected_spec(raw_text: str | None) -> dict[str, Any]:
             "reason": "empty_selected_text",
         }
     stripped = strip_selection_noise(raw)
-    # Ensure leading 已选 for the regex; some blobs already have it.
+    if re.match(r"^规格\s+", stripped):
+        option = re.sub(r"^规格\s+", "", stripped).strip()
+        if option:
+            return {
+                "core_status": "EXTRACTED",
+                "core_selected_spec": f"已选 {option}，购买数量未知",
+                "selected_option_text": option,
+                "purchase_qty": None,
+                "raw_selected_blob": raw_text,
+                "stripped_text": stripped,
+                "reason": "bsk_spec_line_qty_unknown",
+            }
     if stripped.startswith("已选"):
         candidate = stripped
     elif "已选" in stripped:
@@ -550,6 +567,9 @@ def compare_selection_states(
         # Both absent: nothing to compare on this field (local fixtures / no sku token).
         if key in {"variant_token", "product_id"} and not bv and not av:
             continue
+        if key == "purchase_qty":
+            if (bv is None or bv == "") and (av is None or av == ""):
+                continue
         if bv is None or av is None or bv == "":
             reasons.append(f"{labels[key]} 缺失，无法比较")
             continue
@@ -1747,6 +1767,394 @@ def capture_price(page: Page, out_path: Path) -> dict[str, Any]:
     return info
 
 
+def measure_price_context_box(page: Page) -> dict[str, Any] | None:
+    """
+    DOM-based expanded box around #main_price for label/promo context.
+    Prefers a bounded ancestor that already contains the price node; never full-page.
+    """
+    return page.evaluate(
+        """(limits) => {
+            const el = document.querySelector('#main_price');
+            if (!el) return null;
+            const pushRect = (rects, r) => {
+                if (!r || r.width <= 0 || r.height <= 0) return;
+                rects.push({
+                    left: r.left, top: r.top, right: r.right, bottom: r.bottom
+                });
+            };
+            const inkRects = [];
+            const collectInk = (node) => {
+                if (!node || node.nodeType !== 1) return;
+                pushRect(inkRects, node.getBoundingClientRect());
+                try {
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    Array.from(range.getClientRects()).forEach((r) => pushRect(inkRects, r));
+                } catch (e) {}
+            };
+            collectInk(el);
+            el.querySelectorAll('em, .price_decimals, span').forEach(collectInk);
+            if (!inkRects.length) return null;
+            let left = Math.min(...inkRects.map((r) => r.left));
+            let top = Math.min(...inkRects.map((r) => r.top));
+            let right = Math.max(...inkRects.map((r) => r.right));
+            let bottom = Math.max(...inkRects.map((r) => r.bottom));
+
+            const labelHints = /到手|券后|会员|新人|预估|售价|价格|京东|优惠|PLUS|plus/;
+            let ancestorUsed = null;
+            let node = el.parentElement;
+            for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                const r = node.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                if (r.width > limits.maxWidth || r.height > limits.maxHeight) continue;
+                const text = (node.innerText || '').slice(0, 400);
+                const hasHint = labelHints.test(text);
+                left = Math.min(left, r.left);
+                top = Math.min(top, r.top);
+                right = Math.max(right, r.right);
+                bottom = Math.max(bottom, r.bottom);
+                ancestorUsed = {
+                    tag: node.tagName,
+                    className: String(node.className || '').slice(0, 80),
+                    has_hint: hasHint,
+                    width: r.width,
+                    height: r.height,
+                };
+                if (hasHint) break;
+            }
+
+            // Explicit expand so labels above/below ink survive even without ancestor text.
+            top -= limits.expandTop;
+            bottom += limits.expandBottom;
+            left -= limits.padX;
+            right += limits.padX;
+
+            let width = Math.min(Math.max(right - left, 0), limits.maxWidth);
+            let height = Math.min(Math.max(bottom - top, 0), limits.maxHeight);
+            // Ensure useful horizontal context on mobile (avoid ~digit-only width).
+            const minWidth = Math.min(
+                limits.maxWidth,
+                Math.max(280, (right - left) + 2 * limits.padX)
+            );
+            if (width < minWidth) width = Math.min(minWidth, window.innerWidth * 0.92);
+            const minHeight = Math.min(limits.maxHeight, 160);
+            if (height < minHeight) height = Math.min(minHeight, window.innerHeight * 0.55);
+
+            const inkCx = (Math.min(...inkRects.map((r) => r.left))
+                + Math.max(...inkRects.map((r) => r.right))) / 2;
+            const inkCy = (Math.min(...inkRects.map((r) => r.top))
+                + Math.max(...inkRects.map((r) => r.bottom))) / 2;
+            let x = inkCx - width / 2;
+            let y = top; // prefer expanded top (labels above price)
+            if (y + height > window.innerHeight - 8) {
+                y = Math.max(0, window.innerHeight - height - 8);
+            }
+            x = Math.max(0, Math.min(x, window.innerWidth - width));
+
+            return {
+                x, y, width, height,
+                ancestor: ancestorUsed,
+                device_pixel_ratio: window.devicePixelRatio || 1,
+                scroll_x: window.scrollX,
+                scroll_y: window.scrollY,
+                viewport: { width: window.innerWidth, height: window.innerHeight },
+                coordinate_space: 'css_viewport_px',
+                note: 'price_context_not_full_page',
+            };
+        }""",
+        {
+            "maxWidth": PRICE_CONTEXT_MAX_WIDTH_PX,
+            "maxHeight": PRICE_CONTEXT_MAX_HEIGHT_PX,
+            "expandTop": PRICE_CONTEXT_EXPAND_TOP_PX,
+            "expandBottom": PRICE_CONTEXT_EXPAND_BOTTOM_PX,
+            "padX": PRICE_CONTEXT_PAD_X_PX,
+        },
+    )
+
+
+def capture_price_context(page: Page, out_path: Path) -> dict[str, Any]:
+    """
+    Broader crop around #main_price for price labels / nearby promo copy.
+    Keeps crisp price.png unchanged; never falls back to full-page screenshot.
+    """
+    info: dict[str, Any] = {
+        "region": "price_context",
+        "filename": out_path.name,
+        "path": str(out_path.resolve()),
+        "capture_method": "automatic",
+        "selector": MAIN_PRICE_SELECTOR,
+        "status": "FAILED",
+        "save_status": "NOT_SAVED",
+        "content_quality_status": "UNCONFIRMED",
+        "integrity": "PENDING_USER_VERIFY",
+        "coordinate_space": "css_viewport_px",
+        "error": None,
+        "diagnostics": {},
+    }
+    diag = info["diagnostics"]
+    try:
+        if page.locator(MAIN_PRICE_SELECTOR).count() != 1:
+            info["status"] = "MATCH_COUNT_NOT_ONE"
+            info["error"] = "expected single #main_price"
+            return info
+        center_selector_in_viewport(page, MAIN_PRICE_SELECTOR)
+        page.wait_for_timeout(LAYOUT_STABLE_MS)
+        measured = measure_price_context_box(page)
+        if not measured:
+            info["status"] = "MEASURE_FAILED"
+            info["error"] = "price context box empty"
+            return info
+        content = {
+            "x": float(measured["x"]),
+            "y": float(measured["y"]),
+            "width": float(measured["width"]),
+            "height": float(measured["height"]),
+        }
+        vp = {
+            "width": float(measured["viewport"]["width"]),
+            "height": float(measured["viewport"]["height"]),
+        }
+        diag["context_box"] = dict(content)
+        diag["ancestor"] = measured.get("ancestor")
+
+        # Keep context clear of fixed chrome via bounded scroll.
+        for _ in range(MAX_PRICE_OCCLUSION_ADJUSTMENTS):
+            occ = detect_fixed_chrome_occlusion(
+                page, content, margin_px=PRICE_SAFE_MARGIN_PX
+            )
+            diag.setdefault("occlusion_checks", []).append(occ)
+            if not occ.get("occluded"):
+                break
+            delta = float(occ.get("suggested_scroll_delta_y") or 0)
+            if abs(delta) < 1:
+                break
+            apply_scroll_delta(page, delta)
+            page.wait_for_timeout(LAYOUT_STABLE_MS)
+            measured = measure_price_context_box(page)
+            if not measured:
+                break
+            content = {
+                "x": float(measured["x"]),
+                "y": float(measured["y"]),
+                "width": float(measured["width"]),
+                "height": float(measured["height"]),
+            }
+            vp = {
+                "width": float(measured["viewport"]["width"]),
+                "height": float(measured["viewport"]["height"]),
+            }
+
+        # Clamp into viewport without expanding to full page.
+        content["x"] = max(0.0, min(content["x"], vp["width"] - 8))
+        content["y"] = max(0.0, min(content["y"], vp["height"] - 8))
+        content["width"] = max(
+            8.0, min(content["width"], vp["width"] - content["x"])
+        )
+        content["height"] = max(
+            8.0, min(content["height"], vp["height"] - content["y"])
+        )
+        # Refuse if nearly full viewport (anti full-page fallback).
+        if (
+            content["width"] > vp["width"] * 0.92
+            and content["height"] > vp["height"] * 0.75
+        ):
+            info["status"] = "REFUSED_NEAR_FULL_PAGE"
+            info["error"] = "price_context would cover nearly full viewport; refused"
+            info["content_box_css_viewport"] = content
+            return info
+
+        info["content_box_css_viewport"] = dict(content)
+        shot = screenshot_clip(
+            page,
+            out_path,
+            content,
+            pad_x=8,
+            pad_y=8,
+            viewport=vp,
+        )
+        info["clip_box_css_viewport"] = shot.get("clip_box_css_viewport")
+        info["captured_at_utc"] = shot.get("captured_at_utc")
+        info["pixel_size"] = shot.get("pixel_size")
+        if shot.get("error"):
+            info["error"] = str(shot["error"])
+        if shot["status"] != "CAPTURED":
+            info["status"] = shot["status"]
+            info["save_status"] = "NOT_SAVED"
+            return info
+        info["save_status"] = "SAVED"
+        info["status"] = "CAPTURED"
+        info["content_quality_status"] = "GEOMETRY_OK_CONTENT_UNCONFIRMED"
+        info["notes"] = [
+            "price_context 补充标签/优惠上下文；price.png 仍保留清晰数字截图",
+            "非整页截图；不含刻意采集账户/地址区域",
+        ]
+        return info
+    except PlaywrightError as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        info["status"] = "FAILED"
+        return info
+
+
+def try_capture_promo_detail_readonly(
+    page: Page,
+    out_path: Path,
+    *,
+    promotions_discovery: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Open read-only promotion explanation only when discovery shows a clear entry.
+    No coupon claim, add-to-cart, checkout, or payment.
+    """
+    info: dict[str, Any] = {
+        "region": "promo_detail",
+        "filename": out_path.name,
+        "path": str(out_path.resolve()),
+        "capture_method": "automatic_readonly",
+        "status": "SKIPPED_NO_CLEAR_ENTRY",
+        "save_status": "NOT_SAVED",
+        "error": None,
+        "notes": [],
+    }
+    disc = promotions_discovery or {}
+    sample = str(disc.get("sample_text") or "")
+    status = str(disc.get("status") or "")
+    if status not in {"LOCATED", "FOUND", "CAPTURED"} and not sample:
+        info["notes"].append("无优惠区域发现结果，不展开")
+        return info
+    # Require an explicit promo row cue (门槛/优惠/券说明入口), not invent selectors blindly.
+    entry_cues = ("优惠", "满送", "满减", "领券", "促销")
+    if not any(c in sample for c in entry_cues):
+        info["notes"].append("优惠样本文案无明确入口线索，不展开")
+        return info
+
+    try:
+        url_before = page.url
+        # Prefer clicking the discovered promotions content box center if available.
+        box = disc.get("content_box_css_viewport") or disc.get("box")
+        clicked = False
+        if isinstance(box, dict) and box.get("width") and box.get("height"):
+            cx = float(box["x"]) + float(box["width"]) * 0.5
+            cy = float(box["y"]) + float(box["height"]) * 0.5
+            page.mouse.click(cx, cy)
+            clicked = True
+        if not clicked:
+            # Fallback: text-bearing 优惠 row near price (bounded).
+            loc = page.locator("text=优惠").first
+            if loc.count() == 0:
+                info["status"] = "SKIPPED_NO_CLEAR_ENTRY"
+                info["notes"].append("未找到可点击的优惠文案")
+                return info
+            loc.click(timeout=2500)
+            clicked = True
+        page.wait_for_timeout(700)
+        if page.url != url_before:
+            info["status"] = "STOPPED_PAGE_CHANGED"
+            info["notes"].append(
+                "点击优惠入口后发生导航/跳转；停止展开，不反复尝试"
+            )
+            try:
+                page.keyboard.press("Escape")
+            except PlaywrightError:
+                pass
+            return info
+
+        panel = page.evaluate(
+            """() => {
+                const nodes = Array.from(document.querySelectorAll('div, section, aside'));
+                const scored = [];
+                for (const n of nodes) {
+                    const st = window.getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    const r = n.getBoundingClientRect();
+                    if (r.width < 200 || r.height < 120) continue;
+                    if (r.width > window.innerWidth * 0.98 && r.height > window.innerHeight * 0.9) {
+                        continue; // refuse near-full-page
+                    }
+                    const t = (n.innerText || '').slice(0, 500);
+                    if (!t) continue;
+                    let score = 0;
+                    if (/优惠|满减|满送|券|促销|活动/.test(t)) score += 2;
+                    if (/到手|券后|预估/.test(t)) score += 3;
+                    if (/收货|地址|支付|结算|立即购买/.test(t)) score -= 5;
+                    if (score <= 0) continue;
+                    scored.push({
+                        score,
+                        x: r.left, y: r.top, width: r.width, height: r.height,
+                        sample: t.slice(0, 120),
+                    });
+                }
+                scored.sort((a, b) => b.score - a.score);
+                return scored[0] || null;
+            }"""
+        )
+        if not panel:
+            info["status"] = "OPENED_BUT_NO_PANEL"
+            info["notes"].append("已点击优惠入口但未识别说明面板；不猜金额")
+            page.keyboard.press("Escape")
+            return info
+
+        content = {
+            "x": float(panel["x"]),
+            "y": float(panel["y"]),
+            "width": float(panel["width"]),
+            "height": float(panel["height"]),
+        }
+        vp = page.evaluate(
+            "() => ({ width: window.innerWidth, height: window.innerHeight })"
+        )
+        info["panel_sample"] = panel.get("sample")
+        info["content_box_css_viewport"] = content
+        # Refuse if looks like account/address-heavy.
+        sample_panel = str(panel.get("sample") or "")
+        if any(x in sample_panel for x in ("收货地址", "支付方式", "立即购买", "去结算")):
+            info["status"] = "REFUSED_SENSITIVE_OR_CHECKOUT"
+            info["notes"].append("面板疑似含结算/地址信息，已放弃截图")
+            page.keyboard.press("Escape")
+            return info
+
+        shot = screenshot_clip(
+            page,
+            out_path,
+            content,
+            pad_x=10,
+            pad_y=10,
+            viewport={
+                "width": float(vp["width"]),
+                "height": float(vp["height"]),
+            },
+        )
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        info["pixel_size"] = shot.get("pixel_size")
+        if shot["status"] != "CAPTURED":
+            info["status"] = shot["status"]
+            info["error"] = shot.get("error")
+            return info
+        info["status"] = "CAPTURED"
+        info["save_status"] = "SAVED"
+        info["notes"].extend(
+            [
+                "只读优惠说明截图；未领券、未加购、未进结算",
+                "全店通用活动不得未经核实直接当作本商品到手价",
+                "无明确价格与叠加依据时仅保留条件，不猜最终金额",
+            ]
+        )
+        return info
+    except PlaywrightError as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        if "Execution context was destroyed" in msg or "navigation" in msg.lower():
+            info["status"] = "STOPPED_PAGE_CHANGED"
+            info["notes"].append("优惠展开触发页面上下文销毁/导航；已停止，不重试")
+        else:
+            info["status"] = "FAILED"
+        info["error"] = msg
+        try:
+            page.keyboard.press("Escape")
+        except PlaywrightError:
+            pass
+        return info
+
+
 def _region_safe_scroll_delta(
     content: dict[str, float],
     viewport: dict[str, float],
@@ -2807,6 +3215,16 @@ def run_auto_capture(
                         _log(f"  路径: {regions['price']['path']}")
 
                     _log("")
+                    _log("=== 自动截图 price_context.png（标签/优惠上下文）===")
+                    regions["price_context"] = capture_price_context(
+                        page, out_dir / "price_context.png"
+                    )
+                    _log(
+                        f"price_context: {regions['price_context']['status']} "
+                        f"size={regions['price_context'].get('pixel_size')}"
+                    )
+
+                    _log("")
                     _log("=== 语义发现标题/规格/优惠/店铺 ===")
                     model_for_clue = str(
                         (expected or {}).get("model") or CLUE_MODEL
@@ -2873,6 +3291,27 @@ def run_auto_capture(
                                 f"  未截图原因: "
                                 f"{regions[key].get('error') or regions[key]['status']}"
                             )
+
+                    # Read-only promo detail only when promotions row shows a clear entry.
+                    promo_disc = (discovery_raw or {}).get("promotions") or {}
+                    promo_for_entry = dict(promo_disc)
+                    if regions.get("promotions", {}).get("content_box_css_viewport"):
+                        promo_for_entry["content_box_css_viewport"] = regions[
+                            "promotions"
+                        ]["content_box_css_viewport"]
+                    if regions.get("promotions", {}).get("status"):
+                        promo_for_entry["status"] = regions["promotions"]["status"]
+                    _log("")
+                    _log("=== 只读优惠说明 promo_detail.png（有明确入口才展开）===")
+                    regions["promo_detail"] = try_capture_promo_detail_readonly(
+                        page,
+                        out_dir / "promo_detail.png",
+                        promotions_discovery=promo_for_entry,
+                    )
+                    _log(
+                        f"promo_detail: {regions['promo_detail']['status']} "
+                        f"notes={regions['promo_detail'].get('notes')}"
+                    )
 
                     try:
                         selection_state["after"] = snapshot_selection_state(page)

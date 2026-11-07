@@ -22,6 +22,11 @@
 - **P2-D**：全自动商品区域截图（价格区强制视口居中并避开固定底栏；已配合 P4-D 真实验收）
 - **P3-A**：单商品关键词自动搜索与候选链接收集（**本机实测可收集候选**：`run_id=20261024T121849Z_799abc`，`data-sku` 卡片提取；候选≠同款/最低价已核验。历史曾出现 `SEARCH_RESTRICTED`，机制未证实）
 - **P5-A**：任意搜索候选核验适配（业务配置与候选身份分离、URL 适配、型号边界匹配、到手价线索结构）。真实：`100005149674` 候选→截图→OCR 完成；`1143036`（B913AE）标题门控跳过。无声明到手价时标记「到手价待核验」，**不**宣称到手价识别已通过
+- **P5-B**：单业务 SKU 搜索→逐候选核验→商品/价格方案表与 HTML 报告（搜索/核验预算分离；非全平台）
+- **P5-C（阶段C）**：可配置搜索覆盖（`--max-candidates` / `--max-pages` / `--search-timeout-seconds`）与详情预算（`--max-verify`）。**分页控件已实现**（观察为桌面 SERP 真实「下一页」）；**完整跨页真实采集仍待验收**（近期搜索曾 `SEARCH_RESTRICTED`）。作业 `20261026T032108Z_B913A_reuse_afe4` 的 10 候选来自**先前分页探针首屏的显式复用验证**，**不是**「本次实时搜索收集 10 条」。历史数据复用**不得**在现网搜索受限后自动兜底，仅允许用户显式选择的离线/复用模式。到手价识别仍有缺口，扩覆盖≠已解决
+- **P5-D（阶段D）**：多 SKU Excel 输入→顺序执行单 SKU 流程→批量汇总 + checkpoint/resume（默认不做真实浏览器；真实多 SKU 待用户提供第二业务 SKU）
+- **P5-E（真实验收准备）**：业务 Excel 仅保留已确认 B913A；虚构数据在 fixtures。单商品到手价**人工辅助诊断**入口（用户指出位置/打开优惠说明后局部截图）；不算全自动通过。到手价证据缺口仍待用户采集。
+- **P5-F（完整搜索链接收集）**：`--collect-all` 遍历本次可访问结果页、边滚边采、跨页去重；只收集列表不打开详情。默认安全页数/总超时；达上限为 PARTIAL。COMPLETE 需明确末页证据。
 - **P4-A**：本地 OCR 离线识图验证（无图片模型 API）
 - **P4-B**：OCR 候选 → 主售价选择 / 单位分离 / 破价比较与输出表
 - **P4-C**：单次截图任务 → OCR → 比价表一键流程（不启动浏览器）
@@ -213,6 +218,22 @@ cd C:\Users\tianz\Desktop\jasmineskill\priceradar
 - 到手价：`POSSIBLE_BREAK`=疑似破价待人工确认；主展示价仅参考；`manual_verdict` 系统留空。
 - 标题明确为冲突型号（如 B913AE vs B913A）时可跳过打开详情。
 
+### P5-B：单 SKU 搜索→核验作业
+
+一次真实搜索后，仅消费**本次** `candidates.json`，顺序调用 P5-A；登录/验证码/限制时暂停剩余候选（`PAUSED_SESSION`，非普通失败）。
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\p5b_run_sku.py --self-check
+
+.\.venv\Scripts\python.exe .\scripts\p5b_run_sku.py `
+  --business-config .\config\products\b913a.json `
+  --query "清风 B913A" `
+  --limit 5
+```
+
+输出：`artifacts/sku_jobs/<job_id>/`（`product_rows.*`、`price_options.*`、`sku_summary.json`、`report.html`、`search/`、`candidates/`）。  
+报告标明「本次搜索范围内」；达到 limit≠全部商品；最低可比到手价不回退主展示价。
+
 ### P4-A：本地 OCR（RapidOCR + ONNX Runtime）
 
 不启动浏览器。读取已有截图，本地 OCR 后输出结构化候选。
@@ -343,6 +364,74 @@ python3 -m venv .venv
 - 每台电脑单独创建 `.venv`，单独建立 Profile，并在该机手动完成登录。
 - `.venv/` 与 `browser_profiles/` 已列入 `.gitignore`。
 
+### P5-D：多 SKU Excel 批量（阶段D）
+
+业务模板（仅已确认 B913A + 空白行；不含虚构测试商品）：
+
+`templates\batch_sku_input_template.xlsx`
+
+离线虚构样例（不得当业务默认）：`scripts\fixtures\batch_sku_input_synthetic.xlsx`
+
+```powershell
+# 生成/覆盖业务模板
+.\.venv\Scripts\python.exe .\scripts\p5d_run_batch.py --write-template
+
+# 仅校验输入并生成预览（不访问京东）
+.\.venv\Scripts\python.exe .\scripts\p5d_run_batch.py --validate-only --excel .\templates\batch_sku_input_template.xlsx
+
+# 离线自检（synthetic/offline，不启浏览器）
+.\.venv\Scripts\python.exe .\scripts\p5d_run_batch.py --self-check
+
+# 真实批量（需登录态；搜索受限时会暂停整批，不自动复用历史候选）
+.\.venv\Scripts\python.exe .\scripts\p5d_run_batch.py --excel .\templates\batch_sku_input_template.xlsx --max-candidates 10 --max-pages 3 --max-verify 5 --max-verify-total 20
+
+# 显式恢复指定批次（核对输入指纹与规则版本；已完成项不重抓）
+.\.venv\Scripts\python.exe .\scripts\p5d_run_batch.py --excel .\templates\batch_sku_input_template.xlsx --resume <batch_id>
+```
+
+输出唯一目录：`artifacts\batch_jobs\<batch_id>\`（输入快照、校验、checkpoint、商品/价格明细、中文 HTML、`batch_results.xlsx`）。
+
+验收边界：离线批量与 `--validate-only` 可本轮验收；**真实多 SKU 端到端**待用户提供第二个业务 SKU 并择时执行；**完整跨页真实采集**仍待验收；到手价证据缺口未关闭。历史复用不得在搜索受限后自动兜底。
+
+### P5-E：到手价证据人工诊断
+
+审查已有真实截图/OCR后：**主展示价**可识别；**声明到手价标签**在已存证据中未出现。优惠区多为满赠门槛；`promo_detail` 曾跳转店铺。缺口归类见 `artifacts\take_home_diagnose\_evidence_gap_conclusion.json`。
+
+单商品交互诊断（用户选择何时打开浏览器；不自动搜索）：
+
+```powershell
+# 离线自检（不启浏览器）
+.\.venv\Scripts\python.exe .\scripts\p5e_take_home_diagnose.py --self-check
+
+# 打开已确认 B913A 详情（默认业务配置）；或显式传入链接/商品ID
+.\.venv\Scripts\python.exe .\scripts\p5e_take_home_diagnose.py --business-config .\config\products\b913a.json
+.\.venv\Scripts\python.exe .\scripts\p5e_take_home_diagnose.py --product-id 100005149674 --business-config .\config\products\b913a.json
+.\.venv\Scripts\python.exe .\scripts\p5e_take_home_diagnose.py --url "https://item.m.jd.com/product/100005149674.html" --business-config .\config\products\b913a.json
+```
+
+窗口打开后：确认规格 → 指出到手价或手动打开优惠说明 → 终端输入 `capture` → 可多次 → `quit` 结束。不领券/加购/结算。产出：`artifacts\take_home_diagnose\<run_id>\`（局部截图 + 脱敏诊断 + `report.html`）。**人工诊断 ≠ 全自动通过**。
+
+### P5-F：完整搜索结果链接收集
+
+此前少量候选原因：默认 `max_candidates`（常 5–20）同页截断、`max_pages=2`、`search_timeout=60s`；分页探针未见真实第 2 页确认。
+
+```powershell
+# 离线自检
+.\.venv\Scripts\python.exe .\scripts\p5f_collect_all_links.py --self-check
+
+# 真实 collect-all（默认 Playwright / jd_persistent；只采列表，不打开详情；受限即停）
+.\.venv\Scripts\python.exe .\scripts\p5f_collect_all_links.py --collect-all --query "清风 B913A" --business-config .\config\products\b913a.json --max-pages 30 --search-timeout-seconds 900
+
+# BrowserSkill 日常 Chrome（复用 P5-G 翻页；不自动切换；多实例时加 --browser）
+# 先在独立 PowerShell 保持: .\scripts\fixtures\start_bsk_daemon.ps1
+.\.venv\Scripts\python.exe .\scripts\p5f_collect_all_links.py --collect-all --backend bsk --query "清风 B913A" --business-config .\config\products\b913a.json --max-pages 30 --search-timeout-seconds 900
+
+# 显式恢复（须同一 query / backend / rules_version）
+.\.venv\Scripts\python.exe .\scripts\p5f_collect_all_links.py --collect-all --backend bsk --resume <run_id> --query "清风 B913A"
+```
+
+输出：`artifacts\collect_all_runs\<run_id>\`（`all_candidates.csv/json`、`occurrences.csv`、`coverage.json`、`pages/page_*.json`、`report.html`、`checkpoint.json`）。报告写「本次关键词搜索结果遍历完成/部分完成」，不得写全平台同款。
+
 ## 当前明确不做
 
-只输入 SKU 的全自动监控、自动搜索闭环、AI API 调用、Excel、购物车/领券/结算、自动填写登录凭据、Cookie/Token 导出。
+只输入 SKU 的全自动监控、自动搜索闭环、AI API 调用、自动定时/通知、购物车/领券/结算、自动填写登录凭据、Cookie/Token 导出。

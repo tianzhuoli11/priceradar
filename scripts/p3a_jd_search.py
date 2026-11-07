@@ -29,15 +29,38 @@ SEARCH_ENTRY_STRATEGY = (
 SEARCH_BASE = "https://search.jd.com/Search"
 
 NAVIGATION_TIMEOUT_MS = 60_000
-MAX_LIMIT = 5
+# Legacy CLI --limit default was 5; Phase C search default is 20.
+MAX_LIMIT = 5  # kept for older validate_args callers; prefer MAX_CANDIDATES_CAP
+DEFAULT_MAX_CANDIDATES = 20
+MAX_CANDIDATES_CAP = 50
+DEFAULT_MAX_PAGES = 2
+MAX_PAGES_CAP = 10
+DEFAULT_SEARCH_TIMEOUT_SECONDS = 60
 MAX_SCROLLS = 3
 SCROLL_PAUSE_MS = 800
 SCROLL_BUDGET_MS = 8_000
 EXTRACT_TIMEOUT_MS = 20_000
 # After DOMContentLoaded, wait for either goods cards or a blocking tip.
 RESULT_READY_TIMEOUT_MS = 12_000
+# Wait after clicking observed 「下一页」 for real progress (new IDs / page label).
+PAGE_PROGRESS_TIMEOUT_MS = 15_000
+PAGE_PROGRESS_POLL_MS = 500
 # New JD search UI uses div[data-sku] cards; classic item.jd.com anchors may be absent.
 RESULT_CARD_SELECTOR = "[data-sku]"
+
+# Coverage stop reasons (search stage)
+STOP_HIT_CANDIDATE_LIMIT = "HIT_CANDIDATE_LIMIT"
+STOP_HIT_PAGE_BUDGET = "HIT_PAGE_BUDGET"
+STOP_SEARCH_TIMEOUT = "SEARCH_TIMEOUT"
+STOP_NO_MORE_RESULTS = "NO_MORE_RESULTS"
+STOP_NO_PROGRESS = "NO_PROGRESS"
+STOP_LOGIN_REQUIRED = "LOGIN_REQUIRED"
+STOP_VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
+STOP_SEARCH_RESTRICTED = "SEARCH_RESTRICTED"
+STOP_EXTRACTION_FAILED = "EXTRACTION_FAILED"
+STOP_NAVIGATION_FAILED = "NAVIGATION_FAILED"
+STOP_NO_RESULTS = "NO_RESULTS"
+STOP_LOAD_FAILED = "LOAD_FAILED"
 
 # Accepted detail URL path patterns (digits = JD product id).
 RE_ITEM_JD = re.compile(
@@ -495,6 +518,331 @@ def limited_scroll_for_lazy_load(page: Page) -> dict[str, Any]:
     }
 
 
+def page_scroll_metrics(page: Page) -> dict[str, Any]:
+    """Viewport / document scroll metrics for end-of-page checks."""
+    try:
+        return dict(
+            page.evaluate(
+                """() => ({
+                    scroll_y: window.scrollY || 0,
+                    inner_height: window.innerHeight || 0,
+                    scroll_height: Math.max(
+                        document.documentElement.scrollHeight || 0,
+                        document.body ? document.body.scrollHeight : 0
+                    ),
+                    at_bottom: (window.scrollY + window.innerHeight)
+                        >= (Math.max(
+                            document.documentElement.scrollHeight || 0,
+                            document.body ? document.body.scrollHeight : 0
+                        ) - 40)
+                })"""
+            )
+            or {}
+        )
+    except PlaywrightError as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "at_bottom": False}
+
+
+def resolve_search_budget(
+    *,
+    limit: int | None = None,
+    max_candidates: int | None = None,
+    max_pages: int | None = None,
+    search_timeout_seconds: int | None = None,
+    limit_explicit: bool = False,
+    max_candidates_explicit: bool = False,
+    max_pages_explicit: bool = False,
+    search_timeout_explicit: bool = False,
+) -> dict[str, Any]:
+    """
+    Resolve search coverage budget. --limit is legacy alias for max_candidates.
+    Conflict when both --limit and --max-candidates are set to different values.
+    """
+    if limit_explicit and max_candidates_explicit and limit != max_candidates:
+        raise ValueError(
+            f"--limit={limit} 与 --max-candidates={max_candidates} 冲突；"
+            "请只保留其一，或使两者相等"
+        )
+    if limit_explicit and not max_candidates_explicit:
+        mc = int(limit)  # type: ignore[arg-type]
+    elif max_candidates_explicit:
+        mc = int(max_candidates)  # type: ignore[arg-type]
+    else:
+        mc = DEFAULT_MAX_CANDIDATES
+
+    mp = (
+        int(max_pages)
+        if max_pages_explicit and max_pages is not None
+        else DEFAULT_MAX_PAGES
+    )
+    st = (
+        int(search_timeout_seconds)
+        if search_timeout_explicit and search_timeout_seconds is not None
+        else DEFAULT_SEARCH_TIMEOUT_SECONDS
+    )
+
+    if mc < 1 or mc > MAX_CANDIDATES_CAP:
+        raise ValueError(f"max-candidates 必须是 1..{MAX_CANDIDATES_CAP}")
+    if mp < 1 or mp > MAX_PAGES_CAP:
+        raise ValueError(f"max-pages 必须是 1..{MAX_PAGES_CAP}")
+    if st < 5 or st > 600:
+        raise ValueError("search-timeout-seconds 必须是 5..600")
+
+    return {
+        "max_candidates": mc,
+        "max_pages": mp,
+        "search_timeout_seconds": st,
+        "limit_compat": mc,
+        "legacy_limit_mode": bool(limit_explicit and not max_candidates_explicit),
+    }
+
+
+def collect_visible_product_ids(page: Page) -> list[str]:
+    return list(
+        page.evaluate(
+            """() => {
+                const ids = [];
+                const seen = new Set();
+                for (const el of document.querySelectorAll('[data-sku]')) {
+                    const id = String(el.getAttribute('data-sku') || '').trim();
+                    if (!id || !/^\\d{5,}$/.test(id) || seen.has(id)) continue;
+                    seen.add(id);
+                    ids.push(id);
+                }
+                return ids;
+            }"""
+        )
+        or []
+    )
+
+
+def discover_next_page_control(page: Page) -> dict[str, Any]:
+    """
+    Observe real pagination controls on the rendered SERP.
+    Prefer a leaf whose visible text is exactly 「下一页」 (not ancestor wrappers).
+    Does not invent URL page parameters.
+    """
+    return page.evaluate(
+        """() => {
+            const out = {
+                status: 'NOT_FOUND',
+                control: null,
+                pager_text: null,
+                total_pages_hint: null,
+                current_page_hint: null,
+                disabled: false,
+                notes: [],
+            };
+            const nodes = Array.from(
+                document.querySelectorAll('a, button, span, div, li, em, i')
+            );
+            const exact = [];
+            for (const el of nodes) {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (t !== '下一页') continue;
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                // Reject huge wrappers that merely contain the label deep inside.
+                if (r.width > 220 || r.height > 80) continue;
+                const cls = typeof el.className === 'string' ? el.className : '';
+                const ariaDisabled = (el.getAttribute('aria-disabled') || '') === 'true';
+                const disabledAttr = el.hasAttribute('disabled');
+                const disabledCls = /disabled|is-disabled|pagination_disable/i.test(cls);
+                exact.push({
+                    tag: el.tagName,
+                    className: cls.slice(0, 120),
+                    id: el.id || '',
+                    text: t,
+                    href: el.href || el.getAttribute('href') || null,
+                    x: r.left, y: r.top, width: r.width, height: r.height,
+                    area: r.width * r.height,
+                    disabled: ariaDisabled || disabledAttr || disabledCls,
+                });
+            }
+            exact.sort((a, b) => a.area - b.area);
+            if (exact.length) {
+                out.control = exact[0];
+                out.disabled = !!exact[0].disabled;
+                out.status = out.disabled ? 'DISABLED' : 'FOUND';
+            }
+
+            // Record pager strip text if a compact bar contains 上一页/下一页.
+            for (const el of nodes) {
+                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length > 80) continue;
+                if (!(t.includes('下一页') && (t.includes('上一页') || /共\\s*\\d+\\s*页/.test(t)))) {
+                    continue;
+                }
+                const r = el.getBoundingClientRect();
+                if (r.height > 100 || r.width < 80) continue;
+                out.pager_text = t;
+                const mTotal = t.match(/共\\s*(\\d+)\\s*页/);
+                if (mTotal) out.total_pages_hint = parseInt(mTotal[1], 10);
+                // Heuristic: digit immediately after 上一页 is often current on JD strip.
+                const mCur = t.match(/上一页\\s*(\\d+)/);
+                if (mCur) out.current_page_hint = parseInt(mCur[1], 10);
+                break;
+            }
+            if (!out.control) out.notes.push('未观察到可点的叶子「下一页」控件');
+            return out;
+        }"""
+    )
+
+
+def click_observed_next_page(page: Page, control: dict[str, Any]) -> dict[str, Any]:
+    """Click the observed next-page control after scrolling it into view."""
+    info: dict[str, Any] = {"ok": False, "error": None, "method": None}
+    try:
+        page.evaluate(
+            """(c) => {
+                const nodes = Array.from(
+                    document.querySelectorAll('a, button, span, div, li, em, i')
+                );
+                let target = null;
+                for (const el of nodes) {
+                    const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                    if (t !== '下一页') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0 || r.width > 220 || r.height > 80) {
+                        continue;
+                    }
+                    const cls = typeof el.className === 'string' ? el.className : '';
+                    if (c && c.className && cls === c.className) {
+                        target = el;
+                        break;
+                    }
+                    if (!target) target = el;
+                }
+                if (target) target.scrollIntoView({block: 'center', inline: 'nearest'});
+                return !!target;
+            }""",
+            {
+                "className": (control or {}).get("className"),
+            },
+        )
+        page.wait_for_timeout(400)
+        # Re-measure after scroll
+        disc = discover_next_page_control(page)
+        ctrl = disc.get("control") or control
+        if not ctrl:
+            info["error"] = "next_control_missing_after_scroll"
+            return info
+        if disc.get("disabled") or ctrl.get("disabled"):
+            info["error"] = "next_control_disabled"
+            info["disabled"] = True
+            return info
+        cx = float(ctrl["x"]) + float(ctrl["width"]) / 2
+        cy = float(ctrl["y"]) + float(ctrl["height"]) / 2
+        page.mouse.click(cx, cy)
+        info["ok"] = True
+        info["method"] = "mouse_click_observed_next"
+        info["clicked"] = {
+            "x": cx,
+            "y": cy,
+            "className": ctrl.get("className"),
+            "text": ctrl.get("text"),
+        }
+        return info
+    except PlaywrightError as exc:
+        info["error"] = f"{type(exc).__name__}: {exc}"
+        return info
+
+
+def wait_for_search_batch_progress(
+    page: Page,
+    *,
+    before_ids: set[str],
+    before_url: str,
+    before_page_hint: int | None,
+    timeout_ms: int = PAGE_PROGRESS_TIMEOUT_MS,
+) -> dict[str, Any]:
+    """
+    Wait until an explicit progress signal after a load action.
+    Click-complete / HTTP 200 / scroll-alone are NOT success.
+    """
+    started = utc_now()
+    deadline = started.timestamp() + (timeout_ms / 1000.0)
+    last_ids: list[str] = []
+    while utc_now().timestamp() < deadline:
+        restriction = detect_search_restriction(page)
+        if restriction:
+            return {
+                "progressed": False,
+                "reason": "SEARCH_RESTRICTED",
+                "restriction": restriction,
+                "ids": collect_visible_product_ids(page),
+                "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+            }
+        diag = diagnose_page_state(page)
+        if diag in {
+            STATUS_LOGIN_REQUIRED,
+            STATUS_VERIFICATION_REQUIRED,
+            STATUS_SEARCH_RESTRICTED,
+        }:
+            return {
+                "progressed": False,
+                "reason": diag,
+                "ids": collect_visible_product_ids(page),
+                "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+            }
+        last_ids = collect_visible_product_ids(page)
+        new_ids = [i for i in last_ids if i not in before_ids]
+        pager = discover_next_page_control(page)
+        page_hint = pager.get("current_page_hint")
+        url_changed = page.url != before_url
+        page_changed = (
+            before_page_hint is not None
+            and page_hint is not None
+            and int(page_hint) != int(before_page_hint)
+        )
+        if new_ids:
+            return {
+                "progressed": True,
+                "reason": "NEW_PRODUCT_IDS",
+                "new_ids": new_ids,
+                "ids": last_ids,
+                "url_changed": url_changed,
+                "page_hint_before": before_page_hint,
+                "page_hint_after": page_hint,
+                "pager": pager,
+                "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+            }
+        if page_changed:
+            return {
+                "progressed": True,
+                "reason": "PAGE_LABEL_CHANGED",
+                "new_ids": new_ids,
+                "ids": last_ids,
+                "url_changed": url_changed,
+                "page_hint_before": before_page_hint,
+                "page_hint_after": page_hint,
+                "pager": pager,
+                "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+            }
+        # Explicit end-of-results copy
+        try:
+            tail = collect_visible_text(page, max_chars=3000)[-600:]
+        except PlaywrightError:
+            tail = ""
+        if any(x in tail for x in ("没有更多", "已到底", "没有找到")):
+            return {
+                "progressed": False,
+                "reason": "NO_MORE_RESULTS",
+                "ids": last_ids,
+                "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+            }
+        page.wait_for_timeout(PAGE_PROGRESS_POLL_MS)
+
+    return {
+        "progressed": False,
+        "reason": "TIMEOUT_NO_PROGRESS",
+        "new_ids": [i for i in last_ids if i not in before_ids],
+        "ids": last_ids,
+        "url_changed": page.url != before_url,
+        "elapsed_ms": int((utc_now() - started).total_seconds() * 1000),
+    }
+
+
 def extract_raw_candidates(page: Page) -> dict[str, Any]:
     """
     Auto-discover product candidates on the rendered search page.
@@ -683,6 +1031,7 @@ def build_candidate_records(
     query: str,
     limit: int,
     source_url: str,
+    load_batch: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     classified: list[dict[str, Any]] = []
     rejected = 0
@@ -698,7 +1047,17 @@ def build_candidate_records(
             if not info.get("product_id"):
                 continue
         title = str(row.get("title") or "")
-        ad_marked = bool(row.get("ad_marked"))
+        # ad_marked from same card only; False means「未发现标识」not「确认非广告」
+        if "ad_marked" not in row or row.get("ad_marked") is None:
+            ad_marked = None
+            ad_status = "广告标识未知，不能写 false"
+        else:
+            ad_marked = bool(row.get("ad_marked"))
+            ad_status = (
+                "页面有广告标识"
+                if ad_marked
+                else "未发现广告标识，不能断言非广告"
+            )
         source = str(row.get("source") or "item_anchor")
         normalize_status = info.get("normalize_status")
         if source == "data_sku_card" and info.get("product_id"):
@@ -720,7 +1079,7 @@ def build_candidate_records(
             "product_id": product_id,
             "shop_name": row.get("shop"),
             "ad_marked": ad_marked,
-            "ad_status": "页面有广告标识" if ad_marked else "未发现广告标识，不能断言非广告",
+            "ad_status": ad_status,
             "observed_url": info.get("observed_url"),
             "normalized_url": info.get("normalized_url")
             or (
@@ -734,6 +1093,7 @@ def build_candidate_records(
             "discovered_at_utc": utc_iso(),
             "match_status": match_status_for_title(title, query),
             "price": None,
+            "first_seen_load_batch": load_batch,
         }
         classified.append(record)
 
@@ -749,6 +1109,510 @@ def build_candidate_records(
         "deduped_count": len(deduped),
     }
     return deduped, stats
+
+
+def merge_first_seen_candidates(
+    accumulated: list[dict[str, Any]],
+    batch_records: list[dict[str, Any]],
+    *,
+    max_candidates: int,
+    load_batch: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Keep first rank/appearance by JD product id; re-number global ranks."""
+    seen = {
+        str(c.get("product_id"))
+        for c in accumulated
+        if c.get("product_id")
+    }
+    added = 0
+    for rec in batch_records:
+        if len(accumulated) >= max_candidates:
+            break
+        pid = str(rec.get("product_id") or "")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        item = dict(rec)
+        item["first_seen_load_batch"] = load_batch
+        accumulated.append(item)
+        added += 1
+    for i, item in enumerate(accumulated, start=1):
+        item["rank"] = i
+    return accumulated, added
+
+
+def collect_candidates_across_pages(
+    page: Page,
+    *,
+    query: str,
+    max_candidates: int,
+    max_pages: int,
+    search_deadline: float,
+    log: Any = print,
+) -> dict[str, Any]:
+    """
+    Extract + optional next-page loads within budgets.
+    Mechanism (observed 2026-10): desktop SERP has real 「下一页」 pager
+    (e.g. 「上一页 1 2 … 下一页 共12页」), not load-more.
+    Progress requires new product IDs or page-label change.
+    """
+    candidates: list[dict[str, Any]] = []
+    load_batches: list[dict[str, Any]] = []
+    scroll_total = 0
+    raw_cards_observed = 0
+    pages_confirmed: int | None = None
+    stop_reason = STOP_HIT_PAGE_BUDGET
+    related_reasons: list[str] = []
+    run_status = STATUS_PARTIAL
+    status_reason = "in_progress"
+    restriction_info: dict[str, Any] | None = None
+    incomplete_due_to_restriction = False
+    pagination_mechanism = "observed_next_page_control"
+    extract_stats: dict[str, Any] = {}
+
+    def timed_out() -> bool:
+        return utc_now().timestamp() >= search_deadline
+
+    def extract_batch(batch_index: int) -> dict[str, Any]:
+        nonlocal raw_cards_observed, extract_stats, restriction_info
+        nonlocal run_status, status_reason, incomplete_due_to_restriction
+        batch_meta: dict[str, Any] = {
+            "load_batch": batch_index,
+            "url": sanitize_source_search_url(page.url),
+            "new_id_count": 0,
+            "unique_after": len(candidates),
+        }
+        if timed_out():
+            batch_meta["stopped"] = STOP_SEARCH_TIMEOUT
+            return {"stop": STOP_SEARCH_TIMEOUT, "batch": batch_meta}
+
+        restriction_info = detect_search_restriction(page)
+        if restriction_info:
+            batch_meta["stopped"] = STOP_SEARCH_RESTRICTED
+            return {"stop": STOP_SEARCH_RESTRICTED, "batch": batch_meta}
+
+        try:
+            raw = extract_raw_candidates(page)
+        except PlaywrightError as exc:
+            batch_meta["error"] = f"{type(exc).__name__}: {exc}"
+            return {"stop": STOP_EXTRACTION_FAILED, "batch": batch_meta}
+
+        cards = int(raw.get("data_sku_card_count") or 0)
+        anchors = int(raw.get("anchor_count_raw") or 0)
+        raw_cards_observed += max(cards, anchors)
+        rows = list(raw.get("candidate_rows") or [])
+        batch_records, stats = build_candidate_records(
+            rows,
+            query=query,
+            limit=max_candidates,
+            source_url=page.url,
+            load_batch=batch_index,
+        )
+        extract_stats = {
+            **extract_stats,
+            **{f"batch{batch_index}_{k}": v for k, v in stats.items()},
+            "anchor_count_raw_last": anchors,
+            "data_sku_card_count_last": cards,
+            "page_title": raw.get("page_title"),
+        }
+        before = len(candidates)
+        merge_first_seen_candidates(
+            candidates,
+            batch_records,
+            max_candidates=max_candidates,
+            load_batch=batch_index,
+        )
+        added = len(candidates) - before
+        batch_meta["new_id_count"] = added
+        batch_meta["unique_after"] = len(candidates)
+        batch_meta["raw_rows"] = len(rows)
+        pager = discover_next_page_control(page)
+        batch_meta["pager"] = {
+            "status": pager.get("status"),
+            "pager_text": pager.get("pager_text"),
+            "current_page_hint": pager.get("current_page_hint"),
+            "total_pages_hint": pager.get("total_pages_hint"),
+            "disabled": pager.get("disabled"),
+        }
+        return {"stop": None, "batch": batch_meta, "pager": pager, "raw": raw}
+
+    # --- Batch 0: wait + in-page lazy scroll + extract ---
+    wait_info = wait_for_search_content(page)
+    log(
+        f"结果等待: outcome={wait_info.get('wait_outcome')} "
+        f"data_sku={wait_info.get('data_sku_count_after_wait')}"
+    )
+    if detect_search_restriction(page):
+        restriction_info = detect_search_restriction(page)
+        stop_reason = STOP_SEARCH_RESTRICTED
+        run_status = STATUS_SEARCH_RESTRICTED
+        status_reason = "visible_search_frequency_block_after_wait"
+        return _coverage_result(
+            candidates,
+            load_batches,
+            scroll_total,
+            raw_cards_observed,
+            pages_confirmed,
+            stop_reason,
+            related_reasons,
+            run_status,
+            status_reason,
+            restriction_info,
+            incomplete_due_to_restriction,
+            pagination_mechanism,
+            extract_stats,
+            wait_info,
+            max_candidates,
+            max_pages,
+        )
+    if wait_info.get("wait_outcome") == "verification":
+        stop_reason = STOP_VERIFICATION_REQUIRED
+        run_status = STATUS_VERIFICATION_REQUIRED
+        status_reason = "verification_after_wait"
+        return _coverage_result(
+            candidates,
+            load_batches,
+            scroll_total,
+            raw_cards_observed,
+            pages_confirmed,
+            stop_reason,
+            related_reasons,
+            run_status,
+            status_reason,
+            restriction_info,
+            incomplete_due_to_restriction,
+            pagination_mechanism,
+            extract_stats,
+            wait_info,
+            max_candidates,
+            max_pages,
+        )
+
+    scroll_info = limited_scroll_for_lazy_load(page)
+    scroll_info["result_wait"] = wait_info
+    scroll_total += int(scroll_info.get("scroll_count") or 0)
+    if scroll_info.get("restriction"):
+        restriction_info = scroll_info["restriction"]
+        stop_reason = STOP_SEARCH_RESTRICTED
+        run_status = STATUS_SEARCH_RESTRICTED
+        status_reason = str(scroll_info.get("stopped_reason") or stop_reason)
+        incomplete_due_to_restriction = False
+        return _coverage_result(
+            candidates,
+            load_batches,
+            scroll_total,
+            raw_cards_observed,
+            pages_confirmed,
+            stop_reason,
+            related_reasons,
+            run_status,
+            status_reason,
+            restriction_info,
+            incomplete_due_to_restriction,
+            pagination_mechanism,
+            extract_stats,
+            scroll_info,
+            max_candidates,
+            max_pages,
+        )
+
+    r0 = extract_batch(0)
+    load_batches.append(r0["batch"])
+    if r0.get("pager") and r0["pager"].get("current_page_hint") is not None:
+        pages_confirmed = 1
+    elif r0.get("batch", {}).get("new_id_count", 0) > 0 or candidates:
+        # First scope loaded; page index not confirmed from UI → null unless hint.
+        pages_confirmed = 1 if (r0.get("pager") or {}).get("pager_text") else None
+
+    if r0.get("stop"):
+        stop_reason = r0["stop"]
+        if stop_reason == STOP_SEARCH_RESTRICTED:
+            run_status = STATUS_SEARCH_RESTRICTED
+            restriction_info = detect_search_restriction(page) or restriction_info
+        elif stop_reason == STOP_EXTRACTION_FAILED:
+            run_status = STATUS_EXTRACTION_FAILED
+        status_reason = stop_reason
+        return _coverage_result(
+            candidates,
+            load_batches,
+            scroll_total,
+            raw_cards_observed,
+            pages_confirmed,
+            stop_reason,
+            related_reasons,
+            run_status,
+            status_reason,
+            restriction_info,
+            incomplete_due_to_restriction,
+            pagination_mechanism,
+            extract_stats,
+            scroll_info,
+            max_candidates,
+            max_pages,
+        )
+
+    if not candidates:
+        again = diagnose_page_state(page)
+        raw = r0.get("raw") or {}
+        if again == STATUS_NO_RESULTS:
+            stop_reason = STOP_NO_RESULTS
+            run_status = STATUS_NO_RESULTS
+            status_reason = "explicit_no_results_copy"
+        elif int(raw.get("anchor_count_raw") or 0) > 0 or int(
+            raw.get("data_sku_card_count") or 0
+        ) > 0:
+            stop_reason = STOP_EXTRACTION_FAILED
+            run_status = STATUS_EXTRACTION_FAILED
+            status_reason = "cards_present_but_no_reliable_candidates"
+        else:
+            stop_reason = STOP_EXTRACTION_FAILED
+            run_status = STATUS_EXTRACTION_FAILED
+            status_reason = "zero_product_signals"
+        return _coverage_result(
+            candidates,
+            load_batches,
+            scroll_total,
+            raw_cards_observed,
+            pages_confirmed,
+            stop_reason,
+            related_reasons,
+            run_status,
+            status_reason,
+            restriction_info,
+            incomplete_due_to_restriction,
+            pagination_mechanism,
+            extract_stats,
+            scroll_info,
+            max_candidates,
+            max_pages,
+        )
+
+    # --- Further pages via observed 「下一页」 ---
+    pages_loaded = 1  # initial scope counts as first page/batch
+    while len(candidates) < max_candidates and pages_loaded < max_pages:
+        if timed_out():
+            stop_reason = STOP_SEARCH_TIMEOUT
+            related_reasons.append(STOP_HIT_PAGE_BUDGET if pages_loaded >= max_pages else "")
+            related_reasons = [r for r in related_reasons if r]
+            status_reason = "search_budget_timeout"
+            run_status = STATUS_PARTIAL if candidates else STATUS_EXTRACTION_FAILED
+            break
+
+        pager = discover_next_page_control(page)
+        if pager.get("status") == "DISABLED" or pager.get("disabled"):
+            stop_reason = STOP_NO_MORE_RESULTS
+            status_reason = "next_page_disabled"
+            run_status = (
+                STATUS_SUCCESS
+                if len(candidates) >= max_candidates
+                else STATUS_PARTIAL
+            )
+            break
+        if pager.get("status") != "FOUND" or not pager.get("control"):
+            # No clear next control — do not invent URL pagination.
+            stop_reason = STOP_NO_MORE_RESULTS
+            status_reason = "no_observed_next_page_control"
+            pagination_mechanism = "no_next_control_after_batch0"
+            run_status = STATUS_PARTIAL
+            break
+
+        before_ids = set(collect_visible_product_ids(page))
+        before_url = page.url
+        before_hint = pager.get("current_page_hint")
+        log(
+            f"翻页: 点击观察到的「下一页」 "
+            f"(batch={pages_loaded} → {pages_loaded + 1}, "
+            f"pager={pager.get('pager_text')!r})"
+        )
+        click_info = click_observed_next_page(page, pager.get("control") or {})
+        if click_info.get("disabled"):
+            stop_reason = STOP_NO_MORE_RESULTS
+            status_reason = "next_disabled_at_click"
+            run_status = STATUS_PARTIAL
+            break
+        if not click_info.get("ok"):
+            stop_reason = STOP_LOAD_FAILED
+            status_reason = f"next_click_failed:{click_info.get('error')}"
+            related_reasons.append(STOP_NO_PROGRESS)
+            run_status = STATUS_PARTIAL
+            break
+
+        progress = wait_for_search_batch_progress(
+            page,
+            before_ids=before_ids,
+            before_url=before_url,
+            before_page_hint=before_hint
+            if isinstance(before_hint, int)
+            else None,
+        )
+        log(
+            f"翻页进展: progressed={progress.get('progressed')} "
+            f"reason={progress.get('reason')} "
+            f"new_ids={len(progress.get('new_ids') or [])}"
+        )
+        if progress.get("reason") in {
+            STOP_SEARCH_RESTRICTED,
+            STATUS_SEARCH_RESTRICTED,
+        }:
+            restriction_info = progress.get("restriction") or detect_search_restriction(
+                page
+            )
+            stop_reason = STOP_SEARCH_RESTRICTED
+            run_status = STATUS_SEARCH_RESTRICTED
+            status_reason = "restricted_after_next_click"
+            incomplete_due_to_restriction = bool(candidates)
+            break
+        if progress.get("reason") in {
+            STOP_LOGIN_REQUIRED,
+            STATUS_LOGIN_REQUIRED,
+            STOP_VERIFICATION_REQUIRED,
+            STATUS_VERIFICATION_REQUIRED,
+        }:
+            stop_reason = str(progress.get("reason"))
+            run_status = stop_reason
+            status_reason = "blocked_after_next_click"
+            incomplete_due_to_restriction = bool(candidates)
+            break
+        if progress.get("reason") == "NO_MORE_RESULTS":
+            stop_reason = STOP_NO_MORE_RESULTS
+            status_reason = "explicit_no_more_after_next"
+            run_status = STATUS_PARTIAL
+            break
+        if not progress.get("progressed"):
+            stop_reason = STOP_NO_PROGRESS
+            status_reason = f"next_click_no_progress:{progress.get('reason')}"
+            run_status = STATUS_PARTIAL
+            related_reasons.append("avoid_dead_loop_repeat_page")
+            break
+
+        pages_loaded += 1
+        if progress.get("page_hint_after") is not None:
+            pages_confirmed = int(progress["page_hint_after"])
+        elif pages_confirmed is not None:
+            pages_confirmed = pages_loaded
+        else:
+            # Label unknown but batch advanced via new IDs — record loads, not fake pages.
+            pages_confirmed = pages_loaded if progress.get("reason") == "PAGE_LABEL_CHANGED" else pages_confirmed
+
+        rN = extract_batch(pages_loaded - 1)
+        load_batches.append(rN["batch"])
+        if rN.get("stop") == STOP_SEARCH_RESTRICTED:
+            restriction_info = detect_search_restriction(page)
+            stop_reason = STOP_SEARCH_RESTRICTED
+            run_status = STATUS_SEARCH_RESTRICTED
+            incomplete_due_to_restriction = bool(candidates)
+            status_reason = "restricted_during_batch_extract"
+            break
+        if rN.get("stop") == STOP_EXTRACTION_FAILED:
+            stop_reason = STOP_EXTRACTION_FAILED
+            run_status = STATUS_EXTRACTION_FAILED
+            status_reason = "extract_failed_on_later_batch"
+            incomplete_due_to_restriction = bool(candidates)
+            break
+        if rN["batch"].get("new_id_count", 0) == 0 and progress.get("reason") != "PAGE_LABEL_CHANGED":
+            # Progress claimed but no new unique IDs after merge → stop bounded.
+            stop_reason = STOP_NO_PROGRESS
+            status_reason = "repeat_candidates_no_new_unique"
+            related_reasons.append("duplicate_page_or_ids")
+            run_status = STATUS_PARTIAL
+            break
+
+    else:
+        # while conditions ended without break
+        if len(candidates) >= max_candidates:
+            stop_reason = STOP_HIT_CANDIDATE_LIMIT
+            status_reason = "collected_max_candidates"
+            run_status = STATUS_SUCCESS
+        elif pages_loaded >= max_pages:
+            stop_reason = STOP_HIT_PAGE_BUDGET
+            status_reason = "hit_max_pages_or_load_batches"
+            run_status = STATUS_PARTIAL if candidates else STATUS_EXTRACTION_FAILED
+            related_reasons.append(f"pages_loaded={pages_loaded}")
+
+    if len(candidates) >= max_candidates and stop_reason not in {
+        STOP_SEARCH_RESTRICTED,
+        STOP_LOGIN_REQUIRED,
+        STOP_VERIFICATION_REQUIRED,
+    }:
+        stop_reason = STOP_HIT_CANDIDATE_LIMIT
+        run_status = STATUS_SUCCESS
+        status_reason = status_reason or "collected_max_candidates"
+    elif (
+        stop_reason == STOP_HIT_PAGE_BUDGET
+        and len(candidates) < max_candidates
+        and candidates
+    ):
+        run_status = STATUS_PARTIAL
+
+    return _coverage_result(
+        candidates,
+        load_batches,
+        scroll_total,
+        raw_cards_observed,
+        pages_confirmed,
+        stop_reason,
+        related_reasons,
+        run_status,
+        status_reason,
+        restriction_info,
+        incomplete_due_to_restriction,
+        pagination_mechanism,
+        extract_stats,
+        scroll_info,
+        max_candidates,
+        max_pages,
+        pages_loaded=pages_loaded,
+    )
+
+
+def _coverage_result(
+    candidates: list[dict[str, Any]],
+    load_batches: list[dict[str, Any]],
+    scroll_total: int,
+    raw_cards_observed: int,
+    pages_confirmed: int | None,
+    stop_reason: str,
+    related_reasons: list[str],
+    run_status: str,
+    status_reason: str,
+    restriction_info: dict[str, Any] | None,
+    incomplete_due_to_restriction: bool,
+    pagination_mechanism: str,
+    extract_stats: dict[str, Any],
+    scroll_info: dict[str, Any],
+    max_candidates: int,
+    max_pages: int,
+    pages_loaded: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "candidates": candidates,
+        "load_batches": load_batches,
+        "scroll_count": scroll_total,
+        "raw_cards_observed": raw_cards_observed,
+        "unique_candidates_collected": len(candidates),
+        "pages_confirmed": pages_confirmed,
+        "pages_loaded": pages_loaded
+        if pages_loaded is not None
+        else len(load_batches),
+        "stop_reason": stop_reason,
+        "related_stop_reasons": [r for r in related_reasons if r],
+        "run_status": run_status,
+        "status_reason": status_reason,
+        "restriction_info": restriction_info,
+        "incomplete_due_to_restriction": incomplete_due_to_restriction,
+        "pagination_mechanism": pagination_mechanism,
+        "extract_stats": extract_stats,
+        "scroll": scroll_info,
+        "budget": {
+            "max_candidates": max_candidates,
+            "max_pages": max_pages,
+        },
+        "coverage_note": (
+            "本次搜索范围内有限页/加载批次收集；"
+            "不是全京东链接、不是全平台最低价。"
+            f"分页机制观察为：{pagination_mechanism}。"
+        ),
+    }
 
 
 def write_candidates_json(path: Path, candidates: list[dict[str, Any]]) -> None:
@@ -798,8 +1662,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=5,
-        help=f"Max unique candidates (1..{MAX_LIMIT})",
+        default=None,
+        help="Legacy alias of --max-candidates (compat)",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=None,
+        help=f"Max unique candidates (default {DEFAULT_MAX_CANDIDATES}, cap {MAX_CANDIDATES_CAP})",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help=f"Max search pages / load batches (default {DEFAULT_MAX_PAGES})",
+    )
+    parser.add_argument(
+        "--search-timeout-seconds",
+        type=int,
+        default=None,
+        help=f"Whole-search timeout seconds (default {DEFAULT_SEARCH_TIMEOUT_SECONDS})",
     )
     parser.add_argument(
         "--auto-close",
@@ -810,10 +1692,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def validate_args(query: str, limit: int) -> None:
+    """Legacy validator (limit-only). Prefer resolve_search_budget for Phase C."""
     if not query or not query.strip():
         raise ValueError("query 不能为空")
-    if limit < 1 or limit > MAX_LIMIT:
-        raise ValueError(f"limit 必须是 1..{MAX_LIMIT} 的正整数")
+    if limit < 1 or limit > MAX_CANDIDATES_CAP:
+        raise ValueError(f"limit 必须是 1..{MAX_CANDIDATES_CAP} 的正整数")
 
 
 def run_local_logic_checks() -> list[str]:
@@ -931,36 +1814,160 @@ def run_local_logic_checks() -> list[str]:
     if tip4 is not None:
         failures.append("empty text must not be restricted")
 
+    # Phase C budget resolution + merge / dedupe across batches
+    try:
+        resolve_search_budget(
+            limit=5,
+            max_candidates=10,
+            limit_explicit=True,
+            max_candidates_explicit=True,
+        )
+        failures.append("limit vs max-candidates conflict should raise")
+    except ValueError:
+        pass
+
+    b = resolve_search_budget(limit_explicit=False, max_candidates_explicit=False)
+    if b["max_candidates"] != DEFAULT_MAX_CANDIDATES or b["max_pages"] != DEFAULT_MAX_PAGES:
+        failures.append("defaults for max_candidates/pages wrong")
+
+    b2 = resolve_search_budget(
+        limit=5, limit_explicit=True, max_candidates_explicit=False
+    )
+    if b2["max_candidates"] != 5 or not b2["legacy_limit_mode"]:
+        failures.append("legacy --limit alone should set max_candidates=5")
+
+    acc: list[dict[str, Any]] = []
+    batch1 = [
+        {
+            "product_id": "111",
+            "title": "A",
+            "query": "q",
+            "ad_marked": False,
+            "ad_status": "x",
+            "price": None,
+        },
+        {
+            "product_id": "222",
+            "title": "B",
+            "query": "q",
+            "ad_marked": True,
+            "ad_status": "x",
+            "price": None,
+        },
+    ]
+    batch2 = [
+        {
+            "product_id": "111",
+            "title": "A-dup",
+            "query": "q",
+            "ad_marked": False,
+            "ad_status": "x",
+            "price": None,
+        },
+        {
+            "product_id": "333",
+            "title": "C",
+            "query": "q",
+            "ad_marked": False,
+            "ad_status": "x",
+            "price": None,
+        },
+    ]
+    merge_first_seen_candidates(acc, batch1, max_candidates=10, load_batch=0)
+    merge_first_seen_candidates(acc, batch2, max_candidates=10, load_batch=1)
+    if [c["product_id"] for c in acc] != ["111", "222", "333"]:
+        failures.append(f"cross-page dedupe order wrong: {acc}")
+    if acc[0].get("title") != "A":
+        failures.append("first-seen title must be kept on duplicate id")
+    if acc[2].get("first_seen_load_batch") != 1:
+        failures.append("new id should record later load batch")
+
+    # Cap stops further merges
+    acc2: list[dict[str, Any]] = []
+    merge_first_seen_candidates(acc2, batch1, max_candidates=1, load_batch=0)
+    _, added = merge_first_seen_candidates(
+        acc2, batch2, max_candidates=1, load_batch=1
+    )
+    if len(acc2) != 1 or added != 0:
+        failures.append("max_candidates cap should block further merges")
+
     return failures
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    try:
-        validate_args(args.query, args.limit)
-    except ValueError as exc:
-        print(f"参数错误: {exc}")
-        return 2
+def run_search_collect(
+    query: str,
+    limit: int | None = None,
+    *,
+    max_candidates: int | None = None,
+    max_pages: int | None = None,
+    search_timeout_seconds: int | None = None,
+    auto_close: bool = True,
+    out_dir: Path | None = None,
+    profile_dir: Path | None = None,
+    quiet: bool = False,
+    limit_explicit: bool | None = None,
+    max_candidates_explicit: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Library entry for keyword search → candidates (closes browser when done).
 
-    query = args.query.strip()
-    limit = int(args.limit)
+    Returns dict with candidates, run_status, metadata, out_dir, paths.
+    Does not invent candidates or fall back to fixed product links.
+    Search coverage budget is separate from detail verify budget (P5-B).
+    """
+    # Compat: positional/kw limit without Phase-C flags → treat as explicit max_candidates
+    if limit_explicit is None:
+        limit_explicit = limit is not None
+    if max_candidates_explicit is None:
+        max_candidates_explicit = max_candidates is not None
+    budget = resolve_search_budget(
+        limit=limit,
+        max_candidates=max_candidates,
+        max_pages=max_pages,
+        search_timeout_seconds=search_timeout_seconds,
+        limit_explicit=bool(limit_explicit),
+        max_candidates_explicit=bool(max_candidates_explicit),
+        max_pages_explicit=max_pages is not None,
+        search_timeout_explicit=search_timeout_seconds is not None,
+    )
+    if not query or not str(query).strip():
+        raise ValueError("query 不能为空")
+    query = query.strip()
+    max_cand = int(budget["max_candidates"])
+    max_pg = int(budget["max_pages"])
+    timeout_s = int(budget["search_timeout_seconds"])
+    limit = max_cand  # compat field in metadata
     search_url = build_search_url(query)
     started = utc_now()
+    search_deadline = started.timestamp() + timeout_s
+    profile = (profile_dir or PROFILE_DIR).resolve()
 
-    print("=== PriceRadar P3-A ===")
-    print(f"解释器: {sys.executable}")
-    print(f"项目根: {PROJECT_ROOT}")
-    print(f"独立 Profile: {PROFILE_DIR}")
-    print(f"Playwright: {playwright_version()}")
-    print(f"query: {query!r}（作搜索关键词；B913A 不当作京东数字商品ID）")
-    print(f"limit: {limit}")
-    print(f"搜索方式: {SEARCH_ENTRY_STRATEGY}")
-    print("说明: 搜索入口与结果卡片结构仍待本机真实验证；不使用固定商品链接兜底。")
-    print()
+    def _log(msg: str) -> None:
+        if not quiet:
+            print(msg)
 
-    run_id, out_dir = make_run_dir()
-    print(f"run_id: {run_id}")
-    print(f"输出目录: {out_dir}")
+    _log("=== PriceRadar P3-A ===")
+    _log(f"解释器: {sys.executable}")
+    _log(f"项目根: {PROJECT_ROOT}")
+    _log(f"独立 Profile: {profile}")
+    _log(f"Playwright: {playwright_version()}")
+    _log(f"query: {query!r}（作搜索关键词；B913A 不当作京东数字商品ID）")
+    _log(
+        f"budget: max_candidates={max_cand} max_pages={max_pg} "
+        f"search_timeout_seconds={timeout_s} (legacy limit字段={limit})"
+    )
+    _log(f"搜索方式: {SEARCH_ENTRY_STRATEGY}")
+    _log("说明: 不使用固定商品链接兜底；HTTP 200≠搜索成功；点击翻页≠翻页成功。")
+    _log("")
+
+    if out_dir is None:
+        run_id, out_dir = make_run_dir()
+    else:
+        out_dir = Path(out_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        run_id = out_dir.name
+    _log(f"run_id: {run_id}")
+    _log(f"输出目录: {out_dir}")
 
     browser_started = False
     close_ok = False
@@ -974,23 +1981,26 @@ def main(argv: list[str] | None = None) -> int:
     page_diagnosis: str | None = None
     restriction_info: dict[str, Any] | None = None
     incomplete_due_to_restriction = False
+    http_status: int | None = None
+    coverage_bundle: dict[str, Any] = {}
+    coverage_stop_early: str | None = None
 
     try:
         with sync_playwright() as playwright:
             try:
                 context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(PROFILE_DIR),
+                    user_data_dir=str(profile),
                     channel="chrome",
                     headless=False,
                     chromium_sandbox=True,
                 )
             except PlaywrightError as exc:
                 status_reason = f"browser_launch_failed: {type(exc).__name__}: {exc}"
-                print(f"浏览器启动失败: {status_reason}")
+                _log(f"浏览器启动失败: {status_reason}")
                 raise
 
             browser_started = True
-            print("浏览器启动结果: 成功")
+            _log("浏览器启动结果: 成功")
 
             try:
                 page = context.pages[0] if context.pages else context.new_page()
@@ -1002,251 +2012,142 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     http_status = response.status if response is not None else None
                     final_url = page.url
-                    print(
+                    _log(
                         f"导航命令完成 http_status={http_status} "
                         f"final={sanitize_source_search_url(final_url)}"
                     )
-                    print("说明: HTTP 状态不等于搜索成功，需检查最终地址与页面内容。")
+                    _log("说明: HTTP 状态不等于搜索成功，需检查最终地址与页面内容。")
                 except PlaywrightError as exc:
                     run_status = STATUS_NAVIGATION_FAILED
                     status_reason = f"{type(exc).__name__}: {exc}"
-                    print(f"导航失败: {status_reason}")
+                    _log(f"导航失败: {status_reason}")
                     final_url = getattr(page, "url", "UNKNOWN")
                 else:
-                    # Immediate post-navigation restriction check (before wait/scroll/extract).
                     restriction_info = detect_search_restriction(page)
                     if restriction_info:
                         run_status = STATUS_SEARCH_RESTRICTED
                         page_diagnosis = STATUS_SEARCH_RESTRICTED
                         status_reason = "visible_search_frequency_block"
-                        print(f"页面诊断阻塞状态: {run_status}")
-                        print(
+                        _log(f"页面诊断阻塞状态: {run_status}")
+                        _log(
                             f"观察到的限制提示: {restriction_info.get('observed_tip')!r} "
                             f"at {restriction_info.get('detected_at_utc')}"
                         )
-                        print(
+                        _log(
                             "已停止候选提取与滚动；不刷新、不重试、不换入口。"
                             "不推断具体触发机制。"
                         )
                     else:
                         page_diagnosis = diagnose_page_state(page)
                         if page_diagnosis == STATUS_SEARCH_RESTRICTED:
-                            # diagnose also checks restriction; keep consistent.
                             restriction_info = detect_search_restriction(page)
                             run_status = STATUS_SEARCH_RESTRICTED
                             status_reason = "visible_search_frequency_block"
-                            print(f"页面诊断阻塞状态: {run_status}")
+                            _log(f"页面诊断阻塞状态: {run_status}")
                         elif page_diagnosis:
                             run_status = page_diagnosis
                             status_reason = f"diagnose:{page_diagnosis}"
-                            print(f"页面诊断阻塞状态: {run_status}")
+                            _log(f"页面诊断阻塞状态: {run_status}")
                         else:
                             host = urlsplit(final_url).netloc.lower()
                             if (
                                 "search.jd.com" not in host
                                 and "so.m.jd.com" not in host
                             ):
-                                print(
+                                _log(
                                     f"警告: 最终主机 {host!r} 非预期搜索域；"
                                     "提取策略待真实验证。"
                                 )
 
-                            wait_info = wait_for_search_content(page)
-                            scroll_info["result_wait"] = wait_info
-                            print(
-                                f"结果等待: outcome={wait_info.get('wait_outcome')} "
-                                f"data_sku={wait_info.get('data_sku_count_after_wait')} "
-                                f"elapsed_ms={wait_info.get('wait_elapsed_ms')}"
-                            )
-                            # Restriction / captcha may appear only after AJAX settle.
-                            restriction_info = detect_search_restriction(page)
-                            if restriction_info:
-                                run_status = STATUS_SEARCH_RESTRICTED
-                                page_diagnosis = STATUS_SEARCH_RESTRICTED
-                                status_reason = "visible_search_frequency_block_after_wait"
-                                print(
-                                    f"等待后检测到搜索限制: "
-                                    f"{restriction_info.get('observed_tip')!r}"
-                                )
-                                print("已停止滚动与候选提取；不刷新、不重试。")
-                            elif wait_info.get("wait_outcome") == "verification":
-                                run_status = STATUS_VERIFICATION_REQUIRED
-                                page_diagnosis = STATUS_VERIFICATION_REQUIRED
-                                status_reason = "verification_after_wait"
-                                print("等待后检测到验证提示；停止提取。")
+                            # Whole-search deadline (not per-page reset).
+                            remaining = search_deadline - utc_now().timestamp()
+                            if remaining <= 0:
+                                run_status = STATUS_PARTIAL
+                                status_reason = "search_timeout_before_extract"
+                                coverage_stop_early = STOP_SEARCH_TIMEOUT
+                                _log("搜索总超时：进入提取前已到期。")
                             else:
-                                scroll_info = limited_scroll_for_lazy_load(page)
-                                scroll_info["result_wait"] = wait_info
-                                print(
-                                    f"有限滚动: count={scroll_info.get('scroll_count')} "
-                                    f"stopped={scroll_info.get('stopped_reason')} "
-                                    f"budget_ms={SCROLL_BUDGET_MS}"
+                                cov = collect_candidates_across_pages(
+                                    page,
+                                    query=query,
+                                    max_candidates=max_cand,
+                                    max_pages=max_pg,
+                                    search_deadline=search_deadline,
+                                    log=_log,
                                 )
-                                if scroll_info.get("restriction"):
-                                    restriction_info = scroll_info["restriction"]
-                                    run_status = STATUS_SEARCH_RESTRICTED
-                                    page_diagnosis = STATUS_SEARCH_RESTRICTED
-                                    status_reason = str(
-                                        scroll_info.get("stopped_reason")
-                                        or "search_restricted_during_scroll"
-                                    )
-                                    incomplete_due_to_restriction = bool(candidates)
-                                    print(
-                                        f"滚动期间检测到搜索限制: "
-                                        f"{restriction_info.get('observed_tip')!r}"
-                                    )
-                                    print("已停止继续滚动与候选提取；不重试。")
-                                else:
-                                    try:
-                                        raw = extract_raw_candidates(page)
-                                    except PlaywrightError as exc:
-                                        run_status = STATUS_EXTRACTION_FAILED
-                                        status_reason = (
-                                            f"extract_error: {type(exc).__name__}: {exc}"
-                                        )
-                                        raw = {
-                                            "anchor_count_raw": 0,
-                                            "data_sku_card_count": 0,
-                                            "candidate_rows": [],
-                                            "page_title": "",
-                                            "final_url": final_url,
-                                        }
-                                    else:
-                                        # Restriction may appear during extract window.
-                                        restriction_info = detect_search_restriction(
-                                            page
-                                        )
-                                        if restriction_info:
-                                            run_status = STATUS_SEARCH_RESTRICTED
-                                            page_diagnosis = STATUS_SEARCH_RESTRICTED
-                                            status_reason = (
-                                                "visible_search_frequency_block_before_parse"
-                                            )
-                                            print(
-                                                "提取前检测到搜索限制；停止解析候选。"
-                                            )
-                                        else:
-                                            again = diagnose_page_state(page)
-                                            if (
-                                                again == STATUS_NO_RESULTS
-                                                and not raw.get("candidate_rows")
-                                            ):
-                                                run_status = STATUS_NO_RESULTS
-                                                status_reason = (
-                                                    "explicit_no_results_copy"
-                                                )
-                                            else:
-                                                rows = list(
-                                                    raw.get("candidate_rows") or []
-                                                )
-                                                candidates, extract_stats = (
-                                                    build_candidate_records(
-                                                        rows,
-                                                        query=query,
-                                                        limit=limit,
-                                                        source_url=final_url,
-                                                    )
-                                                )
-                                                extract_stats["anchor_count_raw"] = (
-                                                    raw.get("anchor_count_raw")
-                                                )
-                                                extract_stats[
-                                                    "data_sku_card_count"
-                                                ] = raw.get("data_sku_card_count")
-                                                extract_stats["page_title"] = raw.get(
-                                                    "page_title"
-                                                )
+                                candidates = list(cov.get("candidates") or [])
+                                extract_stats = dict(cov.get("extract_stats") or {})
+                                scroll_info = dict(cov.get("scroll") or {})
+                                scroll_info["scroll_count"] = cov.get("scroll_count")
+                                run_status = str(
+                                    cov.get("run_status") or STATUS_PARTIAL
+                                )
+                                status_reason = str(
+                                    cov.get("status_reason") or ""
+                                )
+                                page_diagnosis = run_status if run_status in {
+                                    STATUS_SEARCH_RESTRICTED,
+                                    STATUS_LOGIN_REQUIRED,
+                                    STATUS_VERIFICATION_REQUIRED,
+                                    STATUS_NO_RESULTS,
+                                } else page_diagnosis
+                                restriction_info = cov.get("restriction_info")
+                                incomplete_due_to_restriction = bool(
+                                    cov.get("incomplete_due_to_restriction")
+                                )
+                                coverage_bundle = cov
+                                _log(
+                                    f"覆盖: unique={cov.get('unique_candidates_collected')} "
+                                    f"pages_confirmed={cov.get('pages_confirmed')} "
+                                    f"load_batches={len(cov.get('load_batches') or [])} "
+                                    f"stop={cov.get('stop_reason')} "
+                                    f"mechanism={cov.get('pagination_mechanism')}"
+                                )
 
-                                                if candidates:
-                                                    if len(candidates) >= limit:
-                                                        run_status = STATUS_SUCCESS
-                                                        status_reason = (
-                                                            "collected_limit_unique_candidates_from_first_scope"
-                                                        )
-                                                    else:
-                                                        run_status = STATUS_PARTIAL
-                                                        status_reason = (
-                                                            "fewer_than_limit_after_dedupe_in_first_scope"
-                                                        )
-                                                else:
-                                                    if again == STATUS_NO_RESULTS:
-                                                        run_status = STATUS_NO_RESULTS
-                                                        status_reason = (
-                                                            "no_results_message_and_zero_candidates"
-                                                        )
-                                                    elif (
-                                                        int(
-                                                            raw.get("anchor_count_raw")
-                                                            or 0
-                                                        )
-                                                        > 0
-                                                        or int(
-                                                            raw.get(
-                                                                "data_sku_card_count"
-                                                            )
-                                                            or 0
-                                                        )
-                                                        > 0
-                                                    ):
-                                                        run_status = (
-                                                            STATUS_EXTRACTION_FAILED
-                                                        )
-                                                        status_reason = (
-                                                            "cards_or_anchors_present_but_no_reliable_detail_candidates"
-                                                        )
-                                                    else:
-                                                        run_status = (
-                                                            STATUS_EXTRACTION_FAILED
-                                                        )
-                                                        status_reason = (
-                                                            "zero_product_signals_without_explicit_no_results;"
-                                                            "not_asserting_NO_RESULTS"
-                                                        )
-
-                print()
-                print(f"运行状态: {run_status}")
-                print(f"原因: {status_reason}")
+                _log("")
+                _log(f"运行状态: {run_status}")
+                _log(f"原因: {status_reason}")
                 if restriction_info:
-                    print(
+                    _log(
                         f"限制提示: {restriction_info.get('observed_tip')!r} "
                         f"检测时间(UTC): {restriction_info.get('detected_at_utc')}"
                     )
                 if incomplete_due_to_restriction and candidates:
-                    print("说明: 限制出现前已有部分候选，本轮标记为不完整。")
-                print(f"候选数: {len(candidates)}")
+                    _log("说明: 限制出现前已有部分候选，本轮标记为不完整。")
+                _log(f"候选数: {len(candidates)}")
                 for c in candidates:
-                    print(
+                    _log(
                         f"  #{c['rank']} id={c.get('product_id')} "
                         f"ad={c.get('ad_marked')} "
                         f"src={c.get('discovery_source')} "
                         f"title={str(c.get('title') or '')[:60]!r}"
                     )
 
-                print()
-                if args.auto_close:
-                    print("auto-close: 跳过回车，即将关闭浏览器。")
+                _log("")
+                if auto_close:
+                    _log("auto-close: 跳过回车，即将关闭浏览器。")
                 else:
-                    print("开发验收: 可核对窗口中的页面与终端状态；按回车关闭。")
+                    _log("开发验收: 可核对窗口中的页面与终端状态；按回车关闭。")
                     read_line("按回车结束本次自动化浏览器会话… ")
             except KeyboardInterrupt:
-                print()
-                print("收到 Ctrl+C，正在关闭…")
+                _log("")
+                _log("收到 Ctrl+C，正在关闭…")
                 exit_code = 130
             finally:
                 try:
                     context.close()
                     close_ok = True
-                    print("程序关闭结果: 上下文关闭完成")
+                    _log("程序关闭结果: 上下文关闭完成")
                 except PlaywrightError as exc:
-                    print(f"程序关闭结果: 异常 {type(exc).__name__}: {exc}")
+                    _log(f"程序关闭结果: 异常 {type(exc).__name__}: {exc}")
                     raise
     except RuntimeError as exc:
-        print(f"运行中止: {type(exc).__name__}: {exc}")
+        _log(f"运行中止: {type(exc).__name__}: {exc}")
         if run_status == STATUS_NAVIGATION_FAILED and status_reason == "not_started":
             status_reason = str(exc)
         exit_code = 2
     except PlaywrightError as exc:
-        print(f"Playwright 错误: {type(exc).__name__}: {exc}")
+        _log(f"Playwright 错误: {type(exc).__name__}: {exc}")
         status_reason = f"{type(exc).__name__}: {exc}"
         exit_code = 1
 
@@ -1259,13 +2160,61 @@ def main(argv: list[str] | None = None) -> int:
         write_candidates_json(cand_json, candidates)
         write_candidates_csv(cand_csv, candidates)
     except OSError as exc:
-        print(f"候选文件写入失败: {type(exc).__name__}: {exc}")
+        _log(f"候选文件写入失败: {type(exc).__name__}: {exc}")
 
+    elapsed_seconds = (ended - started).total_seconds()
+    # Prefer bundle stop reason; fall back to status mapping.
+    coverage_stop_reason = (
+        coverage_stop_early
+        or coverage_bundle.get("stop_reason")
+        or (
+            STOP_HIT_CANDIDATE_LIMIT
+            if run_status == STATUS_SUCCESS and len(candidates) >= max_cand
+            else None
+        )
+        or (
+            STOP_SEARCH_RESTRICTED
+            if run_status == STATUS_SEARCH_RESTRICTED
+            else None
+        )
+        or (
+            STOP_LOGIN_REQUIRED
+            if run_status == STATUS_LOGIN_REQUIRED
+            else None
+        )
+        or (
+            STOP_VERIFICATION_REQUIRED
+            if run_status == STATUS_VERIFICATION_REQUIRED
+            else None
+        )
+        or (STOP_NO_RESULTS if run_status == STATUS_NO_RESULTS else None)
+        or (
+            STOP_EXTRACTION_FAILED
+            if run_status == STATUS_EXTRACTION_FAILED
+            else None
+        )
+        or (
+            STOP_NAVIGATION_FAILED
+            if run_status == STATUS_NAVIGATION_FAILED
+            else None
+        )
+        or f"STATUS:{run_status}"
+    )
+
+    pages_confirmed = coverage_bundle.get("pages_confirmed")
     metadata = {
         "run_id": run_id,
         "phase": "P3-A",
         "query": query,
         "limit": limit,
+        "max_candidates": max_cand,
+        "max_pages": max_pg,
+        "search_timeout_seconds": timeout_s,
+        "budget": {
+            "max_candidates": max_cand,
+            "max_pages": max_pg,
+            "search_timeout_seconds": timeout_s,
+        },
         "search_entry_strategy": SEARCH_ENTRY_STRATEGY,
         "search_entry_verification": "REAL_RUN_DATA_SKU_CARDS",
         "search_url_requested": search_url,
@@ -1274,13 +2223,34 @@ def main(argv: list[str] | None = None) -> int:
             if final_url not in {"UNKNOWN", ""}
             else final_url
         ),
+        "http_status": http_status,
         "started_at_utc": utc_iso(started),
         "ended_at_utc": utc_iso(ended),
+        "elapsed_seconds": round(elapsed_seconds, 3),
         "browser_started": browser_started,
         "scroll": scroll_info,
+        "scroll_count": coverage_bundle.get("scroll_count")
+        or (scroll_info or {}).get("scroll_count"),
         "extract_stats": extract_stats,
         "run_status": run_status,
         "status_reason": status_reason,
+        "search_status": run_status,
+        "coverage_stop_reason": coverage_stop_reason,
+        "stop_reason": coverage_stop_reason,
+        "related_stop_reasons": coverage_bundle.get("related_stop_reasons") or [],
+        "raw_cards_observed": coverage_bundle.get("raw_cards_observed"),
+        "unique_candidates_collected": len(candidates),
+        "pages_confirmed": pages_confirmed,
+        "pages_visited": pages_confirmed
+        if pages_confirmed is not None
+        else None,
+        "load_batches": coverage_bundle.get("load_batches") or [],
+        "pages_loaded": coverage_bundle.get("pages_loaded"),
+        "pagination_mechanism": coverage_bundle.get("pagination_mechanism"),
+        "coverage_note": coverage_bundle.get("coverage_note")
+        or (
+            "本次搜索范围内有限页/加载批次收集；不是全京东、不是全平台最低价"
+        ),
         "page_diagnosis": page_diagnosis,
         "search_restriction": restriction_info,
         "incomplete_due_to_restriction": incomplete_due_to_restriction,
@@ -1294,49 +2264,103 @@ def main(argv: list[str] | None = None) -> int:
             "SEARCH_RESTRICTED 表示页面可见搜索频繁限制提示；不推断触发机制",
             "新版搜索页可能无 item.jd.com 锚点，改为 data-sku 卡片发现并构造详情链接",
             "候选仅搜索结果，不代表已确认同款或最低价",
+            "达到 max-candidates 属于覆盖限制，不等于全部商品",
+            "pages_confirmed=null 表示未从页码控件确认页数；load_batches 仍如实记录",
+            "翻页成功以新商品ID或页码变化为准；点击完成/HTTP200/滚动完成不算成功",
+            "搜索超时为整次搜索预算，不是每页重置",
         ],
     }
     try:
         write_metadata(meta_path, metadata)
     except OSError as exc:
-        print(f"metadata 写入失败: {type(exc).__name__}: {exc}")
+        _log(f"metadata 写入失败: {type(exc).__name__}: {exc}")
 
-    print()
-    print("=== 输出文件 ===")
-    print(f"candidates.json: {cand_json.resolve()}")
-    print(f"candidates.csv: {cand_csv.resolve()}")
-    print(f"run_metadata.json: {meta_path.resolve()}")
-    print(f"run_status={run_status} candidates={len(candidates)}")
+    _log("")
+    _log("=== 输出文件 ===")
+    _log(f"candidates.json: {cand_json.resolve()}")
+    _log(f"candidates.csv: {cand_csv.resolve()}")
+    _log(f"run_metadata.json: {meta_path.resolve()}")
+    _log(f"run_status={run_status} candidates={len(candidates)}")
     if run_status == STATUS_SUCCESS:
-        print(
+        _log(
             "本轮候选收集在限定范围内完成；"
             "不代表全平台搜索、同款核验或最低价监控完成。"
         )
     elif run_status == STATUS_PARTIAL:
-        print("本轮仅部分候选；不代表搜索验收通过。")
+        _log("本轮仅部分候选；不代表搜索验收通过。")
     elif run_status == STATUS_SEARCH_RESTRICTED:
-        print(
+        _log(
             "搜索受限（可见频繁限制提示）。已停止提取/滚动；"
             "真实自动搜索仍受阻，P3-A 未通过。"
         )
         if candidates:
-            print("已保留受限前收集到的部分候选（本轮不完整）。")
+            _log("已保留受限前收集到的部分候选（本轮不完整）。")
         else:
-            print("无候选；已保存空清单。")
+            _log("无候选；已保存空清单。")
     elif run_status == STATUS_NO_RESULTS:
-        print("页面明确无搜索结果；非搜索成功。")
+        _log("页面明确无搜索结果；非搜索成功。")
     else:
-        print(f"本轮未成功完成候选收集（状态={run_status}）。")
+        _log(f"本轮未成功完成候选收集（状态={run_status}）。")
 
-    if exit_code:
-        return exit_code
-    if run_status in {
-        STATUS_SUCCESS,
-        STATUS_PARTIAL,
-        STATUS_NO_RESULTS,
-    }:
-        return 0
-    return 1
+    if exit_code == 0:
+        if run_status not in {
+            STATUS_SUCCESS,
+            STATUS_PARTIAL,
+            STATUS_NO_RESULTS,
+        }:
+            exit_code = 1
+
+    return {
+        "ok": exit_code == 0
+        and run_status
+        in {STATUS_SUCCESS, STATUS_PARTIAL, STATUS_NO_RESULTS},
+        "exit_code": exit_code,
+        "run_id": run_id,
+        "out_dir": out_dir,
+        "candidates_path": cand_json,
+        "candidates_csv_path": cand_csv,
+        "metadata_path": meta_path,
+        "candidates": candidates,
+        "run_status": run_status,
+        "status_reason": status_reason,
+        "coverage_stop_reason": coverage_stop_reason,
+        "metadata": metadata,
+        "browser_started": browser_started,
+        "close_ok": close_ok,
+        "page_diagnosis": page_diagnosis,
+        "search_restriction": restriction_info,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if not args.query or not str(args.query).strip():
+            raise ValueError("query 不能为空")
+        resolve_search_budget(
+            limit=args.limit,
+            max_candidates=args.max_candidates,
+            max_pages=args.max_pages,
+            search_timeout_seconds=args.search_timeout_seconds,
+            limit_explicit=args.limit is not None,
+            max_candidates_explicit=args.max_candidates is not None,
+            max_pages_explicit=args.max_pages is not None,
+            search_timeout_explicit=args.search_timeout_seconds is not None,
+        )
+    except ValueError as exc:
+        print(f"参数错误: {exc}")
+        return 2
+    result = run_search_collect(
+        args.query.strip(),
+        limit=args.limit,
+        max_candidates=args.max_candidates,
+        max_pages=args.max_pages,
+        search_timeout_seconds=args.search_timeout_seconds,
+        auto_close=bool(args.auto_close),
+        limit_explicit=args.limit is not None,
+        max_candidates_explicit=args.max_candidates is not None,
+    )
+    return int(result.get("exit_code") or 0)
 
 
 if __name__ == "__main__":

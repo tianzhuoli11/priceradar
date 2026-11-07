@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-RULES_VERSION_ADAPT = "p5a-candidate-adapt-v1"
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+RULES_VERSION_ADAPT = "p5a-candidate-adapt-v2"
 
 ALLOWED_DETAIL_HOSTS = frozenset({"item.jd.com", "item.m.jd.com"})
 
@@ -26,70 +31,13 @@ RE_ITEM_M_JD = re.compile(
     re.IGNORECASE,
 )
 
-
-def model_boundary_regex(model: str) -> re.Pattern[str]:
-    """Whole-token model match: B913A must not match inside B913AE."""
-    m = (model or "").strip()
-    if not m:
-        raise ValueError("model 不能为空")
-    # Escape so business models with special chars stay literal.
-    esc = re.escape(m)
-    return re.compile(rf"(?<![A-Za-z0-9]){esc}(?![A-Za-z0-9])", re.IGNORECASE)
-
-
-def title_contains_exact_model(title: str, model: str) -> bool:
-    try:
-        return bool(model_boundary_regex(model).search(title or ""))
-    except ValueError:
-        return False
-
-
-def title_model_gate(
-    title: str,
-    *,
-    expected_model: str,
-) -> dict[str, Any]:
-    """
-    Coarse title screen before opening detail.
-
-    If title clearly shows a longer conflicting model (expected is a proper prefix
-    of another alphanumeric token, e.g. B913A vs B913AE), skip browse.
-    """
-    title_u = title or ""
-    expected = (expected_model or "").strip()
-    if not expected:
-        return {
-            "status": "REVIEW_REQUIRED",
-            "reason": "业务 expected_model 为空",
-            "skip_browse": False,
-        }
-    if title_contains_exact_model(title_u, expected):
-        return {
-            "status": "TITLE_MODEL_OK",
-            "reason": "标题边界命中预期型号",
-            "skip_browse": False,
-        }
-    # Conflicting longer token: expected + extra alnum (B913AE when expected B913A).
-    conflict = re.search(
-        rf"(?<![A-Za-z0-9]){re.escape(expected)}([A-Za-z0-9]+)(?![A-Za-z0-9])",
-        title_u,
-        re.IGNORECASE,
-    )
-    if conflict:
-        return {
-            "status": "MODEL_MISMATCH_SKIPPED",
-            "reason": (
-                f"标题含冲突型号扩展 {expected}{conflict.group(1)}；"
-                f"不得当作 {expected}"
-            ),
-            "skip_browse": True,
-            "conflict_token": f"{expected}{conflict.group(1)}",
-        }
-    return {
-        "status": "TITLE_MODEL_UNCLEAR",
-        "reason": "标题未边界命中预期型号；仍可进详情核验",
-        "skip_browse": False,
-    }
+# Shared complete-model matcher (B913A ⊄ B913AC/AE). Re-export for callers.
+from priceradar_model_match import (  # noqa: E402
+    classify_title_models,
+    model_boundary_regex,
+    title_contains_exact_model,
+    title_model_gate,
+)
 
 
 def extract_jd_product_id_from_url(url: str) -> str | None:
@@ -283,6 +231,7 @@ def load_business_baseline(path: Path) -> tuple[dict[str, Any] | None, list[str]
 def business_override_from_baseline(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "model": cfg["expected_model"],
+        "business_sku": cfg.get("business_sku") or cfg["expected_model"],
         "spec_label": f"{cfg['target_spec']}／{cfg['comparison_unit']}",
         "target_spec": cfg["target_spec"],
         "packs_per_box": cfg["_packs_per_box_int"],
