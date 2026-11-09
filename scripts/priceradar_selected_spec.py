@@ -300,4 +300,40 @@ def run_selected_spec_offline_checks() -> list[str]:
     if before["selected_spec_text"] == after["selected_spec_text"]:
         fails.append("before/after different selected text must remain distinct")
 
+    # 6) qty UNKNOWN must not invent selected packs from available options
+    qty_unknown = {
+        "selected_status": SELECTED_UNKNOWN,
+        "selected_options": [],
+        "available_options": [
+            {"text": "200抽*20包", "selected": False},
+            {"text": "200抽*10包", "selected": False},
+        ],
+        "purchase_quantity": None,
+        "purchase_quantity_status": "UNKNOWN",
+    }
+    cands_q, _ = selected_spec_candidates_for_unit(qty_unknown)
+    if cands_q:
+        fails.append("qty UNKNOWN with no selected must not emit pack candidates")
+
+    # 7) BSK extracted option text without 「已选…个」 still feeds unit candidates
+    bsk_only = {
+        "selected_status": SELECTED_EXTRACTED,
+        "selected_spec_text": "1层 200抽*20包 整箱装",
+        "selected_options": [
+            {
+                "text": "1层 200抽*20包 整箱装",
+                "selected": True,
+                "className": "specification-item-sku--selected",
+            }
+        ],
+        "available_options": [
+            {"text": "1层 200抽*20包 整箱装", "selected": True},
+        ],
+        "purchase_quantity": None,
+        "purchase_quantity_status": "UNKNOWN",
+    }
+    cands_bsk, _ = selected_spec_candidates_for_unit(bsk_only)
+    if not any(c.get("packs") == "20" for c in cands_bsk):
+        fails.append("BSK selected_spec_text must parse packs for unit candidates")
+
     return fails

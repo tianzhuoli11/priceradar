@@ -397,7 +397,16 @@ def build_report_row(
         "has_possible_break": (verify.get("take_home_rollup") or {}).get(
             "has_possible_break"
         ),
-        "primary_low_clue": bool(cs.get("primary_low_clue_count")),
+        # Prefer product-level low_price_signal (weak primary below red) over clue count.
+        "primary_low_clue": bool(
+            verify.get("low_price_signal")
+            or cs.get("primary_low_clue_count")
+        ),
+        "low_price_signal": bool(verify.get("low_price_signal")),
+        "low_price_signal_amount": verify.get("signal_amount")
+        or ((verify.get("low_price_signal_detail") or {}).get("signal_amount")),
+        "low_price_signal_strength": verify.get("signal_strength")
+        or ((verify.get("low_price_signal_detail") or {}).get("signal_strength")),
         "screenshot_dir": verify.get("screenshot_dir")
         or ((verify.get("capture") or {}).get("out_dir")),
         "pipeline_dir": verify.get("pipeline_dir")
@@ -406,10 +415,13 @@ def build_report_row(
         "review_reasons": "; ".join(
             r for r in (verify.get("review_reasons") or []) if r
         ),
-        "capture_backend": "p2d_jd_auto_capture",
+        "capture_backend": verify.get("capture_backend")
+        or ((verify.get("capture") or {}).get("backend"))
+        or "p2d_jd_auto_capture",
         "notes": (
             "主展示价仅作参考比较，不冒充成交价；"
-            "无到手价证据时保持到手价待核验"
+            "无到手价证据时保持到手价待核验；"
+            "low_price_signal≠可比箱价/POSSIBLE_BREAK"
         ),
     }
 
@@ -439,6 +451,9 @@ def write_report_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "task_status",
         "has_possible_break",
         "primary_low_clue",
+        "low_price_signal",
+        "low_price_signal_amount",
+        "low_price_signal_strength",
         "verify_dir",
         "screenshot_dir",
         "pipeline_dir",
@@ -673,6 +688,42 @@ def run_offline_checks(policy: dict[str, Any]) -> list[str]:
     )
     if limit_pause != "DETAIL_RATE_LIMITED":
         failures.append("offline: limit.html must pause as DETAIL_RATE_LIMITED")
+    # Historical 6487a8: pc-frequent mislabeled IDENTITY_FAILED when page_kind UNKNOWN.
+    frequent_pause = p5a.detect_session_block_from_capture(
+        {
+            "navigation_status": "IDENTITY_FAILED",
+            "actual_product_url": "https://pc-frequent-pro.pf.jd.com/",
+            "product_identity_ok": False,
+            "error": "UNKNOWN",
+            "page_classify": {
+                "page_kind": "UNKNOWN",
+                "session_block": None,
+                "href": "https://pc-frequent-pro.pf.jd.com/?from=pc_item&reason=403",
+                "title": "PC频控页 -京东商城",
+            },
+        }
+    )
+    if frequent_pause != "DETAIL_RATE_LIMITED":
+        failures.append(
+            "offline: pc-frequent-pro must pause as DETAIL_RATE_LIMITED "
+            "(not IDENTITY_FAILED / WRONG_PAGE)"
+        )
+    # observation_changed empty-URL capture must not stay IDENTITY_FAILED in p5a labeling
+    obs_capture = {
+        "navigation_status": "IDENTITY_FAILED",
+        "actual_product_url": "",
+        "product_identity_ok": False,
+        "error": "UNKNOWN_PAGE",
+        "page_classify": {
+            "code": "permission_denied",
+            "message": "The strict observation changed before this action",
+            "data": {"reason": "observation_changed"},
+            "settle_attempts": 8,
+        },
+    }
+    # detect_session_block should be None; observation is handled in verify_one path.
+    if p5a.detect_session_block_from_capture(obs_capture) is not None:
+        failures.append("offline: observation_changed alone must not pause session")
     # Session block field must beat a misleading identity failure URL.
     priority = p5a.detect_session_block_from_capture(
         {
@@ -776,6 +827,46 @@ def run_offline_checks(policy: dict[str, Any]) -> list[str]:
     return failures
 
 
+def append_not_visited_after_pause(
+    *,
+    selected: list[dict[str, Any]],
+    paused_at_index: int,
+    progress: dict[str, Any],
+    report_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Record remaining samples as NOT_VISITED (no navigation). paused_at_index is 1-based."""
+    remaining_recs: list[dict[str, Any]] = []
+    pause_reason = progress.get("pause_reason")
+    for j, rem in enumerate(selected[paused_at_index:], start=paused_at_index + 1):
+        rem_pid = str(rem.get("jd_product_id") or "")
+        rec = {
+            "index": j,
+            "product_id": rem_pid,
+            "classification": rem.get("classification"),
+            "task_status": "NOT_VISITED",
+            "match_status": "PAUSED_SESSION",
+            "navigation_status": "NOT_VISITED",
+            "pause_reason": pause_reason,
+            "system_verdict": None,
+            "verify_dir": None,
+            "row": {
+                "product_id": rem_pid,
+                "task_status": "NOT_VISITED",
+                "match_status": "PAUSED_SESSION",
+                "navigation_status": "NOT_VISITED",
+                "pause_reason": pause_reason,
+                "manual_verdict": None,
+                "title": rem.get("title"),
+                "original_classification": rem.get("classification"),
+            },
+        }
+        remaining_recs.append(rec)
+        progress.setdefault("items", []).append(rec)
+        if report_rows is not None:
+            report_rows.append(rec["row"])
+    return remaining_recs
+
+
 def run_pause_navigation_offline_test() -> list[str]:
     """Prove: first PAUSED_SESSION → zero further navigations (not post-hoc relabel)."""
     failures: list[str] = []
@@ -815,14 +906,28 @@ def run_pause_navigation_offline_test() -> list[str]:
         {"jd_product_id": "333", "classification": CLASS_OTHER, "title": "t3"},
     ]
     progress = {"paused": False, "pause_reason": None, "items": []}
-    for sample in samples:
+    paused_at = None
+    for idx, sample in enumerate(samples, start=1):
         if progress.get("paused"):
             break
         verify = fake_verify(product_id=str(sample["jd_product_id"]))
         if verify.get("task_status") == "PAUSED_SESSION":
             progress["paused"] = True
             progress["pause_reason"] = verify.get("match_status")
-        progress["items"].append(sample["jd_product_id"])
+            paused_at = idx
+        progress["items"].append(
+            {
+                "index": idx,
+                "product_id": sample["jd_product_id"],
+                "task_status": verify.get("task_status"),
+                "match_status": verify.get("match_status"),
+            }
+        )
+
+    if progress.get("paused") and paused_at is not None:
+        append_not_visited_after_pause(
+            selected=samples, paused_at_index=paused_at, progress=progress
+        )
 
     if nav_calls != ["111"]:
         failures.append(
@@ -830,8 +935,13 @@ def run_pause_navigation_offline_test() -> list[str]:
         )
     if progress.get("pause_reason") != "DETAIL_RATE_LIMITED":
         failures.append("offline: pause reason must be DETAIL_RATE_LIMITED")
-    if len(progress["items"]) != 1:
-        failures.append("offline: only first item should be recorded before pause break")
+    statuses = [i.get("task_status") for i in progress["items"]]
+    if statuses != ["PAUSED_SESSION", "NOT_VISITED", "NOT_VISITED"]:
+        failures.append(
+            f"offline: remaining must be NOT_VISITED after pause; got {statuses}"
+        )
+    if any(i.get("match_status") != "PAUSED_SESSION" for i in progress["items"][1:]):
+        failures.append("offline: not-visited rows must keep match_status=PAUSED_SESSION")
     return failures
 
 
@@ -1059,6 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
         "completed": 0,
         "failed": 0,
         "paused": 0,
+        "not_visited": 0,
         "skipped": 0,
         "box_comparable_count": 0,
         "possible_break_count": 0,
@@ -1156,6 +1267,25 @@ def main(argv: list[str] | None = None) -> int:
 
         if progress.get("paused"):
             print(f"PAUSED: {progress.get('pause_reason')} — remaining items not started")
+            rem = append_not_visited_after_pause(
+                selected=selected,
+                paused_at_index=idx,
+                progress=progress,
+                report_rows=report_rows,
+            )
+            summary["not_visited"] = len(rem)
+            write_json(out_dir / "progress.json", progress)
+            write_report_csv(
+                out_dir / "compare_report.csv",
+                [{k: v for k, v in r.items() if k != "_clues"} for r in report_rows],
+            )
+            write_report_html(
+                out_dir / "compare_report.html",
+                run_id=run_id,
+                summary=summary,
+                rows=[{k: v for k, v in r.items() if k != "_clues"} for r in report_rows],
+                policy=policy,
+            )
             break
 
     summary["ended_at_utc"] = utc_iso()

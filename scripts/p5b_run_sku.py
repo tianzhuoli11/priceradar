@@ -1,18 +1,21 @@
 """
-P5-B: single business SKU — search → verify each candidate → unified tables.
+P5-B: single business SKU — search/reuse → classify → verify → report → resume.
 
-Reuses p3a.run_search_collect and p5a.verify_one (no shell, no “latest” dirs).
-Does not implement multi-SKU Excel, pagination, checkout, or coupon claiming.
+Reuses p3a/p5f search, p5a.verify_one, and explicit BSK/p2d backends (no auto-switch).
+Candidate sources: live-search | existing-collection (explicit path; never “latest”).
+Does not implement multi-SKU Excel, JDSpider, checkout, or coupon claiming.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import importlib.util
 import json
 import secrets
+import shutil
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -23,10 +26,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
 JOB_ROOT = (PROJECT_ROOT / "artifacts" / "sku_jobs").resolve()
 
-RULES_VERSION = "p5b-sku-job-v2"
+RULES_VERSION = "p5b-sku-job-v3"
 DEFAULT_MAX_VERIFY = 5
 MAX_VERIFY_CAP = 30
 STATUS_NOT_VERIFIED_BUDGET = "NOT_VERIFIED_BUDGET"
+STATUS_NOT_VISITED_BUDGET = "NOT_VISITED_BUDGET"  # alias in reports
+STATUS_CLASSIFICATION_SKIPPED = "CLASSIFICATION_SKIPPED"
+
+SOURCE_LIVE_SEARCH = "live-search"
+SOURCE_EXISTING_COLLECTION = "existing-collection"
+BACKEND_P2D = "p2d"
+BACKEND_BSK = "bsk"
 
 SESSION_PAUSE_TASK = "PAUSED_SESSION"
 SESSION_PAUSE_MATCH = frozenset(
@@ -44,6 +54,23 @@ SEARCH_BLOCK_STATUSES = frozenset(
         "LOGIN_REQUIRED",
         "VERIFICATION_REQUIRED",
         "SEARCH_RESTRICTED",
+    }
+)
+TERMINAL_OK_STATUSES = frozenset(
+    {
+        "COMPLETED",
+        "SKIPPED",
+        STATUS_NOT_VERIFIED_BUDGET,
+        STATUS_CLASSIFICATION_SKIPPED,
+        "NO_CANDIDATES",
+    }
+)
+TERMINAL_FAIL_STATUSES = frozenset({"FAILED"})
+RESUME_PENDING_MATCH = frozenset(
+    {
+        "PAUSED_BEFORE_VISIT",
+        STATUS_NOT_VERIFIED_BUDGET,
+        "NOT_VISITED",
     }
 )
 
@@ -68,8 +95,10 @@ def load_sibling(stem: str) -> Any:
 
 p3a = load_sibling("p3a_jd_search")
 p5a = load_sibling("p5a_verify_candidate")
+p5f = load_sibling("p5f_collect_all_links")
 adapt = load_sibling("priceradar_candidate_adapt")
 take_home = load_sibling("priceradar_take_home_prices")
+model_match = load_sibling("priceradar_model_match")
 
 
 def utc_now() -> datetime:
@@ -142,6 +171,529 @@ def save_progress(job_dir: Path, progress: dict[str, Any]) -> None:
     write_json(job_dir / "job_progress.json", progress)
 
 
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def stable_hash(payload: Any) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def normalize_backend(backend: str | None) -> str:
+    b = str(backend or "").strip().lower()
+    if b in {"playwright", "p2d"}:
+        return BACKEND_P2D
+    if b == BACKEND_BSK:
+        return BACKEND_BSK
+    raise ValueError(f"backend 必须显式指定为 {BACKEND_P2D}|{BACKEND_BSK}，收到 {backend!r}")
+
+
+def search_backend_for(backend: str) -> str:
+    """Map detail backend to p5f search backend name (no auto-switch)."""
+    if backend == BACKEND_BSK:
+        return p5f.BACKEND_BSK
+    return p5f.BACKEND_PLAYWRIGHT
+
+
+def load_model_scope_policy(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(f"model-scope-policy 不存在: {p}")
+    data = read_json(p)
+    if not isinstance(data, dict):
+        raise ValueError("model-scope-policy 必须是 JSON object")
+    return data
+
+
+def build_job_fingerprint(
+    *,
+    cfg: dict[str, Any],
+    query: str,
+    candidate_source: str,
+    existing_collection_dir: str | None,
+    backend: str,
+    model_scope_policy: dict[str, Any] | None,
+) -> dict[str, Any]:
+    policy_id = None
+    policy_hash = None
+    if model_scope_policy:
+        policy_id = model_scope_policy.get("policy_id")
+        policy_hash = stable_hash(model_scope_policy)
+    return {
+        "rules_version": RULES_VERSION,
+        "adapt_rules_version": adapt.RULES_VERSION_ADAPT,
+        "take_home_rules_version": take_home.RULES_VERSION_TAKE_HOME,
+        "model_match_rules_version": getattr(model_match, "RULES_VERSION", None),
+        "business_sku": cfg.get("business_sku"),
+        "expected_model": cfg.get("expected_model"),
+        "red_line": str(cfg.get("red_line")),
+        "query": query,
+        "candidate_source": candidate_source,
+        "existing_collection_dir": existing_collection_dir,
+        "backend": backend,
+        "model_scope_policy_id": policy_id,
+        "model_scope_policy_hash": policy_hash,
+    }
+
+
+def fingerprint_mismatch_reasons(
+    saved: dict[str, Any] | None, current: dict[str, Any]
+) -> list[str]:
+    if not saved:
+        return ["缺少已保存 fingerprint，拒绝静默续跑"]
+    reasons = []
+    for key in (
+        "rules_version",
+        "adapt_rules_version",
+        "take_home_rules_version",
+        "model_match_rules_version",
+        "business_sku",
+        "expected_model",
+        "red_line",
+        "query",
+        "candidate_source",
+        "existing_collection_dir",
+        "backend",
+        "model_scope_policy_id",
+        "model_scope_policy_hash",
+    ):
+        if saved.get(key) != current.get(key):
+            reasons.append(f"{key}: saved={saved.get(key)!r} current={current.get(key)!r}")
+    return reasons
+
+
+def resolve_job_dir(job_id: str) -> Path:
+    job_dir = (JOB_ROOT / job_id).resolve()
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"resume job 不存在: {job_dir}")
+    return job_dir
+
+
+def new_attempt_id(seq: int) -> str:
+    return f"att{seq:03d}_{secrets.token_hex(2)}"
+
+
+def classify_candidate(
+    cand: dict[str, Any], *, expected_model: str
+) -> dict[str, Any]:
+    out = dict(cand)
+    title = str(cand.get("title") or "")
+    if cand.get("classification"):
+        gate = adapt.title_model_gate(title, expected_model=expected_model)
+        gate = dict(gate)
+        gate["classification"] = cand.get("classification")
+        gate["observed_model_tokens"] = (
+            cand.get("observed_model_tokens") or gate.get("observed_model_tokens")
+        )
+        gate["source_classification"] = "candidate_record"
+    else:
+        gate = adapt.title_model_gate(title, expected_model=expected_model)
+        gate = dict(gate)
+        gate["source_classification"] = "live_title_rules"
+    out["classification"] = gate.get("classification")
+    out["title_gate"] = gate
+    out["observed_model_tokens"] = gate.get("observed_model_tokens")
+    out["classification_reason"] = gate.get("reason")
+    return out
+
+
+def candidate_detail_plan(
+    cand: dict[str, Any],
+    *,
+    cfg: dict[str, Any],
+    model_scope_policy: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Decide whether this candidate needs a detail navigation (budget-consuming)."""
+    expected_model = str(cfg.get("expected_model") or "")
+    business_sku = str(cfg.get("business_sku") or expected_model)
+    gate = cand.get("title_gate") or adapt.title_model_gate(
+        str(cand.get("title") or ""), expected_model=expected_model
+    )
+    auth = p5a.model_scope_allows_title_browse(
+        model_scope_policy, gate=gate, business_sku=business_sku
+    )
+    skip_browse = bool(gate.get("skip_browse"))
+    needs_detail = (not skip_browse) or bool(auth.get("allowed"))
+    classification_skip = skip_browse and not auth.get("allowed")
+    return {
+        "gate": gate,
+        "title_auth": auth,
+        "needs_detail": needs_detail,
+        "classification_skip": classification_skip,
+        "authorization_note": (
+            auth.get("other_model_label_zh")
+            if auth.get("allowed")
+            else (
+                "TARGET纳入本次业务基准"
+                if gate.get("classification") == model_match.CLASS_TARGET
+                else "未授权自动纳入"
+            )
+        ),
+    }
+
+
+def collection_to_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    source_dir: Path,
+    coverage: dict[str, Any],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for i, row in enumerate(rows, start=1):
+        pid = str(row.get("product_id") or row.get("jd_product_id") or "").strip()
+        if not pid:
+            continue
+        url = str(row.get("normalized_url") or row.get("observed_url") or "").strip()
+        if not url:
+            url = f"https://item.jd.com/{pid}.html"
+        discovered = (
+            row.get("discovered_at_utc")
+            or row.get("source_collected_at_utc")
+            or coverage.get("started_at_utc")
+            or coverage.get("ended_at_utc")
+        )
+        out.append(
+            {
+                "product_id": pid,
+                "jd_product_id": pid,
+                "rank": row.get("rank") or row.get("source_page") or i,
+                "title": row.get("title"),
+                "shop_name": row.get("shop_name"),
+                "ad_marked": row.get("ad_marked"),
+                "ad_status": row.get("ad_status"),
+                "normalized_url": url,
+                "observed_url": row.get("observed_url") or url,
+                "discovery_source": "existing-collection",
+                "discovered_at_utc": discovered,
+                "source_collection_dir": str(source_dir),
+                "source_run_id": row.get("source_run_id")
+                or coverage.get("run_id")
+                or source_dir.name,
+                "classification": row.get("classification"),
+                "observed_model_tokens": row.get("observed_model_tokens"),
+                "other_models_normalized": row.get("other_models_normalized"),
+                "conflict_token": row.get("conflict_token"),
+                "page": row.get("page") or row.get("source_page"),
+                "query": row.get("query") or coverage.get("query"),
+                "synthetic": row.get("synthetic"),
+            }
+        )
+    return out
+
+
+def load_existing_collection(
+    collection_dir: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any], Path]:
+    """Load explicit collection dir. Never picks ‘latest’."""
+    source = Path(collection_dir).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"既有采集目录不存在: {source}")
+    coverage: dict[str, Any] = {}
+    for name in ("coverage.json", "run_metadata.json", "summary.json"):
+        p = source / name
+        if p.is_file():
+            try:
+                loaded = read_json(p)
+                if isinstance(loaded, dict):
+                    coverage = {**coverage, **loaded}
+            except json.JSONDecodeError:
+                pass
+
+    rows: list[dict[str, Any]] | None = None
+    used: Path | None = None
+    for name in ("all_candidates.json", "all_classified.json", "candidates.json"):
+        p = source / name
+        if p.is_file():
+            data = read_json(p)
+            if isinstance(data, list):
+                rows = data
+                used = p
+                break
+            if isinstance(data, dict) and isinstance(data.get("candidates"), list):
+                rows = data["candidates"]
+                used = p
+                break
+    if rows is None or used is None:
+        raise FileNotFoundError(
+            f"{source} 缺少 all_candidates.json / all_classified.json / candidates.json"
+        )
+
+    candidates = collection_to_candidates(rows, source_dir=source, coverage=coverage)
+    integrity = (
+        (coverage.get("completeness") or {}).get("integrity")
+        or coverage.get("overall_integrity")
+        or coverage.get("search_run_status")
+        or coverage.get("run_status")
+    )
+    stop_reason = (
+        (coverage.get("completeness") or {}).get("stop_reason")
+        or coverage.get("coverage_stop_reason")
+        or coverage.get("stop_reason")
+    )
+    restricted = bool((coverage.get("completeness") or {}).get("restricted"))
+    partial = bool(
+        integrity
+        and str(integrity).upper()
+        not in {"COMPLETE", "COMPLETE_EXPLAINABLE", "SUCCESS"}
+    ) or restricted
+    meta = {
+        "candidate_source": SOURCE_EXISTING_COLLECTION,
+        "reuse_mode": True,
+        "existing_collection_dir": str(source),
+        "existing_candidates_file": str(used),
+        "run_status": coverage.get("run_status") or ("PARTIAL" if partial else "REUSED"),
+        "search_run_status": coverage.get("run_status")
+        or coverage.get("overall_integrity")
+        or ("PARTIAL" if partial else "REUSED_COLLECTION"),
+        "coverage_stop_reason": stop_reason,
+        "stop_reason": stop_reason,
+        "overall_integrity": integrity,
+        "query": coverage.get("query"),
+        "pages_confirmed": coverage.get("pages_visited")
+        or (coverage.get("completeness") or {}).get("continuous_pages"),
+        "pages_visited": coverage.get("pages_visited"),
+        "unique_candidates_collected": len(candidates),
+        "candidate_count": len(candidates),
+        "raw_cards_observed": coverage.get("unique_candidates")
+        or coverage.get("raw_cards_observed"),
+        "backend": coverage.get("backend"),
+        "discovered_at_utc": coverage.get("started_at_utc")
+        or coverage.get("ended_at_utc")
+        or coverage.get("created_at_utc"),
+        "coverage_note": (
+            "复用显式既有采集目录的候选链接；"
+            "候选发现时间来自历史采集，详情核验时间为本任务；"
+            "复用链接 ≠ 复用历史价格；非本轮实时搜索。"
+            + (" 源采集完整性非 COMPLETE，不得显示为完整覆盖。" if partial else "")
+        ),
+        "completeness": coverage.get("completeness"),
+        "end_page_evidence": (coverage.get("completeness") or {}).get(
+            "end_page_evidence"
+        ),
+        "synthetic": any(c.get("synthetic") for c in candidates),
+    }
+    return candidates, meta, used
+
+
+def materialize_candidates_file(
+    search_dir: Path, candidates: list[dict[str, Any]]
+) -> Path:
+    path = search_dir / "candidates.json"
+    p3a.write_candidates_json(path, candidates)
+    return path
+
+
+def run_live_search(
+    *,
+    query: str,
+    backend: str,
+    business_config: Path,
+    max_cand: int,
+    max_pg: int,
+    timeout_s: int,
+    search_dir: Path,
+    bsk_browser: str | None,
+    search_fn: Callable[..., dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], Path, dict[str, Any]]:
+    """Execute live search with explicit backend. Returns candidates, meta, path, raw."""
+    if search_fn is not None:
+        search_result = search_fn(
+            query,
+            limit=max_cand,
+            max_candidates=max_cand,
+            max_pages=max_pg,
+            search_timeout_seconds=timeout_s,
+            auto_close=True,
+            out_dir=search_dir,
+            quiet=False,
+            limit_explicit=False,
+            max_candidates_explicit=True,
+            backend=backend,
+            browser=bsk_browser,
+        )
+        candidates = list(search_result.get("candidates") or [])
+        search_meta = dict(search_result.get("metadata") or {})
+        candidates_path = Path(
+            search_result.get("candidates_path") or (search_dir / "candidates.json")
+        )
+        if candidates_path.is_file():
+            try:
+                loaded = read_json(candidates_path)
+                if isinstance(loaded, list):
+                    candidates = loaded
+            except json.JSONDecodeError:
+                pass
+        for c in candidates:
+            c.setdefault("discovered_at_utc", utc_iso())
+            c.setdefault("discovery_source", SOURCE_LIVE_SEARCH)
+        search_meta["candidate_source"] = SOURCE_LIVE_SEARCH
+        search_meta["reuse_mode"] = False
+        search_meta.setdefault("candidate_count", len(candidates))
+        search_meta.setdefault("unique_candidates_collected", len(candidates))
+        search_meta.setdefault("run_status", search_result.get("run_status"))
+        search_meta.setdefault(
+            "coverage_stop_reason", search_result.get("coverage_stop_reason")
+        )
+        return candidates, search_meta, candidates_path, search_result
+
+    if backend == BACKEND_BSK:
+        # p5f writes under collect_all_runs; copy handoff into this job's search_dir.
+        collect = p5f.run_collect_all(
+            query=query,
+            business_config=business_config,
+            max_pages=max_pg,
+            search_timeout_seconds=max(timeout_s, 30),
+            allow_browser=True,
+            backend=search_backend_for(backend),
+            browser=bsk_browser,
+            reuse_search_tab=True,
+        )
+        collect_dir = Path(collect.get("run_dir") or collect.get("out_dir") or "")
+        if not collect_dir.is_dir():
+            raise RuntimeError("BSK live-search 未返回有效 collect run_dir")
+        # Mirror key artifacts into job search_dir for single-job audit trail.
+        for name in (
+            "all_candidates.json",
+            "coverage.json",
+            "checkpoint.json",
+            "report.html",
+        ):
+            src = collect_dir / name
+            if src.is_file():
+                shutil.copy2(src, search_dir / name)
+        write_json(
+            search_dir / "live_search_collect_pointer.json",
+            {
+                "collect_run_dir": str(collect_dir),
+                "backend": BACKEND_BSK,
+                "query": query,
+                "copied_at_utc": utc_iso(),
+            },
+        )
+        candidates, meta, used = load_existing_collection(collect_dir)
+        # Re-tag as live discovery (this job triggered the search).
+        now = utc_iso()
+        for c in candidates:
+            c["discovery_source"] = SOURCE_LIVE_SEARCH
+            c["discovered_at_utc"] = c.get("discovered_at_utc") or now
+            c["live_collect_run_dir"] = str(collect_dir)
+        if max_cand and len(candidates) > max_cand:
+            candidates = candidates[:max_cand]
+        meta["candidate_source"] = SOURCE_LIVE_SEARCH
+        meta["reuse_mode"] = False
+        meta["live_collect_run_dir"] = str(collect_dir)
+        meta["coverage_note"] = (
+            "本轮 live-search（BSK/p5f）采集；详情核验另计时间。"
+            + (
+                " 搜索完整性非 COMPLETE，不得显示为完整覆盖。"
+                if str(meta.get("overall_integrity") or "").upper()
+                not in {"COMPLETE", "COMPLETE_EXPLAINABLE", "SUCCESS", ""}
+                and meta.get("overall_integrity")
+                else ""
+            )
+        )
+        meta["unique_candidates_collected"] = len(candidates)
+        meta["candidate_count"] = len(candidates)
+        meta.setdefault("run_status", collect.get("run_status") or meta.get("run_status"))
+        candidates_path = materialize_candidates_file(search_dir, candidates)
+        write_json(search_dir / "run_metadata.json", meta)
+        return candidates, meta, candidates_path, collect
+
+    # p2d / Playwright search via p3a
+    search_result = p3a.run_search_collect(
+        query,
+        limit=max_cand,
+        max_candidates=max_cand,
+        max_pages=max_pg,
+        search_timeout_seconds=timeout_s,
+        auto_close=True,
+        out_dir=search_dir,
+        quiet=False,
+        limit_explicit=False,
+        max_candidates_explicit=True,
+    )
+    candidates = list(search_result.get("candidates") or [])
+    search_meta = dict(search_result.get("metadata") or {})
+    candidates_path = Path(
+        search_result.get("candidates_path") or (search_dir / "candidates.json")
+    )
+    if candidates_path.is_file():
+        try:
+            loaded = read_json(candidates_path)
+            if isinstance(loaded, list):
+                candidates = loaded
+        except json.JSONDecodeError:
+            pass
+    now = utc_iso()
+    for c in candidates:
+        c.setdefault("discovered_at_utc", now)
+        c.setdefault("discovery_source", SOURCE_LIVE_SEARCH)
+    search_meta["candidate_source"] = SOURCE_LIVE_SEARCH
+    search_meta["reuse_mode"] = False
+    search_meta.setdefault("candidate_count", len(candidates))
+    search_meta.setdefault("unique_candidates_collected", len(candidates))
+    search_meta.setdefault("run_status", search_result.get("run_status"))
+    search_meta.setdefault(
+        "coverage_stop_reason", search_result.get("coverage_stop_reason")
+    )
+    search_meta["backend"] = BACKEND_P2D
+    return candidates, search_meta, candidates_path, search_result
+
+
+def classification_skip_row(
+    *,
+    business_sku: str,
+    red_line: str,
+    candidate: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    gate = plan.get("gate") or {}
+    return take_home.apply_low_price_signal_fields(
+        {
+            "business_sku": business_sku,
+            "jd_product_id": candidate.get("product_id"),
+            "search_rank": candidate.get("rank"),
+            "title": candidate.get("title"),
+            "url": candidate.get("normalized_url") or candidate.get("observed_url"),
+            "shop": candidate.get("shop_name"),
+            "ad_marked": candidate.get("ad_marked"),
+            "observed_model": "",
+            "observed_spec": "",
+            "classification": gate.get("classification")
+            or candidate.get("classification"),
+            "authorization_note": plan.get("authorization_note"),
+            "primary_display_price": None,
+            "take_home_status": STATUS_CLASSIFICATION_SKIPPED,
+            "lowest_observed_take_home_price": None,
+            "lowest_take_home_option_id": None,
+            "lowest_take_home_price_type": None,
+            "lowest_take_home_conditions": None,
+            "normalized_price": None,
+            "red_line": red_line,
+            "price_delta": None,
+            "task_status": "SKIPPED",
+            "match_status": "MODEL_MISMATCH_SKIPPED",
+            "system_verdict": "MODEL_MISMATCH_SKIPPED",
+            "system_verdict_zh": "分类跳过（未打开详情；不占导航预算）",
+            "manual_verdict": None,
+            "legacy_page_price_verdict": None,
+            "review_reasons": gate.get("reason") or plan.get("title_auth", {}).get("reason"),
+            "discovered_at": candidate.get("discovered_at_utc"),
+            "checked_at": utc_iso(),
+            "candidate_run_dir": "",
+            "evidence_paths": "",
+            "screenshot_link": "",
+            "packaging_match": None,
+            "box_comparable": None,
+            "attempt_id": None,
+            "execution_status": STATUS_CLASSIFICATION_SKIPPED,
+        }
+    )
+
+
 PRODUCT_ROW_FIELDS = [
     "business_sku",
     "jd_product_id",
@@ -152,6 +704,8 @@ PRODUCT_ROW_FIELDS = [
     "ad_marked",
     "observed_model",
     "observed_spec",
+    "classification",
+    "authorization_note",
     "primary_display_price",
     "take_home_status",
     "lowest_observed_take_home_price",
@@ -170,14 +724,18 @@ PRODUCT_ROW_FIELDS = [
     "signal_review_reasons",
     "task_status",
     "match_status",
+    "execution_status",
     "system_verdict",
     "system_verdict_zh",
     "manual_verdict",
     "legacy_page_price_verdict",
     "review_reasons",
+    "discovered_at",
     "checked_at",
+    "attempt_id",
     "candidate_run_dir",
     "evidence_paths",
+    "screenshot_link",
     "packaging_match",
     "box_comparable",
 ]
@@ -268,6 +826,8 @@ def product_row_from_verify(
     candidate: dict[str, Any],
     verify: dict[str, Any],
     options: list[dict[str, Any]],
+    plan: dict[str, Any] | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     pid = str(candidate.get("product_id") or verify.get("candidate_product_id") or "")
     comparable_opts = [o for o in options if o.get("comparable_for_min")]
@@ -302,14 +862,22 @@ def product_row_from_verify(
             delta = format(lowest - red, "f")
 
     evidence = []
+    shot = ""
     if verify.get("screenshot_dir"):
         evidence.append(str(verify["screenshot_dir"]))
+        shot = str(verify["screenshot_dir"])
     if verify.get("pipeline_dir"):
         evidence.append(str(verify["pipeline_dir"]))
     if verify.get("verify_dir"):
         evidence.append(str(verify["verify_dir"]))
+    capture = verify.get("capture") or {}
+    if capture.get("screenshot_path"):
+        shot = str(capture["screenshot_path"])
+        evidence.append(shot)
 
     url_adapt = verify.get("url_adapt") or {}
+    plan = plan or {}
+    gate = plan.get("gate") or candidate.get("title_gate") or {}
     row = {
         "business_sku": business_sku,
         "jd_product_id": pid,
@@ -325,7 +893,14 @@ def product_row_from_verify(
         or "",
         "ad_marked": candidate.get("ad_marked"),
         "observed_model": verify.get("observed_model") or "",
-        "observed_spec": "",  # filled if pipeline row available later
+        "observed_spec": verify.get("observed_spec") or "",
+        "classification": gate.get("classification")
+        or candidate.get("classification")
+        or "",
+        "authorization_note": plan.get("authorization_note")
+        or (
+            (verify.get("title_gate_authorization") or {}).get("other_model_label_zh")
+        ),
         "primary_display_price": verify.get("page_primary_price"),
         "take_home_status": take_home_status,
         "lowest_observed_take_home_price": format(lowest, "f") if lowest is not None else None,
@@ -337,6 +912,7 @@ def product_row_from_verify(
         "price_delta": delta,
         "task_status": verify.get("task_status"),
         "match_status": verify.get("match_status"),
+        "execution_status": verify.get("task_status"),
         "system_verdict": verify.get("system_verdict"),
         "system_verdict_zh": verify.get("system_verdict_zh"),
         "manual_verdict": None,
@@ -346,10 +922,13 @@ def product_row_from_verify(
         )
         if isinstance(verify.get("review_reasons"), list)
         else (verify.get("review_reasons") or verify.get("failure_reason") or ""),
+        "discovered_at": candidate.get("discovered_at_utc"),
         "checked_at": verify.get("ended_at_utc") or verify.get("started_at_utc"),
+        "attempt_id": attempt_id or verify.get("attempt_id"),
         "candidate_run_dir": verify.get("verify_dir")
         or ((verify.get("capture") or {}).get("out_dir")),
         "evidence_paths": ";".join(evidence),
+        "screenshot_link": shot,
         "packaging_match": verify.get("packaging_match"),
         "box_comparable": verify.get("box_comparable"),
     }
@@ -362,7 +941,10 @@ def paused_placeholder_row(
     red_line: str,
     candidate: dict[str, Any],
     reason: str,
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    plan = plan or {}
+    gate = plan.get("gate") or candidate.get("title_gate") or {}
     return take_home.apply_low_price_signal_fields(
         {
             "business_sku": business_sku,
@@ -374,6 +956,9 @@ def paused_placeholder_row(
             "ad_marked": candidate.get("ad_marked"),
             "observed_model": "",
             "observed_spec": "",
+            "classification": gate.get("classification")
+            or candidate.get("classification"),
+            "authorization_note": plan.get("authorization_note"),
             "primary_display_price": None,
             "take_home_status": "PAUSED_SESSION",
             "lowest_observed_take_home_price": None,
@@ -385,14 +970,18 @@ def paused_placeholder_row(
             "price_delta": None,
             "task_status": SESSION_PAUSE_TASK,
             "match_status": "PAUSED_BEFORE_VISIT",
+            "execution_status": "NOT_VISITED_SESSION_PAUSE",
             "system_verdict": SESSION_PAUSE_TASK,
             "system_verdict_zh": "会话暂停，候选未访问（非普通采集失败）",
             "manual_verdict": None,
             "legacy_page_price_verdict": None,
             "review_reasons": reason,
+            "discovered_at": candidate.get("discovered_at_utc"),
             "checked_at": utc_iso(),
+            "attempt_id": None,
             "candidate_run_dir": "",
             "evidence_paths": "",
+            "screenshot_link": "",
             "packaging_match": None,
             "box_comparable": None,
         }
@@ -405,8 +994,11 @@ def not_verified_budget_row(
     red_line: str,
     candidate: dict[str, Any],
     max_verify: int,
+    plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Candidate kept from search but not detail-verified due to max-verify budget."""
+    plan = plan or {}
+    gate = plan.get("gate") or candidate.get("title_gate") or {}
     return take_home.apply_low_price_signal_fields(
         {
             "business_sku": business_sku,
@@ -418,6 +1010,9 @@ def not_verified_budget_row(
             "ad_marked": candidate.get("ad_marked"),
             "observed_model": "",
             "observed_spec": "",
+            "classification": gate.get("classification")
+            or candidate.get("classification"),
+            "authorization_note": plan.get("authorization_note"),
             "primary_display_price": None,
             "take_home_status": STATUS_NOT_VERIFIED_BUDGET,
             "lowest_observed_take_home_price": None,
@@ -429,6 +1024,7 @@ def not_verified_budget_row(
             "price_delta": None,
             "task_status": STATUS_NOT_VERIFIED_BUDGET,
             "match_status": STATUS_NOT_VERIFIED_BUDGET,
+            "execution_status": STATUS_NOT_VISITED_BUDGET,
             "system_verdict": STATUS_NOT_VERIFIED_BUDGET,
             "system_verdict_zh": (
                 f"搜索已收录，但未核验（详情访问预算 max-verify={max_verify}）"
@@ -437,11 +1033,14 @@ def not_verified_budget_row(
             "legacy_page_price_verdict": None,
             "review_reasons": (
                 "超出详情核验预算，未打开详情；"
-                "不得当作失败、已核验或无低价；不得继承其他候选价格"
+                "不得当作失败、已核验或有低价；不得继承其他候选价格"
             ),
+            "discovered_at": candidate.get("discovered_at_utc"),
             "checked_at": utc_iso(),
+            "attempt_id": None,
             "candidate_run_dir": "",
             "evidence_paths": "",
+            "screenshot_link": "",
             "packaging_match": None,
             "box_comparable": None,
             "first_seen_load_batch": candidate.get("first_seen_load_batch"),
@@ -530,13 +1129,20 @@ def fallback_no_candidate_row(
             "manual_verdict": None,
             "legacy_page_price_verdict": None,
             "review_reasons": reason,
+            "discovered_at": None,
             "checked_at": utc_iso(),
+            "attempt_id": None,
             "candidate_run_dir": "",
             "evidence_paths": "",
+            "screenshot_link": "",
             "packaging_match": None,
             "box_comparable": None,
+            "classification": None,
+            "authorization_note": None,
+            "execution_status": "NO_CANDIDATES",
         }
     )
+
 
 
 def build_sku_summary(
@@ -549,18 +1155,28 @@ def build_sku_summary(
     query_basis: str,
     limit: int,
     max_verify: int | None = None,
+    detail_pages_opened_actual: int | None = None,
+    session_paused: bool = False,
+    job_execution_complete: bool = True,
 ) -> dict[str, Any]:
-    # Exclude synthetic no-candidate placeholder from “candidate” counts when jd empty
     real_rows = [r for r in product_rows if r.get("jd_product_id")]
     placeholder = [r for r in product_rows if not r.get("jd_product_id")]
+
+    seen_ids: set[str] = set()
+    dedup_rows: list[dict[str, Any]] = []
+    for r in real_rows:
+        pid = str(r.get("jd_product_id"))
+        if pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+        dedup_rows.append(r)
+    real_rows = dedup_rows
 
     candidates_found = int(
         search_meta.get("unique_candidates_collected")
         or search_meta.get("candidate_count")
         or len(real_rows)
     )
-    # Visited/processed = entered verify (incl. mismatch skip / OCR fail);
-    # excludes pause-before-visit and budget-not-verified.
     paused_unvisited = sum(
         1
         for r in real_rows
@@ -573,14 +1189,15 @@ def build_sku_summary(
         if r.get("task_status") == STATUS_NOT_VERIFIED_BUDGET
         or r.get("match_status") == STATUS_NOT_VERIFIED_BUDGET
     )
-    visited = len(real_rows) - paused_unvisited - not_verified_budget
-
-    model_skip = sum(
+    classification_skipped = sum(
         1
         for r in real_rows
         if r.get("system_verdict") == "MODEL_MISMATCH_SKIPPED"
         or r.get("match_status") == "MODEL_MISMATCH_SKIPPED"
+        or r.get("execution_status") == STATUS_CLASSIFICATION_SKIPPED
     )
+    visited = len(real_rows) - paused_unvisited - not_verified_budget
+    model_skip = classification_skipped
     comparable_products = sum(
         1
         for r in real_rows
@@ -588,6 +1205,11 @@ def build_sku_summary(
     )
     possible_break_products = sum(
         1 for r in real_rows if r.get("system_verdict") == take_home.SYSTEM_POSSIBLE_BREAK
+    )
+    no_break_in_scope = sum(
+        1
+        for r in real_rows
+        if r.get("system_verdict") == take_home.SYSTEM_NO_BREAK_IN_SCOPE
     )
     review_products = sum(
         1
@@ -597,15 +1219,18 @@ def build_sku_summary(
     )
     failed = sum(1 for r in real_rows if r.get("task_status") == "FAILED")
     completed = sum(1 for r in real_rows if r.get("task_status") == "COMPLETED")
-    # detail_pages_opened: actual detail visits (exclude title-gate skip & budget-skip)
-    detail_pages_opened = max(0, visited - model_skip)
-    primary_low_signal = sum(
-        1 for r in real_rows if r.get("low_price_signal") is True
-    )
+    if detail_pages_opened_actual is not None:
+        detail_pages_opened = int(detail_pages_opened_actual)
+    else:
+        detail_pages_opened = max(0, visited - model_skip)
+    primary_low_signal = sum(1 for r in real_rows if r.get("low_price_signal") is True)
     valid_options = sum(1 for o in price_options if o.get("comparable_for_min"))
     mv = max_verify if max_verify is not None else search_meta.get("max_verify")
 
-    # Job-level lowest from comparable options only
+    pending_verify = paused_unvisited + not_verified_budget
+    all_candidates_verified = pending_verify == 0 and not session_paused
+    verified_in_scope = completed + failed + model_skip
+
     best = None
     best_opt = None
     for o in price_options:
@@ -617,21 +1242,39 @@ def build_sku_summary(
         if best is None or amt < best:
             best = amt
             best_opt = o
-
-    # If all products are review / no comparable → lowest must be null
     if comparable_products == 0:
         best = None
         best_opt = None
 
     extract = search_meta.get("extract_stats") or {}
     scroll = search_meta.get("scroll") or {}
+    integrity = search_meta.get("overall_integrity") or (
+        (search_meta.get("completeness") or {}).get("integrity")
+    )
+    search_status = (
+        search_meta.get("run_status") or search_meta.get("search_status") or ""
+    )
+    partial_search = (
+        str(integrity or "").upper() in {"PARTIAL", "RESTRICTED"}
+        or str(search_status).upper() in {"PARTIAL", "SEARCH_RESTRICTED"}
+        or bool((search_meta.get("completeness") or {}).get("restricted"))
+    )
+    reuse_mode = bool(search_meta.get("reuse_mode"))
+    scope_prefix = (
+        "既有采集目录候选"
+        if reuse_mode
+        else ("本次搜索（部分/受限）" if partial_search else "本次搜索范围内")
+    )
     coverage = {
         "scope_statement": (
-            "本次搜索范围内（首屏有限滚动 + 去重候选上限）；"
-            "不是全京东、不是全部链接、不是全平台最低价"
+            f"{scope_prefix}；不是全京东、不是全部链接、不是全平台最低价"
         ),
         "query": query,
         "query_generation_basis": query_basis,
+        "candidate_source": search_meta.get("candidate_source")
+        or (SOURCE_EXISTING_COLLECTION if reuse_mode else SOURCE_LIVE_SEARCH),
+        "reuse_mode": reuse_mode,
+        "existing_collection_dir": search_meta.get("existing_collection_dir"),
         "limit": limit,
         "max_candidates": search_meta.get("max_candidates") or limit,
         "max_pages": search_meta.get("max_pages"),
@@ -657,18 +1300,24 @@ def build_sku_summary(
         or search_meta.get("stop_reason")
         or search_meta.get("status_reason"),
         "related_stop_reasons": search_meta.get("related_stop_reasons") or [],
-        "search_run_status": search_meta.get("run_status")
-        or search_meta.get("search_status"),
-        "pages_visited": search_meta.get("pages_confirmed"),
+        "search_run_status": search_status,
+        "overall_integrity": integrity,
+        "end_page_evidence": search_meta.get("end_page_evidence")
+        or (search_meta.get("completeness") or {}).get("end_page_evidence"),
+        "partial_or_restricted": partial_search,
+        "pages_visited": search_meta.get("pages_visited")
+        or search_meta.get("pages_confirmed"),
+        "candidate_discovery_at_utc": search_meta.get("discovered_at_utc"),
         "coverage_note": search_meta.get("coverage_note")
-        or (
-            "本次搜索范围内有限页/加载批次收集；不是全京东、不是全平台最低价"
-        ),
+        or ("本次搜索范围内有限页/加载批次收集；不是全京东、不是全平台最低价"),
         "hit_limit_means": "达到候选上限属于覆盖限制，不等于全部商品",
         "scope_line": (
-            f"本次搜索范围内收集{candidates_found}个候选，"
-            f"实际访问{detail_pages_opened}个，"
-            f"{not_verified_budget}个尚未核验。"
+            f"{scope_prefix}收集{candidates_found}个候选，"
+            f"分类跳过{model_skip}个，实际导航{detail_pages_opened}个，"
+            f"完成{completed}个，失败{failed}个，"
+            f"预算未访问{not_verified_budget}个，"
+            f"暂停未访问{paused_unvisited}个。"
+            + (" 搜索为 PARTIAL/受限，不得视为完整覆盖。" if partial_search else "")
         ),
     }
 
@@ -677,15 +1326,17 @@ def build_sku_summary(
         "rules_version": RULES_VERSION,
         "candidates_found": candidates_found,
         "candidates_processed": visited,
-        "candidates_visited": visited,  # alias of candidates_processed
+        "candidates_visited": visited,
         "detail_pages_opened": detail_pages_opened,
         "model_mismatch_skipped": model_skip,
+        "classification_skipped": classification_skipped,
         "not_verified_budget": not_verified_budget,
         "completed": completed,
         "failed": failed,
         "paused_unvisited": paused_unvisited,
         "products_with_comparable_take_home": comparable_products,
         "products_possible_break": possible_break_products,
+        "products_no_break_in_scope": no_break_in_scope,
         "products_primary_low_price_signal": primary_low_signal,
         "products_review_required": review_products,
         "products_failed": failed,
@@ -693,44 +1344,55 @@ def build_sku_summary(
         "valid_comparable_price_option_count": valid_options,
         "price_option_count_total": len(price_options),
         "max_verify": mv,
+        "job_execution_complete": job_execution_complete,
+        "all_candidates_verified": all_candidates_verified,
+        "verified_coverage_count": verified_in_scope,
+        "verified_coverage_of_candidates": f"{verified_in_scope}/{candidates_found}",
+        "session_paused": session_paused,
+        "reuse_mode": reuse_mode,
+        "no_break_in_scope_note": (
+            "NO_BREAK_IN_SCOPE 仅针对已识别的有效可比方案，"
+            "不代表整个 SKU / 全部候选没有破价"
+        ),
         "stat_definitions": {
-            "candidates_found": "本次搜索去重后的候选商品数（非价格方案数）",
+            "candidates_found": "搜索/既有采集去重后的候选商品数（非价格方案数）",
             "candidates_processed": (
                 "已进入核验流程的候选（含型号跳过/失败；"
                 "不含暂停未访问、不含预算未核验）"
             ),
             "candidates_visited": "同 candidates_processed（兼容旧字段）",
-            "detail_pages_opened": (
-                "实际打开详情页数＝processed−model_mismatch_skipped；"
-                "型号不符跳过不消耗详情访问预算"
-            ),
-            "model_mismatch_skipped": "标题门控明确型号不符而跳过的商品数（未开详情）",
-            "not_verified_budget": (
-                "因 max-verify 预算未打开详情的候选数（≠失败、≠已核验、≠无低价）"
-            ),
+            "detail_pages_opened": "实际详情导航次数（分类跳过不占预算）",
+            "model_mismatch_skipped": "分类跳过商品数（未开详情，不占导航预算）",
+            "classification_skipped": "同 model_mismatch_skipped",
+            "not_verified_budget": "因 max-verify 预算未打开详情的候选数",
             "completed": "task_status=COMPLETED 的商品数",
             "failed": "task_status=FAILED 的商品数（普通失败）",
             "paused_unvisited": "会话暂停后未打开的候选数（非普通失败）",
             "products_with_comparable_take_home": "至少有一个有效可比到手价方案的商品数",
             "products_possible_break": "商品级 system_verdict=POSSIBLE_BREAK（疑似破价）",
-            "products_primary_low_price_signal": (
-                "主展示低价线索商品数（≠已确认破价；与疑似破价分开统计）"
-            ),
+            "products_no_break_in_scope": "已核验可比范围内未破价商品数；≠整 SKU 无破价",
+            "products_primary_low_price_signal": "主展示低价线索商品数（≠已确认破价）",
             "products_review_required": "商品级待核验（含无到手价证据）",
             "products_failed": "同 failed（兼容）",
             "candidates_paused_unvisited": "同 paused_unvisited（兼容）",
             "valid_comparable_price_option_count": "可比到手价方案条数（≠商品数）",
+            "job_execution_complete": "本轮编排已正常收尾（可能仍有未核验候选）",
+            "all_candidates_verified": "全部候选均已核验完毕（无预算/暂停残留）",
         },
         "search_coverage": coverage,
         "verify_coverage": {
             "max_verify": mv,
             "detail_pages_opened": detail_pages_opened,
             "model_mismatch_skipped": model_skip,
+            "classification_skipped": classification_skipped,
             "not_verified_budget": not_verified_budget,
             "paused_unvisited": paused_unvisited,
             "completed": completed,
             "failed": failed,
             "scope_line": coverage["scope_line"],
+            "job_execution_complete": job_execution_complete,
+            "all_candidates_verified": all_candidates_verified,
+            "verified_coverage_of_candidates": f"{verified_in_scope}/{candidates_found}",
         },
         "lowest_comparable_take_home": (
             {
@@ -759,9 +1421,12 @@ def build_sku_summary(
             "最低价为空表示本次无有效可比到手价方案（例如全部待核验）",
             "legacy/主展示价不参与到手价结论与最低价",
             "主展示低价线索 ≠ 疑似破价 ≠ 已确认破价",
-            "NOT_VERIFIED_BUDGET 不得当作失败或无低价",
+            "NOT_VERIFIED_BUDGET 不得当作失败或有低价",
             "manual_verdict 系统不代填",
             "不得称全部京东链接或全平台最低价",
+            "任务执行完成 ≠ 全部候选核验完毕",
+            "NO_BREAK_IN_SCOPE 仅针对已识别有效可比方案",
+            "候选发现时间与详情检查时间分开记录",
         ],
     }
 
@@ -779,13 +1444,16 @@ def render_report_html(
 
     def rows_html(rows: list[dict[str, Any]], keys: list[str]) -> str:
         if not rows:
-            return "<tr><td colspan='99'>（无）</td></tr>"
+            return "<tr><td colspan='99'>（空）</td></tr>"
         head = "".join(f"<th>{esc(k)}</th>" for k in keys)
         body = []
         for r in rows:
             body.append(
                 "<tr>"
-                + "".join(f"<td>{esc(str(r.get(k) if r.get(k) is not None else ''))}</td>" for k in keys)
+                + "".join(
+                    f"<td>{esc(str(r.get(k) if r.get(k) is not None else ''))}</td>"
+                    for k in keys
+                )
                 + "</tr>"
             )
         return f"<tr>{head}</tr>" + "".join(body)
@@ -802,7 +1470,6 @@ def render_report_html(
           <li>链接：{esc(str(lowest.get('url') or ''))}</li>
         </ul>"""
 
-    # Prefer suspected break + primary-low signals at top of product table
     ordered_rows = sorted(
         product_rows,
         key=lambda r: (
@@ -814,17 +1481,26 @@ def render_report_html(
     prod_keys = [
         "search_rank",
         "jd_product_id",
+        "url",
         "title",
-        "task_status",
-        "system_verdict",
-        "system_verdict_zh",
+        "observed_model",
+        "classification",
+        "authorization_note",
+        "observed_spec",
         "primary_display_price",
-        "low_price_signal",
-        "signal_amount",
-        "signal_conditions",
-        "signal_review_reasons",
         "lowest_observed_take_home_price",
         "lowest_take_home_conditions",
+        "box_comparable",
+        "red_line",
+        "system_verdict",
+        "low_price_signal",
+        "signal_review_reasons",
+        "review_reasons",
+        "execution_status",
+        "task_status",
+        "discovered_at",
+        "checked_at",
+        "screenshot_link",
         "manual_verdict",
     ]
     opt_keys = [
@@ -851,12 +1527,24 @@ def render_report_html(
     )
     reuse_html = (
         "<p class='warn'>复用模式：搜索证据非本轮实时翻页采集；"
-        "请分别核对搜索证据时间、来源任务、复用时间及详情核验时间；"
-        "详见 search/run_metadata.json 的 reuse 字段。"
+        "请分别核对候选发现时间、来源任务、复用时间及详情核验时间；"
+        "复用链接不等于复用历史价格。"
         "历史复用不得在现网搜索受限后自动兜底。</p>"
         if reuse_mode
         else ""
     )
+    exec_line = (
+        f"任务执行完成={esc(str(summary.get('job_execution_complete')))} · "
+        f"全部候选核验完毕={esc(str(summary.get('all_candidates_verified')))} · "
+        f"覆盖={esc(str(summary.get('verified_coverage_of_candidates')))}"
+    )
+    partial_flag = ""
+    if cov.get("partial_or_restricted"):
+        partial_flag = (
+            "<p class='warn'>搜索 PARTIAL/受限：不得显示为完整覆盖。"
+            f" integrity={esc(str(cov.get('overall_integrity')))}"
+            f" stop={esc(str(cov.get('coverage_stop_reason')))}</p>"
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -877,53 +1565,53 @@ th {{ background: #f5f5f5; }}
 <body>
 <h1>PriceRadar 单 SKU 搜索核验报告</h1>
 <p class="muted">job_id={esc(job_id)} · rules={esc(RULES_VERSION)} ·
-<strong>本次搜索范围内</strong>（非全京东 / 非全平台最低价）</p>
+<strong>本次范围内</strong>（非全京东 / 非全平台最低价）</p>
+<p class="muted">{exec_line}</p>
 {evidence_note_html}
 {reuse_html}
+{partial_flag}
 
 <div class="card">
   <h2>覆盖说明</h2>
   <p>{esc(str(cov.get('scope_statement')))}</p>
   <ul>
+    <li>候选来源：{esc(str(cov.get('candidate_source')))}
+        · 复用={esc(str(cov.get('reuse_mode')))}</li>
     <li>搜索词：{esc(str(cov.get('query')))}（{esc(str(cov.get('query_generation_basis')))}）</li>
     <li>limit：{esc(str(cov.get('limit')))} · 去重候选：{esc(str(cov.get('deduped_candidate_count')))}</li>
-    <li>原始卡片数：{esc(str(cov.get('raw_card_count')))} · 滚动次数：{esc(str(cov.get('scroll_count')))}</li>
-    <li>停止原因：{esc(str(cov.get('coverage_stop_reason')))} · 搜索状态：{esc(str(cov.get('search_run_status')))}</li>
-    <li>pages_visited：{esc(str(cov.get('pages_visited')))}（未实测分页则保持 UNKNOWN）</li>
+    <li>页数：{esc(str(cov.get('pages_visited')))} · 停止原因：{esc(str(cov.get('coverage_stop_reason')))}</li>
+    <li>完整性：{esc(str(cov.get('overall_integrity')))} · 搜索状态：{esc(str(cov.get('search_run_status')))}</li>
+    <li>末页证据：{esc(str(cov.get('end_page_evidence')))}</li>
+    <li>候选发现时间：{esc(str(cov.get('candidate_discovery_at_utc')))}</li>
   </ul>
 </div>
 
 <div class="card">
   <h2>SKU 汇总 · {esc(str(summary.get('business_sku')))}</h2>
-  <p><strong>{esc(str((summary.get('search_coverage') or {}).get('scope_line') or (summary.get('verify_coverage') or {}).get('scope_line') or ''))}</strong></p>
+  <p><strong>{esc(str((summary.get('search_coverage') or {}).get('scope_line') or ''))}</strong></p>
   <ul>
-    <li>候选数（搜索去重）：{esc(str(summary.get('candidates_found')))}</li>
-    <li>已处理（processed）：{esc(str(summary.get('candidates_processed')))}</li>
-    <li>详情页打开：{esc(str(summary.get('detail_pages_opened')))}</li>
-    <li>型号不符跳过：{esc(str(summary.get('model_mismatch_skipped')))}</li>
-    <li>预算未核验：{esc(str(summary.get('not_verified_budget')))}</li>
-    <li>completed / failed / paused_unvisited：
-        {esc(str(summary.get('completed')))} /
-        {esc(str(summary.get('failed')))} /
-        {esc(str(summary.get('paused_unvisited')))}</li>
-    <li>可比到手价商品数：{esc(str(summary.get('products_with_comparable_take_home')))}</li>
-    <li>疑似破价商品数：{esc(str(summary.get('products_possible_break')))}</li>
-    <li>主展示低价线索数：{esc(str(summary.get('products_primary_low_price_signal')))}
-        （与疑似破价分开，不冒充已确认破价）</li>
-    <li>待核验商品数：{esc(str(summary.get('products_review_required')))}</li>
+    <li>搜索候选：{esc(str(summary.get('candidates_found')))}</li>
+    <li>分类跳过：{esc(str(summary.get('classification_skipped')))}</li>
+    <li>实际导航：{esc(str(summary.get('detail_pages_opened')))}</li>
+    <li>完成 / 失败：{esc(str(summary.get('completed')))} / {esc(str(summary.get('failed')))}</li>
+    <li>预算未访问：{esc(str(summary.get('not_verified_budget')))}</li>
+    <li>暂停未访问：{esc(str(summary.get('paused_unvisited')))}</li>
+    <li>可比价商品：{esc(str(summary.get('products_with_comparable_take_home')))}</li>
+    <li>疑似破价：{esc(str(summary.get('products_possible_break')))}</li>
+    <li>范围内未破价（NO_BREAK_IN_SCOPE）：{esc(str(summary.get('products_no_break_in_scope')))}
+        — {esc(str(summary.get('no_break_in_scope_note')))}</li>
+    <li>主展示低价线索：{esc(str(summary.get('products_primary_low_price_signal')))}</li>
+    <li>待核验商品：{esc(str(summary.get('products_review_required')))}</li>
     <li>有效价格方案数：{esc(str(summary.get('valid_comparable_price_option_count')))}
-        （总方案 {esc(str(summary.get('price_option_count_total')))}，≠商品数）</li>
-    <li>搜索停止原因：{esc(str(cov.get('coverage_stop_reason')))}
-        · pages_confirmed={esc(str(cov.get('pages_confirmed')))}
-        · mechanism={esc(str(cov.get('pagination_mechanism')))}</li>
+        （总方案 {esc(str(summary.get('price_option_count_total')))}）</li>
   </ul>
   <h3>范围内最低可比到手价</h3>
   {lowest_block}
-  <p class="muted">POSSIBLE_BREAK = 疑似破价，待人工确认；主展示低价线索 ≠ 到手价破价；manual_verdict 留空。</p>
+  <p class="muted">POSSIBLE_BREAK = 疑似破价，待人工确认；manual_verdict 留空。</p>
 </div>
 
 <div class="card">
-  <h2>商品明细（优先疑似破价与低价线索）</h2>
+  <h2>商品明细（一行一个候选核验结果；价格方案另表）</h2>
   <table>{rows_html(ordered_rows, prod_keys)}</table>
 </div>
 
@@ -934,6 +1622,20 @@ th {{ background: #f5f5f5; }}
 </body>
 </html>
 """
+
+
+def _latest_attempt_by_pid(
+    attempts: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for att in attempts:
+        pid = str(att.get("product_id") or "")
+        if not pid:
+            continue
+        prev = latest.get(pid)
+        if prev is None or int(att.get("seq") or 0) >= int(prev.get("seq") or 0):
+            latest[pid] = att
+    return latest
 
 
 def run_sku_job(
@@ -948,6 +1650,13 @@ def run_sku_job(
     limit_explicit: bool = False,
     max_candidates_explicit: bool = False,
     max_verify_explicit: bool = False,
+    candidate_source: str = SOURCE_LIVE_SEARCH,
+    existing_collection_dir: Path | None = None,
+    resume_job_id: str | None = None,
+    backend: str | None = None,
+    bsk_browser: str | None = None,
+    model_scope_policy: dict[str, Any] | Path | None = None,
+    retry_failed: bool = False,
     search_fn: Callable[..., dict[str, Any]] | None = None,
     verify_fn: Callable[..., dict[str, Any]] | None = None,
     job_dir: Path | None = None,
@@ -958,7 +1667,19 @@ def run_sku_job(
     if errs or cfg is None:
         raise ValueError("; ".join(errs or ["config invalid"]))
 
-    # Compat: bare limit= int from old callers without explicit flags
+    if isinstance(model_scope_policy, (str, Path)):
+        model_scope_policy = load_model_scope_policy(Path(model_scope_policy))
+
+    backend_norm = normalize_backend(backend)
+
+    source = str(candidate_source or SOURCE_LIVE_SEARCH).strip().lower()
+    if source not in {SOURCE_LIVE_SEARCH, SOURCE_EXISTING_COLLECTION}:
+        raise ValueError(
+            f"candidate-source 必须是 {SOURCE_LIVE_SEARCH}|{SOURCE_EXISTING_COLLECTION}"
+        )
+    if source == SOURCE_EXISTING_COLLECTION and not existing_collection_dir and not resume_job_id:
+        raise ValueError("existing-collection 模式必须显式提供 --existing-collection-dir")
+
     if limit is not None and not limit_explicit and not max_candidates_explicit:
         limit_explicit = True
 
@@ -978,20 +1699,124 @@ def run_sku_job(
     max_ver = int(budgets["max_verify"])
     limit = max_cand
 
-    if query and query.strip():
-        use_query = query.strip()
+    query_explicit = bool(query and str(query).strip())
+    if query_explicit:
+        use_query = str(query).strip()
         query_basis = "CLI --query（显式传入）"
     else:
         use_query, query_basis = default_query_from_baseline(cfg)
 
     business_sku = cfg["business_sku"]
     red_line = cfg["red_line"]
-    if job_dir is not None:
-        job_dir = Path(job_dir).resolve()
-        job_dir.mkdir(parents=True, exist_ok=True)
-        job_id = job_id or job_dir.name
+
+    existing_dir_resolved = (
+        str(Path(existing_collection_dir).resolve())
+        if existing_collection_dir
+        else None
+    )
+    source_explicit = candidate_source is not None and str(candidate_source).strip() != ""
+    # argparse always passes a default; track via sentinel only when resume needs it.
+    # For fingerprint: explicit CLI query/collection/backend always checked.
+
+    resuming = bool(resume_job_id)
+    prior_attempts: list[dict[str, Any]] = []
+    prior_rows_by_pid: dict[str, dict[str, Any]] = {}
+    prior_options: list[dict[str, Any]] = []
+    prior_detail_opens = 0
+
+    if resuming:
+        job_id = str(resume_job_id)
+        job_dir = resolve_job_dir(job_id)
+        progress_path = job_dir / "job_progress.json"
+        if not progress_path.is_file():
+            raise FileNotFoundError(f"缺少 job_progress.json: {progress_path}")
+        prior_progress = read_json(progress_path)
+        saved_fp = prior_progress.get("fingerprint") or {}
+        if prior_progress.get("backend"):
+            if normalize_backend(prior_progress.get("backend")) != backend_norm:
+                raise RuntimeError(
+                    "恢复拒绝：backend 与原任务不一致 "
+                    f"saved={prior_progress.get('backend')!r} current={backend_norm!r}"
+                )
+        # Explicit caller overrides must match saved; omitted fields adopt saved.
+        fp_query = use_query if query_explicit else (saved_fp.get("query") or use_query)
+        fp_source = (
+            source
+            if source_explicit and query_explicit
+            else (saved_fp.get("candidate_source") or prior_progress.get("candidate_source") or source)
+        )
+        # Prefer: if existing_collection_dir explicitly passed, use it; else saved.
+        fp_existing = existing_dir_resolved or saved_fp.get("existing_collection_dir")
+        if query_explicit and fp_query != saved_fp.get("query"):
+            raise RuntimeError(
+                "恢复拒绝：输入/红线/授权/规则版本变化，不得静默沿用旧结论。"
+                f"请新建任务或显式重处理。差异: query: saved={saved_fp.get('query')!r} "
+                f"current={fp_query!r}"
+            )
+        if existing_collection_dir is not None and existing_dir_resolved != saved_fp.get(
+            "existing_collection_dir"
+        ):
+            raise RuntimeError(
+                "恢复拒绝：existing-collection-dir 与原任务不一致，不得静默沿用旧结论。"
+            )
+        current_fp = build_job_fingerprint(
+            cfg=cfg,
+            query=fp_query,
+            candidate_source=str(
+                saved_fp.get("candidate_source")
+                or prior_progress.get("candidate_source")
+                or source
+            ),
+            existing_collection_dir=fp_existing,
+            backend=backend_norm,
+            model_scope_policy=model_scope_policy,
+        )
+        mismatches = fingerprint_mismatch_reasons(saved_fp, current_fp)
+        if mismatches:
+            raise RuntimeError(
+                "恢复拒绝：输入/红线/授权/规则版本变化，不得静默沿用旧结论。"
+                "请新建任务或显式重处理。差异: "
+                + "; ".join(mismatches)
+            )
+        # Adopt saved operational identity after checks pass
+        source = prior_progress.get("candidate_source") or source
+        use_query = prior_progress.get("query") or use_query
+        query_basis = prior_progress.get("query_generation_basis") or query_basis
+        existing_dir_resolved = (
+            prior_progress.get("existing_collection_dir") or existing_dir_resolved
+        )
+        attempts_path = job_dir / "candidate_attempts.json"
+        if attempts_path.is_file():
+            loaded = read_json(attempts_path)
+            if isinstance(loaded, list):
+                prior_attempts = loaded
+        rows_path = job_dir / "product_rows.json"
+        if rows_path.is_file():
+            loaded_rows = read_json(rows_path)
+            if isinstance(loaded_rows, list):
+                for r in loaded_rows:
+                    pid = str(r.get("jd_product_id") or "")
+                    if pid:
+                        prior_rows_by_pid[pid] = r
+        opts_path = job_dir / "price_options.json"
+        if opts_path.is_file():
+            loaded_opts = read_json(opts_path)
+            if isinstance(loaded_opts, list):
+                prior_options = loaded_opts
+        prior_detail_opens = int(prior_progress.get("detail_pages_opened") or 0)
+        max_ver = int(prior_progress.get("max_verify") or max_ver)
+        max_cand = int(prior_progress.get("max_candidates") or max_cand)
+        max_pg = int(prior_progress.get("max_pages") or max_pg)
+        timeout_s = int(prior_progress.get("search_timeout_seconds") or timeout_s)
+        limit = max_cand
     else:
-        job_id, job_dir = make_job_dir(business_sku)
+        if job_dir is not None:
+            job_dir = Path(job_dir).resolve()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            job_id = job_id or job_dir.name
+        else:
+            job_id, job_dir = make_job_dir(business_sku)
+
     search_dir = job_dir / "search"
     cand_verify_root = job_dir / "candidates"
     search_dir.mkdir(parents=True, exist_ok=True)
@@ -999,6 +1824,18 @@ def run_sku_job(
 
     snapshot = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
     write_json(job_dir / "business_baseline_snapshot.json", snapshot)
+    if model_scope_policy:
+        write_json(job_dir / "model_scope_policy_snapshot.json", model_scope_policy)
+
+    fingerprint = build_job_fingerprint(
+        cfg=cfg,
+        query=use_query,
+        candidate_source=source,
+        existing_collection_dir=existing_dir_resolved,
+        backend=backend_norm,
+        model_scope_policy=model_scope_policy,
+    )
+    write_json(job_dir / "job_fingerprint.json", fingerprint)
 
     progress: dict[str, Any] = {
         "job_id": job_id,
@@ -1007,6 +1844,14 @@ def run_sku_job(
         "business_sku": business_sku,
         "query": use_query,
         "query_generation_basis": query_basis,
+        "candidate_source": source,
+        "existing_collection_dir": existing_dir_resolved,
+        "backend": backend_norm,
+        "bsk_browser": bsk_browser,
+        "model_scope_policy_id": (model_scope_policy or {}).get("policy_id")
+        if model_scope_policy
+        else None,
+        "retry_failed": bool(retry_failed),
         "limit": limit,
         "max_candidates": max_cand,
         "max_pages": max_pg,
@@ -1017,39 +1862,84 @@ def run_sku_job(
         "completed_product_ids": [],
         "session_paused": False,
         "pause_reason": None,
-        "detail_pages_opened": 0,
+        "detail_pages_opened": prior_detail_opens,
+        "fingerprint": fingerprint,
         "historical_anchors_not_used_for_search_or_identity": cfg.get(
             "historical_anchors"
         ),
+        "resuming": resuming,
     }
     save_progress(job_dir, progress)
 
-    search_impl = search_fn or p3a.run_search_collect
     verify_impl = verify_fn or p5a.verify_one
 
     print(f"=== PriceRadar P5-B job {job_id} ===")
     print(
-        f"business_sku={business_sku} query={use_query!r} "
-        f"max_candidates={max_cand} max_pages={max_pg} "
-        f"search_timeout={timeout_s}s max_verify={max_ver}"
+        f"business_sku={business_sku} query={use_query!r} source={source} "
+        f"backend={backend_norm} max_candidates={max_cand} max_pages={max_pg} "
+        f"search_timeout={timeout_s}s max_verify={max_ver} resume={resuming}"
     )
     print(f"job_dir={job_dir}")
 
-    search_result = search_impl(
-        use_query,
-        limit=max_cand,
-        max_candidates=max_cand,
-        max_pages=max_pg,
-        search_timeout_seconds=timeout_s,
-        auto_close=True,
-        out_dir=search_dir,
-        quiet=False,
-        limit_explicit=False,
-        max_candidates_explicit=True,
-    )
-    # Ensure we only consume THIS search result
-    candidates = list(search_result.get("candidates") or [])
-    search_meta = dict(search_result.get("metadata") or {})
+    search_result: dict[str, Any]
+    if resuming and (search_dir / "candidates.json").is_file():
+        candidates = read_json(search_dir / "candidates.json")
+        if not isinstance(candidates, list):
+            raise RuntimeError("resume: search/candidates.json 非法")
+        meta_path = search_dir / "run_metadata.json"
+        search_meta = read_json(meta_path) if meta_path.is_file() else {}
+        if not isinstance(search_meta, dict):
+            search_meta = {}
+        candidates_path = search_dir / "candidates.json"
+        search_result = {
+            "run_id": progress.get("search_run_id") or search_dir.name,
+            "run_status": search_meta.get("run_status") or "REUSED",
+            "candidates_path": str(candidates_path),
+            "close_ok": True,
+        }
+        print(f"resume: reused candidates from {candidates_path} n={len(candidates)}")
+    elif source == SOURCE_EXISTING_COLLECTION:
+        assert existing_collection_dir is not None or existing_dir_resolved
+        coll = Path(existing_dir_resolved or existing_collection_dir)  # type: ignore[arg-type]
+        candidates, search_meta, used = load_existing_collection(coll)
+        if max_cand and len(candidates) > max_cand:
+            candidates = candidates[:max_cand]
+            search_meta["unique_candidates_collected"] = len(candidates)
+            search_meta["candidate_count"] = len(candidates)
+            search_meta["truncated_by_max_candidates"] = True
+        # Copy pointer + materialize handoff file (no “latest”)
+        write_json(
+            search_dir / "existing_collection_pointer.json",
+            {
+                "existing_collection_dir": str(coll.resolve()),
+                "candidates_file": str(used),
+                "loaded_at_utc": utc_iso(),
+                "note": "synthetic" if search_meta.get("synthetic") else "historical_links",
+            },
+        )
+        candidates_path = materialize_candidates_file(search_dir, candidates)
+        write_json(search_dir / "run_metadata.json", search_meta)
+        search_result = {
+            "run_id": coll.name,
+            "run_status": search_meta.get("run_status") or "REUSED",
+            "candidates_path": str(candidates_path),
+            "coverage_stop_reason": search_meta.get("coverage_stop_reason"),
+            "close_ok": True,
+            "status_reason": "existing-collection",
+        }
+    else:
+        candidates, search_meta, candidates_path, search_result = run_live_search(
+            query=use_query,
+            backend=backend_norm,
+            business_config=business_config,
+            max_cand=max_cand,
+            max_pg=max_pg,
+            timeout_s=timeout_s,
+            search_dir=search_dir,
+            bsk_browser=bsk_browser,
+            search_fn=search_fn,
+        )
+
     search_meta.setdefault("candidate_count", len(candidates))
     search_meta.setdefault("unique_candidates_collected", len(candidates))
     search_meta.setdefault("run_status", search_result.get("run_status"))
@@ -1060,21 +1950,20 @@ def run_sku_job(
     search_meta["max_pages"] = max_pg
     search_meta["search_timeout_seconds"] = timeout_s
     search_meta["max_verify"] = max_ver
-    # Search browser must release profile before detail verify (run_search_collect closes).
+    search_meta["candidate_source"] = source
+    search_meta.setdefault("backend", backend_norm)
+
+    # Classify with current rules (preserve explicit classification if present).
+    expected_model = str(cfg.get("expected_model") or "")
+    classified: list[dict[str, Any]] = []
+    for c in candidates:
+        classified.append(classify_candidate(c, expected_model=expected_model))
+    candidates = classified
+    write_json(search_dir / "candidates_classified.json", candidates)
+    materialize_candidates_file(search_dir, candidates)
+
     progress["search_browser_released"] = True
     progress["search_close_ok"] = search_result.get("close_ok")
-    candidates_path = Path(
-        search_result.get("candidates_path") or (search_dir / "candidates.json")
-    )
-    # Re-read from written file to guarantee exact handoff (no historical anchors)
-    if candidates_path.is_file():
-        try:
-            loaded = json.loads(candidates_path.read_text(encoding="utf-8-sig"))
-            if isinstance(loaded, list):
-                candidates = loaded
-        except json.JSONDecodeError:
-            pass
-
     progress["stage"] = "VERIFY"
     progress["search_run_id"] = search_result.get("run_id")
     progress["search_status"] = search_result.get("run_status")
@@ -1083,11 +1972,17 @@ def run_sku_job(
     save_progress(job_dir, progress)
 
     product_rows: list[dict[str, Any]] = []
-    price_options: list[dict[str, Any]] = []
+    price_options: list[dict[str, Any]] = list(prior_options)
     verify_results: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = list(prior_attempts)
+    latest_prior = _latest_attempt_by_pid(prior_attempts)
+    attempt_seq = max((int(a.get("seq") or 0) for a in attempts), default=0)
 
     search_status = str(search_result.get("run_status") or "")
-    # Session block at search stage: do not invent candidates; may still have list
+    session_paused = False
+    pause_reason = None
+    detail_opens = prior_detail_opens
+
     if search_status in SEARCH_BLOCK_STATUSES and not candidates:
         product_rows.append(
             fallback_no_candidate_row(
@@ -1097,6 +1992,8 @@ def run_sku_job(
                 search_status=search_status,
             )
         )
+        session_paused = True
+        pause_reason = search_status
         progress["session_paused"] = True
         progress["pause_reason"] = search_status
         save_progress(job_dir, progress)
@@ -1110,62 +2007,160 @@ def run_sku_job(
             )
         )
     else:
-        session_paused = False
-        pause_reason = None
-        detail_opens = 0
-        # Search-stage login/captcha/restriction: keep candidates, pause all detail verify.
-        if search_status in SEARCH_BLOCK_STATUSES:
+        if search_status in SEARCH_BLOCK_STATUSES and not resuming:
             session_paused = True
             pause_reason = search_status
             progress["session_paused"] = True
             progress["pause_reason"] = pause_reason
             save_progress(job_dir, progress)
 
-        expected_model = str(cfg.get("expected_model") or "")
-
         for cand in candidates:
             pid = str(cand.get("product_id") or "").strip()
             if not pid:
                 continue
             rank = cand.get("rank")
+            plan = candidate_detail_plan(
+                cand, cfg=cfg, model_scope_policy=model_scope_policy
+            )
+
+            # Resume: skip completed; optionally retry failed; resume pause/budget.
+            prior_att = latest_prior.get(pid)
+            prior_row = prior_rows_by_pid.get(pid)
+            if resuming and prior_att:
+                st = str(prior_att.get("status") or "")
+                match = str(prior_att.get("match_status") or "")
+                if st == "COMPLETED" or (
+                    st == "SKIPPED" and match == "MODEL_MISMATCH_SKIPPED"
+                ):
+                    if prior_row:
+                        product_rows.append(prior_row)
+                    progress["completed_product_ids"].append(pid)
+                    continue
+                if st in TERMINAL_FAIL_STATUSES and not retry_failed:
+                    if prior_row:
+                        product_rows.append(prior_row)
+                    progress["completed_product_ids"].append(pid)
+                    continue
+                # pause/budget pending → fall through to re-process
+                if match in RESUME_PENDING_MATCH or st in {
+                    SESSION_PAUSE_TASK,
+                    STATUS_NOT_VERIFIED_BUDGET,
+                }:
+                    pass  # continue processing
+                elif st in TERMINAL_OK_STATUSES and st != STATUS_NOT_VERIFIED_BUDGET:
+                    if prior_row:
+                        product_rows.append(prior_row)
+                    progress["completed_product_ids"].append(pid)
+                    continue
+
             if session_paused:
                 row = paused_placeholder_row(
                     business_sku=business_sku,
                     red_line=red_line,
                     candidate=cand,
                     reason=f"会话已暂停({pause_reason})，未访问本候选",
+                    plan=plan,
                 )
                 product_rows.append(row)
+                attempt_seq += 1
+                att = {
+                    "product_id": pid,
+                    "seq": attempt_seq,
+                    "attempt_id": new_attempt_id(attempt_seq),
+                    "status": SESSION_PAUSE_TASK,
+                    "match_status": "PAUSED_BEFORE_VISIT",
+                    "result_path": None,
+                    "evidence_checked_at": row.get("checked_at"),
+                    "discovered_at": cand.get("discovered_at_utc"),
+                    "navigation_consumed": False,
+                    "synthetic": bool(cand.get("synthetic")),
+                }
+                attempts.append(att)
                 progress["completed_product_ids"].append(pid)
                 save_progress(job_dir, progress)
                 write_json(job_dir / "product_rows.json", product_rows)
+                write_json(job_dir / "candidate_attempts.json", attempts)
                 continue
 
-            # Offline title gate: model mismatch does not consume detail budget.
-            title = str(cand.get("title") or "")
-            gate = adapt.title_model_gate(title, expected_model=expected_model)
-            needs_detail = not bool(gate.get("skip_browse"))
+            if plan.get("classification_skip"):
+                row = classification_skip_row(
+                    business_sku=business_sku,
+                    red_line=red_line,
+                    candidate=cand,
+                    plan=plan,
+                )
+                product_rows.append(row)
+                attempt_seq += 1
+                att = {
+                    "product_id": pid,
+                    "seq": attempt_seq,
+                    "attempt_id": new_attempt_id(attempt_seq),
+                    "status": "SKIPPED",
+                    "match_status": "MODEL_MISMATCH_SKIPPED",
+                    "result_path": None,
+                    "evidence_checked_at": row.get("checked_at"),
+                    "discovered_at": cand.get("discovered_at_utc"),
+                    "navigation_consumed": False,
+                    "classification": plan.get("gate", {}).get("classification"),
+                    "synthetic": bool(cand.get("synthetic")),
+                }
+                attempts.append(att)
+                progress["completed_product_ids"].append(pid)
+                save_progress(job_dir, progress)
+                write_json(job_dir / "product_rows.json", product_rows)
+                write_json(job_dir / "candidate_attempts.json", attempts)
+                continue
 
+            needs_detail = bool(plan.get("needs_detail"))
             if needs_detail and detail_opens >= max_ver:
                 row = not_verified_budget_row(
                     business_sku=business_sku,
                     red_line=red_line,
                     candidate=cand,
                     max_verify=max_ver,
+                    plan=plan,
                 )
                 product_rows.append(row)
+                attempt_seq += 1
+                att = {
+                    "product_id": pid,
+                    "seq": attempt_seq,
+                    "attempt_id": new_attempt_id(attempt_seq),
+                    "status": STATUS_NOT_VERIFIED_BUDGET,
+                    "match_status": STATUS_NOT_VERIFIED_BUDGET,
+                    "result_path": None,
+                    "evidence_checked_at": row.get("checked_at"),
+                    "discovered_at": cand.get("discovered_at_utc"),
+                    "navigation_consumed": False,
+                    "synthetic": bool(cand.get("synthetic")),
+                }
+                attempts.append(att)
                 progress["completed_product_ids"].append(pid)
                 save_progress(job_dir, progress)
                 write_json(job_dir / "product_rows.json", product_rows)
+                write_json(job_dir / "candidate_attempts.json", attempts)
                 continue
 
-            verify_dir = cand_verify_root / f"rank{rank}_{pid}"
+            attempt_seq += 1
+            attempt_id = new_attempt_id(attempt_seq)
+            verify_dir = cand_verify_root / f"rank{rank}_{pid}" / attempt_id
             print(
-                f"--- verify rank={rank} id={pid} "
+                f"--- verify rank={rank} id={pid} attempt={attempt_id} "
                 f"detail_budget={detail_opens}/{max_ver} "
-                f"needs_detail={needs_detail} ---"
+                f"needs_detail={needs_detail} backend={backend_norm} ---"
             )
             try:
+                vres = verify_impl(
+                    business_config=business_config,
+                    candidates_path=candidates_path,
+                    product_id=pid,
+                    out_dir=verify_dir,
+                    model_scope_policy=model_scope_policy,
+                    backend=backend_norm,
+                    bsk_browser=bsk_browser,
+                )
+            except TypeError:
+                # Older injectables may not accept new kwargs.
                 vres = verify_impl(
                     business_config=business_config,
                     candidates_path=candidates_path,
@@ -1187,10 +2182,11 @@ def run_sku_job(
                     "verify_dir": str(verify_dir),
                 }
 
-            # Count only actual detail opens (model skip does not consume budget).
             match = str(vres.get("match_status") or "")
+            navigated = False
             if needs_detail and match != "MODEL_MISMATCH_SKIPPED":
                 detail_opens += 1
+                navigated = True
                 progress["detail_pages_opened"] = detail_opens
 
             verify_results.append(vres)
@@ -1200,6 +2196,11 @@ def run_sku_job(
                 search_rank=rank,
                 clues=list(vres.get("price_clues") or []),
             )
+            # On retry, drop prior options for this pid then append new.
+            if retry_failed and prior_att:
+                price_options = [
+                    o for o in price_options if str(o.get("jd_product_id")) != pid
+                ]
             price_options.extend(opts)
             row = product_row_from_verify(
                 business_sku=business_sku,
@@ -1207,16 +2208,34 @@ def run_sku_job(
                 candidate=cand,
                 verify=vres,
                 options=opts,
+                plan=plan,
+                attempt_id=attempt_id,
             )
             product_rows.append(row)
+
+            att = {
+                "product_id": pid,
+                "seq": attempt_seq,
+                "attempt_id": attempt_id,
+                "status": vres.get("task_status"),
+                "match_status": match,
+                "result_path": str(verify_dir),
+                "evidence_checked_at": row.get("checked_at"),
+                "discovered_at": cand.get("discovered_at_utc"),
+                "navigation_consumed": navigated,
+                "screenshot_link": row.get("screenshot_link"),
+                "classification": plan.get("gate", {}).get("classification"),
+                "synthetic": bool(cand.get("synthetic")),
+            }
+            attempts.append(att)
 
             progress["completed_product_ids"].append(pid)
             progress["last_verify_status"] = vres.get("task_status")
             save_progress(job_dir, progress)
             write_json(job_dir / "product_rows.json", product_rows)
             write_json(job_dir / "price_options.json", price_options)
+            write_json(job_dir / "candidate_attempts.json", attempts)
 
-            # Ordinary candidate failure continues; session-level pause stops rest.
             task = str(vres.get("task_status") or "")
             if task == SESSION_PAUSE_TASK or match in SESSION_PAUSE_MATCH:
                 session_paused = True
@@ -1226,42 +2245,77 @@ def run_sku_job(
                 save_progress(job_dir, progress)
 
     def _finalize_outputs(*, stage: str = "DONE") -> dict[str, Any]:
+        # Deduplicate product_rows by jd_product_id keeping last
+        dedup: dict[str, dict[str, Any]] = {}
+        ordered_ids: list[str] = []
+        passthrough: list[dict[str, Any]] = []
+        for r in product_rows:
+            pid = str(r.get("jd_product_id") or "")
+            if not pid:
+                passthrough.append(r)
+                continue
+            if pid not in dedup:
+                ordered_ids.append(pid)
+            dedup[pid] = r
+        final_rows = passthrough + [dedup[i] for i in ordered_ids]
+
+        job_execution_complete = stage in {"DONE", "PAUSED", "BUDGET_REACHED"}
         summary_local = build_sku_summary(
             business_sku=business_sku,
-            product_rows=product_rows,
+            product_rows=final_rows,
             price_options=price_options,
             search_meta=search_meta,
             query=use_query,
             query_basis=query_basis,
             limit=limit,
             max_verify=max_ver,
+            detail_pages_opened_actual=detail_opens,
+            session_paused=session_paused,
+            job_execution_complete=job_execution_complete,
         )
         summary_local["job_id"] = job_id
         summary_local["started_at_utc"] = utc_iso(started)
         summary_local["ended_at_utc"] = utc_iso()
         summary_local["job_dir"] = str(job_dir)
         summary_local["search_dir"] = str(search_dir)
-        summary_local["partial"] = stage != "DONE"
-        write_json(job_dir / "product_rows.json", product_rows)
-        write_csv(job_dir / "product_rows.csv", product_rows, PRODUCT_ROW_FIELDS)
+        summary_local["backend"] = backend_norm
+        summary_local["candidate_source"] = source
+        summary_local["partial"] = stage != "DONE" or not summary_local.get(
+            "all_candidates_verified"
+        )
+        summary_local["pause_reason"] = pause_reason
+        write_json(job_dir / "product_rows.json", final_rows)
+        write_csv(job_dir / "product_rows.csv", final_rows, PRODUCT_ROW_FIELDS)
         write_json(job_dir / "price_options.json", price_options)
         write_csv(job_dir / "price_options.csv", price_options, PRICE_OPTION_FIELDS)
+        write_json(job_dir / "candidate_attempts.json", attempts)
         write_json(job_dir / "sku_summary.json", summary_local)
         report_html = render_report_html(
             job_id=job_id,
             summary=summary_local,
-            product_rows=product_rows,
+            product_rows=final_rows,
             price_options=price_options,
         )
         (job_dir / "report.html").write_text(report_html, encoding="utf-8")
         progress["stage"] = stage
         progress["ended_at_utc"] = summary_local["ended_at_utc"]
         progress["summary_path"] = str(job_dir / "sku_summary.json")
+        progress["session_paused"] = session_paused
+        progress["pause_reason"] = pause_reason
+        progress["detail_pages_opened"] = detail_opens
         save_progress(job_dir, progress)
         return summary_local
 
+    final_stage = "DONE"
+    if session_paused:
+        final_stage = "PAUSED"
+    elif any(
+        r.get("task_status") == STATUS_NOT_VERIFIED_BUDGET for r in product_rows
+    ):
+        final_stage = "BUDGET_REACHED"
+
     try:
-        summary = _finalize_outputs(stage="DONE")
+        summary = _finalize_outputs(stage=final_stage)
     except Exception as exc:  # noqa: BLE001
         progress["fatal_error"] = f"{type(exc).__name__}: {exc}"
         save_progress(job_dir, progress)
@@ -1278,7 +2332,9 @@ def run_sku_job(
         f"budget_skip={summary.get('not_verified_budget')} "
         f"possible_break={summary.get('products_possible_break')} "
         f"primary_low={summary.get('products_primary_low_price_signal')} "
-        f"paused={summary.get('candidates_paused_unvisited')}"
+        f"paused={summary.get('candidates_paused_unvisited')} "
+        f"job_done={summary.get('job_execution_complete')} "
+        f"all_verified={summary.get('all_candidates_verified')}"
     )
     print(f"report={job_dir / 'report.html'}")
 
@@ -1286,17 +2342,19 @@ def run_sku_job(
         "job_id": job_id,
         "job_dir": job_dir,
         "summary": summary,
-        "product_rows": product_rows,
+        "product_rows": summary and read_json(job_dir / "product_rows.json"),
         "price_options": price_options,
+        "attempts": attempts,
         "search_result": {
             "run_id": search_result.get("run_id"),
             "run_status": search_result.get("run_status"),
             "candidates_path": str(candidates_path),
             "candidate_count": len(candidates),
             "coverage_stop_reason": search_meta.get("coverage_stop_reason"),
+            "candidate_source": source,
+            "backend": backend_norm,
         },
     }
-
 
 def run_offline_self_checks() -> int:
     failures: list[str] = []
@@ -1487,6 +2545,7 @@ def run_offline_self_checks() -> int:
         business_config=cfg_path,
         query="清风 B913A",
         limit=4,
+        backend=BACKEND_P2D,
         search_fn=fake_search_4,
         verify_fn=fake_verify,
     )
@@ -1513,8 +2572,8 @@ def run_offline_self_checks() -> int:
         failures.append("444 should be paused unvisited after session pause")
     if by_id.get("444", {}).get("match_status") != "PAUSED_BEFORE_VISIT":
         failures.append("444 must not look like ordinary capture failure")
-    if calls != ["111", "222", "333"]:
-        failures.append(f"verify call order wrong: {calls}")
+    if calls != ["111", "333"]:
+        failures.append(f"verify call order wrong (222 classify-skip no nav): {calls}")
 
     summ = job["summary"]
     if summ.get("candidates_paused_unvisited", 0) < 1:
@@ -1657,6 +2716,7 @@ def run_offline_self_checks() -> int:
         business_config=cfg_path,
         query="清风 B913A",
         limit=1,
+        backend=BACKEND_P2D,
         search_fn=fake_search_one,
         verify_fn=fake_verify_multi,
     )
@@ -1727,6 +2787,7 @@ def run_offline_self_checks() -> int:
         business_config=cfg_path,
         query="清风 B913A",
         limit=1,
+        backend=BACKEND_P2D,
         search_fn=fake_search_one,
         verify_fn=fake_verify_primary_low,
     )
@@ -1775,6 +2836,7 @@ def run_offline_self_checks() -> int:
         business_config=cfg_path,
         query="清风 B913A",
         limit=5,
+        backend=BACKEND_P2D,
         search_fn=fake_search_empty,
         verify_fn=fake_verify,
     )
@@ -1904,6 +2966,7 @@ def run_offline_self_checks() -> int:
         max_verify=2,
         max_candidates_explicit=True,
         max_verify_explicit=True,
+        backend=BACKEND_P2D,
         search_fn=fake_search_budget,
         verify_fn=fake_verify_budget,
     )
@@ -1947,6 +3010,446 @@ def run_offline_self_checks() -> int:
     except ValueError:
         pass
 
+
+    # --- v3 orchestration (synthetic; not JD live) ---
+    synth_root = JOB_ROOT / f"_synthetic_offline_{utc_stamp()}_{secrets.token_hex(2)}"
+    synth_root.mkdir(parents=True, exist_ok=True)
+    synth_collect = synth_root / "synthetic_collection"
+    synth_collect.mkdir(parents=True, exist_ok=True)
+    synth_cands = [
+        {
+            "product_id": "s1001",
+            "jd_product_id": "s1001",
+            "rank": 1,
+            "title": "清风 B913A 20包整箱 synthetic",
+            "normalized_url": "https://item.jd.com/s1001.html",
+            "observed_url": "https://item.jd.com/s1001.html",
+            "discovered_at_utc": "2026-01-01T00:00:00+00:00",
+            "synthetic": True,
+        },
+        {
+            "product_id": "s1002",
+            "jd_product_id": "s1002",
+            "rank": 2,
+            "title": "清风 B913AC 近型号 synthetic",
+            "normalized_url": "https://item.jd.com/s1002.html",
+            "observed_url": "https://item.jd.com/s1002.html",
+            "discovered_at_utc": "2026-01-01T00:00:00+00:00",
+            "synthetic": True,
+        },
+        {
+            "product_id": "s1003",
+            "jd_product_id": "s1003",
+            "rank": 3,
+            "title": "清风 B913A 箱装 synthetic",
+            "normalized_url": "https://item.jd.com/s1003.html",
+            "observed_url": "https://item.jd.com/s1003.html",
+            "discovered_at_utc": "2026-01-01T00:00:00+00:00",
+            "synthetic": True,
+        },
+        {
+            "product_id": "s1004",
+            "jd_product_id": "s1004",
+            "rank": 4,
+            "title": "清风 B913A 剩余 synthetic",
+            "normalized_url": "https://item.jd.com/s1004.html",
+            "observed_url": "https://item.jd.com/s1004.html",
+            "discovered_at_utc": "2026-01-01T00:00:00+00:00",
+            "synthetic": True,
+        },
+    ]
+    write_json(synth_collect / "all_candidates.json", synth_cands)
+    write_json(
+        synth_collect / "coverage.json",
+        {
+            "query": "清风 B913A",
+            "backend": "bsk",
+            "run_status": "SUCCESS",
+            "overall_integrity": "COMPLETE_EXPLAINABLE",
+            "unique_candidates": len(synth_cands),
+            "pages_visited": [1],
+            "completeness": {
+                "integrity": "COMPLETE",
+                "stop_reason": "SYNTHETIC_FIXTURE",
+                "end_page_evidence": ["synthetic_end"],
+                "restricted": False,
+            },
+            "started_at_utc": "2026-01-01T00:00:00+00:00",
+            "synthetic": True,
+        },
+    )
+
+    policy = load_model_scope_policy(
+        PROJECT_ROOT / "config" / "policies" / "b913a_model_scope_include_other_20261027.json"
+    )
+    nav_calls: list[str] = []
+
+    def fake_verify_v3(**kwargs):
+        pid = str(kwargs["product_id"])
+        nav_calls.append(pid)
+        out = Path(kwargs["out_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        # Evidence path must be attempt-local (no cross-product shots)
+        shot = out / "shot.png"
+        shot.write_bytes(b"synthetic-not-jd")
+        if pid == "s1001":
+            # First detail hits rate-limit → pause; no further navigations
+            res = {
+                "task_status": SESSION_PAUSE_TASK,
+                "match_status": "DETAIL_RATE_LIMITED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "system_verdict_zh": "详情限流（synthetic）",
+                "manual_verdict": None,
+                "price_clues": [],
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "screenshot_dir": str(out),
+                "capture": {"screenshot_path": str(shot)},
+                "candidate": {"title": "清风 B913A 20包整箱 synthetic", "product_id": pid},
+            }
+            write_json(out / "verify_result.json", res)
+            return res
+        if pid == "s1003":
+            res = {
+                "task_status": "COMPLETED",
+                "match_status": "PACKAGING_PASSED",
+                "system_verdict": take_home.SYSTEM_NO_BREAK_IN_SCOPE,
+                "system_verdict_zh": take_home.SYSTEM_VERDICT_ZH[
+                    take_home.SYSTEM_NO_BREAK_IN_SCOPE
+                ],
+                "manual_verdict": None,
+                "page_primary_price": "130.00",
+                "packaging_match": "PASSED",
+                "box_comparable": True,
+                "observed_model": "B913A",
+                "observed_spec": "200张*20包",
+                "price_clues": [
+                    {
+                        "price_type": take_home.PRICE_TYPE_DECLARED_CONDITIONAL,
+                        "amount": "130.00",
+                        "conditions": "synthetic条件",
+                        "normalized_price": "130.00",
+                        "system_verdict": take_home.SYSTEM_NO_BREAK_IN_SCOPE,
+                        "system_verdict_zh": take_home.SYSTEM_VERDICT_ZH[
+                            take_home.SYSTEM_NO_BREAK_IN_SCOPE
+                        ],
+                        "manual_verdict": None,
+                        "review_reasons": [],
+                    }
+                ],
+                "take_home_rollup": {"take_home_clue_count": 1, "has_possible_break": False},
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "screenshot_dir": str(out),
+                "capture": {"screenshot_path": str(shot)},
+                "candidate": {"title": "清风 B913A 箱装 synthetic", "product_id": pid},
+                "url_adapt": {
+                    "adapted_url": f"https://item.jd.com/{pid}.html",
+                    "final_url_sanitized": f"https://item.jd.com/{pid}.html",
+                },
+            }
+            write_json(out / "verify_result.json", res)
+            return res
+        if pid == "s1004":
+            res = {
+                "task_status": "FAILED",
+                "match_status": "OCR_FAILED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "system_verdict_zh": "待核验",
+                "manual_verdict": None,
+                "price_clues": [],
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "screenshot_dir": str(out),
+                "capture": {"screenshot_path": str(shot)},
+                "candidate": {"title": "清风 B913A 剩余 synthetic", "product_id": pid},
+            }
+            write_json(out / "verify_result.json", res)
+            return res
+        failures.append(f"v3 unexpected nav pid {pid}")
+        return {"task_status": "FAILED", "price_clues": [], "verify_dir": str(out)}
+
+    job_v3 = run_sku_job(
+        business_config=cfg_path,
+        query="清风 B913A",
+        candidate_source=SOURCE_EXISTING_COLLECTION,
+        existing_collection_dir=synth_collect,
+        backend=BACKEND_P2D,
+        max_candidates=4,
+        max_verify=3,
+        max_candidates_explicit=True,
+        max_verify_explicit=True,
+        model_scope_policy=policy,
+        verify_fn=fake_verify_v3,
+        job_dir=synth_root / "job_existing",
+        job_id=(synth_root / "job_existing").name,
+    )
+    # Candidate source accurate
+    if job_v3["search_result"].get("candidate_source") != SOURCE_EXISTING_COLLECTION:
+        failures.append("v3: candidate_source not existing-collection")
+    if not (job_v3["summary"].get("search_coverage") or {}).get("reuse_mode"):
+        failures.append("v3: reuse_mode missing for existing-collection")
+    # Discovery vs check time
+    rows_v3 = {str(r["jd_product_id"]): r for r in job_v3["product_rows"]}
+    if rows_v3.get("s1001", {}).get("discovered_at") != "2026-01-01T00:00:00+00:00":
+        failures.append("v3: discovery time not preserved from collection")
+    # Classification: OTHER authorized should need detail; without pause would nav
+    # But rate-limit on first detail → zero further navigations
+    if nav_calls != ["s1001"]:
+        failures.append(f"v3: after first rate-limit expect only s1001 nav, got {nav_calls}")
+    if rows_v3.get("s1003", {}).get("match_status") != "PAUSED_BEFORE_VISIT":
+        failures.append("v3: s1003 must be pause-unvisited after rate-limit")
+    if rows_v3.get("s1004", {}).get("match_status") != "PAUSED_BEFORE_VISIT":
+        failures.append("v3: s1004 must be pause-unvisited")
+    # s1002 OTHER with policy → would need detail, but paused before visit
+    if rows_v3.get("s1002", {}).get("classification") != model_match.CLASS_OTHER:
+        failures.append("v3: s1002 should classify OTHER_MODEL")
+    if rows_v3.get("s1002", {}).get("match_status") != "PAUSED_BEFORE_VISIT":
+        failures.append("v3: authorized OTHER still paused-unvisited after rate-limit")
+    if job_v3["summary"].get("detail_pages_opened") != 1:
+        failures.append(
+            f"v3: detail_pages_opened should be 1, got {job_v3['summary'].get('detail_pages_opened')}"
+        )
+    if job_v3["summary"].get("job_execution_complete") is not True:
+        failures.append("v3: job_execution_complete should be true even when paused")
+    if job_v3["summary"].get("all_candidates_verified") is not False:
+        failures.append("v3: all_candidates_verified must be false when paused remain")
+
+    # No duplicate product rows
+    ids = [r.get("jd_product_id") for r in job_v3["product_rows"] if r.get("jd_product_id")]
+    if len(ids) != len(set(ids)):
+        failures.append("v3: duplicate product rows")
+
+    # Evidence not cross-used: paused rows have empty screenshot
+    for pid in ("s1002", "s1003", "s1004"):
+        if rows_v3[pid].get("screenshot_link"):
+            failures.append(f"v3: {pid} must not inherit screenshot from s1001")
+
+    # Resume: completed/paused — only unfinished; no auto retry of ordinary fail
+    # Build a job with one completed + one failed + one budget skip, then resume
+    synth2 = synth_root / "synthetic_collection2"
+    synth2.mkdir(parents=True, exist_ok=True)
+    c2 = [
+        {
+            "product_id": "r1",
+            "jd_product_id": "r1",
+            "rank": 1,
+            "title": "清风 B913A r1 synthetic",
+            "normalized_url": "https://item.jd.com/r1.html",
+            "discovered_at_utc": "2026-02-02T00:00:00+00:00",
+            "synthetic": True,
+        },
+        {
+            "product_id": "r2",
+            "jd_product_id": "r2",
+            "rank": 2,
+            "title": "清风 B913A r2 synthetic",
+            "normalized_url": "https://item.jd.com/r2.html",
+            "discovered_at_utc": "2026-02-02T00:00:00+00:00",
+            "synthetic": True,
+        },
+        {
+            "product_id": "r3",
+            "jd_product_id": "r3",
+            "rank": 3,
+            "title": "清风 B913A r3 synthetic",
+            "normalized_url": "https://item.jd.com/r3.html",
+            "discovered_at_utc": "2026-02-02T00:00:00+00:00",
+            "synthetic": True,
+        },
+    ]
+    write_json(synth2 / "all_candidates.json", c2)
+    write_json(
+        synth2 / "coverage.json",
+        {
+            "query": "清风 B913A",
+            "run_status": "PARTIAL",
+            "overall_integrity": "PARTIAL",
+            "completeness": {
+                "integrity": "PARTIAL",
+                "restricted": True,
+                "stop_reason": "SYNTHETIC_PARTIAL",
+                "end_page_evidence": ["synthetic_partial"],
+            },
+            "started_at_utc": "2026-02-02T00:00:00+00:00",
+            "synthetic": True,
+        },
+    )
+    resume_nav: list[str] = []
+
+    def fake_verify_resume(**kwargs):
+        pid = str(kwargs["product_id"])
+        resume_nav.append(pid)
+        out = Path(kwargs["out_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        if pid == "r1":
+            return {
+                "task_status": "COMPLETED",
+                "match_status": "PACKAGING_PASSED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "system_verdict_zh": "到手价待核验",
+                "manual_verdict": None,
+                "page_primary_price": "140.00",
+                "packaging_match": "PASSED",
+                "box_comparable": True,
+                "price_clues": [],
+                "take_home_rollup": {"take_home_clue_count": 0},
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "candidate": {"title": "清风 B913A r1 synthetic", "product_id": pid},
+                "url_adapt": {
+                    "adapted_url": "https://item.jd.com/r1.html",
+                    "final_url_sanitized": "https://item.jd.com/r1.html",
+                },
+            }
+        if pid == "r2":
+            return {
+                "task_status": "FAILED",
+                "match_status": "OCR_FAILED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "manual_verdict": None,
+                "price_clues": [],
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "candidate": {"title": "清风 B913A r2 synthetic", "product_id": pid},
+            }
+        failures.append(f"resume unexpected first-pass pid {pid}")
+        return {"task_status": "FAILED", "price_clues": [], "verify_dir": str(out)}
+
+    resume_job_id = f"synth_resume_{utc_stamp()}_{secrets.token_hex(2)}"
+    job_a = run_sku_job(
+        business_config=cfg_path,
+        query="清风 B913A",
+        candidate_source=SOURCE_EXISTING_COLLECTION,
+        existing_collection_dir=synth2,
+        backend=BACKEND_P2D,
+        max_candidates=3,
+        max_verify=1,
+        max_candidates_explicit=True,
+        max_verify_explicit=True,
+        verify_fn=fake_verify_resume,
+        job_dir=JOB_ROOT / resume_job_id,
+        job_id=resume_job_id,
+    )
+    # max_verify=1 → r1 completed, r2/r3 budget (r2 never failed in first pass if budget)
+    # Actually order: r1 needs detail → open; then r2/r3 budget. So resume_nav=["r1"]
+    if resume_nav != ["r1"]:
+        failures.append(f"v3 budget first pass nav should be [r1], got {resume_nav}")
+    if (job_a["summary"].get("search_coverage") or {}).get("partial_or_restricted") is not True:
+        failures.append("v3: PARTIAL collection must flag partial_or_restricted")
+    # Force a failed attempt into progress for r2 by second job with higher budget
+    resume_nav.clear()
+
+    def fake_verify_resume2(**kwargs):
+        pid = str(kwargs["product_id"])
+        resume_nav.append(pid)
+        out = Path(kwargs["out_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        if pid == "r2":
+            return {
+                "task_status": "FAILED",
+                "match_status": "OCR_FAILED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "manual_verdict": None,
+                "price_clues": [],
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "candidate": {"title": "清风 B913A r2 synthetic", "product_id": pid},
+            }
+        if pid == "r3":
+            return {
+                "task_status": "COMPLETED",
+                "match_status": "PACKAGING_PASSED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "manual_verdict": None,
+                "page_primary_price": "150.00",
+                "packaging_match": "PASSED",
+                "box_comparable": True,
+                "price_clues": [],
+                "take_home_rollup": {"take_home_clue_count": 0},
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "candidate": {"title": "清风 B913A r3 synthetic", "product_id": pid},
+                "url_adapt": {
+                    "adapted_url": "https://item.jd.com/r3.html",
+                    "final_url_sanitized": "https://item.jd.com/r3.html",
+                },
+            }
+        failures.append(f"resume2 unexpected pid {pid}")
+        return {"task_status": "FAILED", "price_clues": [], "verify_dir": str(out)}
+
+    # Resume with higher max_verify recorded in progress — update progress max_verify
+    prog_path = JOB_ROOT / resume_job_id / "job_progress.json"
+    prog = read_json(prog_path)
+    prog["max_verify"] = 3
+    write_json(prog_path, prog)
+
+    job_b = run_sku_job(
+        business_config=cfg_path,
+        query="清风 B913A",
+        candidate_source=SOURCE_EXISTING_COLLECTION,
+        existing_collection_dir=synth2,
+        backend=BACKEND_P2D,
+        resume_job_id=resume_job_id,
+        max_verify=3,
+        max_verify_explicit=True,
+        verify_fn=fake_verify_resume2,
+    )
+    # r1 completed → no re-nav; r2/r3 previously budget → now visited
+    if "r1" in resume_nav:
+        failures.append("v3: completed r1 must not be re-fetched on resume")
+    if resume_nav != ["r2", "r3"]:
+        failures.append(f"v3: resume should nav [r2,r3], got {resume_nav}")
+    # Ordinary failure not auto-retried: run again without retry_failed
+    resume_nav.clear()
+    job_c = run_sku_job(
+        business_config=cfg_path,
+        query="清风 B913A",
+        candidate_source=SOURCE_EXISTING_COLLECTION,
+        existing_collection_dir=synth2,
+        backend=BACKEND_P2D,
+        resume_job_id=resume_job_id,
+        verify_fn=fake_verify_resume2,
+    )
+    if resume_nav:
+        failures.append(f"v3: without --retry-failed must not re-nav failed, got {resume_nav}")
+    # Failed attempts retained
+    attempts = read_json(JOB_ROOT / resume_job_id / "candidate_attempts.json")
+    r2_attempts = [a for a in attempts if a.get("product_id") == "r2"]
+    if len(r2_attempts) < 1:
+        failures.append("v3: failed attempt for r2 must be retained")
+
+    # Input change → refuse silent reuse
+    try:
+        run_sku_job(
+            business_config=cfg_path,
+            query="清风 B913A CHANGED",
+            candidate_source=SOURCE_EXISTING_COLLECTION,
+            existing_collection_dir=synth2,
+            backend=BACKEND_P2D,
+            resume_job_id=resume_job_id,
+            verify_fn=fake_verify_resume2,
+        )
+        failures.append("v3: fingerprint/query change must refuse resume")
+    except RuntimeError as exc:
+        if "恢复拒绝" not in str(exc):
+            failures.append(f"v3: unexpected resume refusal text: {exc}")
+
+    # Write offline deliverable pointer
+    write_json(
+        synth_root / "OFFLINE_ORCHESTRATION_RESULT.json",
+        {
+            "synthetic": True,
+            "note": "synthetic offline orchestration; not JD live verification",
+            "job_existing": str(job_v3["job_dir"]),
+            "job_resume": str(JOB_ROOT / resume_job_id),
+            "report_existing": str(Path(job_v3["job_dir"]) / "report.html"),
+            "report_resume": str(JOB_ROOT / resume_job_id / "report.html"),
+        },
+    )
+    print(f"v3 synthetic offline dir: {synth_root}")
+
+
     print("=== P5-B offline self-check ===")
     if failures:
         print(f"FAILED ({len(failures)}):")
@@ -1958,7 +3461,9 @@ def run_offline_self_checks() -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="P5-B single SKU search→verify job")
+    p = argparse.ArgumentParser(
+        description="P5-B single SKU: live-search|existing-collection → classify → verify → report → resume"
+    )
     p.add_argument(
         "--business-config",
         type=Path,
@@ -1968,6 +3473,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--query",
         default=None,
         help="Optional search query; default from expected_brand+expected_model",
+    )
+    p.add_argument(
+        "--candidate-source",
+        choices=[SOURCE_LIVE_SEARCH, SOURCE_EXISTING_COLLECTION],
+        default=SOURCE_LIVE_SEARCH,
+        help="live-search=本次搜索；existing-collection=显式既有采集目录",
+    )
+    p.add_argument(
+        "--existing-collection-dir",
+        type=Path,
+        default=None,
+        help="既有采集目录（existing-collection 必填；禁止自动选 latest）",
+    )
+    p.add_argument(
+        "--resume-job-id",
+        default=None,
+        help="按明确 job_id 恢复（完成项不重抓；暂停项可续；失败需 --retry-failed）",
+    )
+    p.add_argument(
+        "--backend",
+        choices=[BACKEND_P2D, BACKEND_BSK],
+        default=None,
+        help="详情/搜索后端：p2d|bsk（必填；不自动切换）",
+    )
+    p.add_argument(
+        "--bsk-browser",
+        default=None,
+        help="BSK 浏览器实例 id/label（多实例时显式指定）",
+    )
+    p.add_argument(
+        "--model-scope-policy",
+        type=Path,
+        default=None,
+        help="显式 OTHER 授权策略 JSON（仅读取；不改写真实型号）",
+    )
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="恢复时显式重试普通失败（默认不自动重试；旧失败尝试保留）",
     )
     p.add_argument(
         "--limit",
@@ -1997,7 +3541,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-verify",
         type=int,
         default=None,
-        help="Max detail visits (default 5; model-skip does not consume)",
+        help="Max detail navigations (default 5; classification-skip does not consume)",
     )
     p.add_argument("--self-check", action="store_true")
     return p.parse_args(argv)
@@ -2007,7 +3551,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_check:
         return run_offline_self_checks()
+    if not args.backend and not args.resume_job_id:
+        print("参数/配置错误: 必须显式指定 --backend p2d|bsk（不自动切换）")
+        return 2
+    if (
+        args.candidate_source == SOURCE_EXISTING_COLLECTION
+        and not args.existing_collection_dir
+        and not args.resume_job_id
+    ):
+        print("参数/配置错误: existing-collection 需要 --existing-collection-dir")
+        return 2
     try:
+        backend = args.backend
+        if args.resume_job_id and not backend:
+            # Resume may omit backend only if job_progress already recorded it;
+            # run_sku_job still requires an explicit value — load from progress.
+            prog = read_json(resolve_job_dir(args.resume_job_id) / "job_progress.json")
+            backend = prog.get("backend")
+            if not backend:
+                print("参数/配置错误: resume 任务缺少 backend，请显式传入 --backend")
+                return 2
         result = run_sku_job(
             business_config=args.business_config,
             query=args.query,
@@ -2019,6 +3582,13 @@ def main(argv: list[str] | None = None) -> int:
             limit_explicit=args.limit is not None,
             max_candidates_explicit=args.max_candidates is not None,
             max_verify_explicit=args.max_verify is not None,
+            candidate_source=args.candidate_source,
+            existing_collection_dir=args.existing_collection_dir,
+            resume_job_id=args.resume_job_id,
+            backend=backend,
+            bsk_browser=args.bsk_browser,
+            model_scope_policy=args.model_scope_policy,
+            retry_failed=bool(args.retry_failed),
         )
     except ValueError as exc:
         print(f"参数/配置错误: {exc}")
@@ -2027,7 +3597,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"运行失败: {type(exc).__name__}: {exc}")
         return 1
     summary = result.get("summary") or {}
-    if summary.get("candidates_paused_unvisited"):
+    if summary.get("candidates_paused_unvisited") or summary.get("session_paused"):
         return 3
     return 0
 

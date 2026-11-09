@@ -202,17 +202,20 @@ DISCOVER_REGIONS_JS = r"""(() => {
     '.sku-shopname',
   ], 'shop');
 
-  // Evidence (2026-11-02 desktop probe 10181313217018): selected class is
-  // .specification-item-sku--selected (NOT legacy --sel).
+  // Evidence (2026-11-02 desktop probe): selected class is
+  // .specification-item-sku--selected. Do NOT use legacy --sel (prefix-similar
+  // false positive). Full panel is screenshot fallback only, never selected text.
   let selected = trySelectors([
     '.specification-item-sku--selected',
     '.specification-item-sku.specification-item-sku--selected',
     '.page-right-spec .specification-item-sku--selected',
-    '.specification-item-sku--sel',
     '.page-right-spec',
     '.specifications-panel-content',
   ], 'selected_spec');
-  if (selected.status === 'FOUND' && selected.selector === '.page-right-spec') {
+  if (selected.status === 'FOUND' && (
+      selected.selector === '.page-right-spec'
+      || selected.selector === '.specifications-panel-content'
+  )) {
     selected.note = 'fell_back_to_full_spec_panel; selected item class may be missing';
   }
   if (selected.status !== 'FOUND') {
@@ -417,6 +420,35 @@ def classify_session_block(page_info: dict[str, Any]) -> str | None:
     return None
 
 
+def page_info_is_observation_error(page_info: dict[str, Any] | None) -> bool:
+    """BSK strict observation_changed / permission_denied is not page identity."""
+    if not isinstance(page_info, dict):
+        return False
+    if str(page_info.get("page_kind") or "") == "OBSERVATION_FAILED":
+        return True
+    if str(page_info.get("code") or "") == "permission_denied":
+        return True
+    reason = str(
+        page_info.get("reason")
+        or ((page_info.get("data") or {}) if isinstance(page_info.get("data"), dict) else {}).get(
+            "reason"
+        )
+        or ""
+    )
+    if reason == "observation_changed":
+        return True
+    msg = str(page_info.get("message") or "")
+    if "observation changed" in msg.lower():
+        return True
+    # Nested evaluate failure payloads stored as page_classify.
+    blob = json.dumps(page_info, ensure_ascii=False)
+    if "observation_changed" in blob and not page_info.get("href"):
+        return True
+    if '"code": "permission_denied"' in blob and not page_info.get("url_product_id"):
+        return True
+    return False
+
+
 def identity_from_page(
     page_info: dict[str, Any], *, candidate_product_id: str
 ) -> dict[str, Any]:
@@ -433,6 +465,26 @@ def identity_from_page(
             "url_product_id": url_id,
             "final_url_sanitized": final_url,
             "page_kind": page_info.get("page_kind"),
+        }
+    if page_info_is_observation_error(page_info):
+        return {
+            "ok": False,
+            "reason": "OBSERVATION_FAILED",
+            "priority": "observation_error_not_identity",
+            "candidate_product_id": pid,
+            "url_product_id": url_id,
+            "final_url_sanitized": final_url,
+            "page_kind": page_info.get("page_kind") or "OBSERVATION_FAILED",
+            "observation_error": {
+                "code": page_info.get("code"),
+                "message": page_info.get("message"),
+                "reason": (
+                    (page_info.get("data") or {}).get("reason")
+                    if isinstance(page_info.get("data"), dict)
+                    else page_info.get("reason")
+                ),
+                "settle_attempts": page_info.get("settle_attempts"),
+            },
         }
     kind = str(page_info.get("page_kind") or "")
     if kind == "PRODUCT_OFF_SHELF":
@@ -481,6 +533,30 @@ def identity_from_page(
     }
 
 
+def _classify_eval_to_page_info(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Map evaluate result to page_info; preserve observation errors (do not invent href)."""
+    if not isinstance(raw, dict):
+        return {"page_kind": "UNKNOWN", "eval_raw": sanitize(raw)}
+    if not raw.get("ok"):
+        err = raw.get("raw") if isinstance(raw.get("raw"), dict) else raw
+        if not isinstance(err, dict):
+            err = {"detail": sanitize(raw)}
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        out = {
+            "page_kind": "OBSERVATION_FAILED",
+            "code": err.get("code") or data.get("code"),
+            "message": err.get("message") or data.get("message"),
+            "reason": data.get("reason") or err.get("reason"),
+            "data": sanitize(data) if data else None,
+            "eval_raw": sanitize(raw),
+        }
+        return out
+    data = raw.get("value")
+    if isinstance(data, dict):
+        return data
+    return {"page_kind": "UNKNOWN", "eval_raw": sanitize(raw)}
+
+
 def wait_page_settle(
     client: BskClient,
     session_id: str,
@@ -490,6 +566,7 @@ def wait_page_settle(
     cooperate_policy: str = "strict",
 ) -> dict[str, Any]:
     last: dict[str, Any] = {}
+    saw_observation_error = False
     for i in range(attempts):
         raw = eval_json(
             client,
@@ -498,10 +575,13 @@ def wait_page_settle(
             cooperate_policy=cooperate_policy,
             cooperate_settle=(i == 0),
         )
-        data = raw.get("value") if isinstance(raw, dict) else raw
-        if not isinstance(data, dict):
-            data = {"page_kind": "UNKNOWN", "eval_raw": sanitize(raw)}
+        data = _classify_eval_to_page_info(raw if isinstance(raw, dict) else None)
         last = data
+        if page_info_is_observation_error(data):
+            saw_observation_error = True
+            # Keep trying briefly; bounded resync happens once after the loop.
+            time.sleep(delay_s)
+            continue
         kind = str(data.get("page_kind") or "")
         if kind in {
             "PRODUCT_DETAIL",
@@ -528,7 +608,54 @@ def wait_page_settle(
                 return last
         time.sleep(delay_s)
     last["settle_attempts"] = attempts
+    if saw_observation_error and page_info_is_observation_error(last):
+        last["observation_error_during_settle"] = True
     return last
+
+
+def classify_page_with_one_observation_resync(
+    client: BskClient,
+    session_id: str,
+    *,
+    page_info: dict[str, Any],
+    cooperate_policy: str = "strict",
+) -> dict[str, Any]:
+    """
+    Same tab only: at most one cooperate sync + reclassify after observation_changed.
+    Never re-navigates. Fresh context/observation; do not reuse stale refs.
+    """
+    if not page_info_is_observation_error(page_info):
+        return page_info
+    sync = cooperate_sync(
+        client, session_id, policy=cooperate_policy, settle=True
+    )
+    raw = eval_json(
+        client,
+        session_id,
+        CLASSIFY_PAGE_JS,
+        context_id=sync.get("context_id"),
+        observation_id=sync.get("observation_id"),
+        cooperate_policy=cooperate_policy,
+        cooperate_settle=False,
+    )
+    retry = _classify_eval_to_page_info(raw if isinstance(raw, dict) else None)
+    retry = dict(retry)
+    retry["settle_attempts"] = int(page_info.get("settle_attempts") or 0)
+    retry["observation_resync_attempted"] = True
+    retry["observation_resync_sync_ok"] = bool(sync.get("ok"))
+    retry["observation_resync_context_id"] = sync.get("context_id")
+    retry["observation_error_before_resync"] = {
+        "code": page_info.get("code"),
+        "message": page_info.get("message"),
+        "reason": page_info.get("reason"),
+        "settle_attempts": page_info.get("settle_attempts"),
+    }
+    if page_info_is_observation_error(retry):
+        retry["page_kind"] = "OBSERVATION_FAILED"
+        retry["observation_resync_recovered"] = False
+    else:
+        retry["observation_resync_recovered"] = True
+    return retry
 
 
 def region_status_from_discover(info: dict[str, Any] | None) -> str:
@@ -1232,6 +1359,31 @@ def run_bsk_detail_capture(
         page_info = wait_page_settle(
             client, session_id, cooperate_policy=cooperate_policy
         )
+        if page_info_is_observation_error(page_info):
+            page_info = classify_page_with_one_observation_resync(
+                client,
+                session_id,
+                page_info=page_info,
+                cooperate_policy=cooperate_policy,
+            )
+        # Python fallback must enrich JS-unknown rate-limit pages (pc-frequent-pro).
+        py_block = classify_session_block(page_info)
+        if py_block and not page_info.get("session_block"):
+            page_info = dict(page_info)
+            page_info["session_block"] = py_block
+            if str(page_info.get("page_kind") or "") in {
+                "",
+                "UNKNOWN",
+                "OBSERVATION_FAILED",
+            }:
+                page_info["page_kind"] = (
+                    "LOGIN"
+                    if py_block == "LOGIN_REQUIRED"
+                    else "VERIFICATION"
+                    if py_block == "VERIFICATION_REQUIRED"
+                    else "SESSION_LIMIT"
+                )
+                page_info["session_block_source"] = "python_classify_session_block"
         write_json(out_dir / "page_classify.json", sanitize(page_info))
         result["actual_product_url"] = sanitize_final_url(str(page_info.get("href") or ""))
         result["page_classify"] = sanitize(page_info)
@@ -1267,7 +1419,28 @@ def run_bsk_detail_capture(
                 result["session_kept_for_manual"] = True
             return result
 
+        if ident.get("reason") == "OBSERVATION_FAILED":
+            result.update(
+                {
+                    "navigation_status": "OBSERVATION_FAILED",
+                    "capture_status": "FAILED",
+                    "product_identity_ok": False,
+                    "error": "OBSERVATION_FAILED",
+                    "observation_failure": ident.get("observation_error")
+                    or {
+                        "stage": "classify_after_settle",
+                        "page_classify": sanitize(page_info),
+                    },
+                    "ended_at_utc": utc_iso_now(),
+                }
+            )
+            write_json(out_dir / "metadata.json", result)
+            stop_session(client, session_id)
+            result["session_stopped"] = True
+            return result
+
         if not ident.get("ok"):
+            # Only true identity/page-kind failures reach here (trusted classify payload).
             result.update(
                 {
                     "navigation_status": "IDENTITY_FAILED",
@@ -1506,6 +1679,22 @@ def run_offline_bsk_detail_checks() -> list[str]:
     if classify_session_block(limit_page) != "DETAIL_RATE_LIMITED":
         failures.append("classify_session_block limit failed")
 
+    # Historical failure mode (6487a8): JS left page_kind UNKNOWN on pc-frequent-pro.
+    frequent = {
+        "href": "https://pc-frequent-pro.pf.jd.com/?from=pc_item&reason=403",
+        "page_kind": "UNKNOWN",
+        "session_block": None,
+        "url_product_id": None,
+        "title": "PC频控页 -京东商城",
+    }
+    if classify_session_block(frequent) != "DETAIL_RATE_LIMITED":
+        failures.append("pc-frequent-pro must classify DETAIL_RATE_LIMITED via href")
+    freq_ident = identity_from_page(frequent, candidate_product_id="10181313217018")
+    if freq_ident.get("reason") != "DETAIL_RATE_LIMITED":
+        failures.append("pc-frequent must beat PRODUCT_ID_MISMATCH / UNKNOWN identity")
+    if freq_ident.get("priority") != "session_block_over_identity":
+        failures.append("pc-frequent identity must mark session_block_over_identity")
+
     ok_page = {
         "href": "https://item.jd.com/1556260334.html",
         "page_kind": "PRODUCT_DETAIL",
@@ -1524,6 +1713,46 @@ def run_offline_bsk_detail_checks() -> list[str]:
     mid = identity_from_page(mismatch, candidate_product_id="1556260334")
     if mid.get("ok") or mid.get("reason") != "PRODUCT_ID_MISMATCH":
         failures.append("id change must fail identity")
+
+    # observation_changed must NOT become IDENTITY_FAILED / UNKNOWN_PAGE alone
+    obs_err = {
+        "code": "permission_denied",
+        "message": "The strict observation changed before this action",
+        "data": {"reason": "observation_changed"},
+        "settle_attempts": 8,
+        "page_kind": "OBSERVATION_FAILED",
+    }
+    if not page_info_is_observation_error(obs_err):
+        failures.append("observation_changed payload must detect as observation error")
+    obs_ident = identity_from_page(obs_err, candidate_product_id="10181313217018")
+    if obs_ident.get("reason") != "OBSERVATION_FAILED":
+        failures.append("observation error must classify OBSERVATION_FAILED not identity")
+    if obs_ident.get("priority") != "observation_error_not_identity":
+        failures.append("observation error priority must be observation_error_not_identity")
+
+    # Recovered classify after resync → normal identity path
+    recovered = {
+        "href": "https://item.jd.com/10181313217018.html",
+        "page_kind": "PRODUCT_DETAIL",
+        "url_product_id": "10181313217018",
+        "session_block": None,
+        "observation_resync_recovered": True,
+    }
+    if not identity_from_page(
+        recovered, candidate_product_id="10181313217018"
+    ).get("ok"):
+        failures.append("recovered classify with matching id must pass identity")
+
+    # Resync lands on rate-limit → session block still wins
+    resync_limit = {
+        "href": "https://pc-frequent-pro.pf.jd.com/?from=pc_item&reason=403",
+        "page_kind": "UNKNOWN",
+        "session_block": None,
+        "observation_resync_attempted": True,
+    }
+    lim = identity_from_page(resync_limit, candidate_product_id="10181313217018")
+    if lim.get("reason") != "DETAIL_RATE_LIMITED":
+        failures.append("observation resync into pc-frequent must be DETAIL_RATE_LIMITED")
 
     # Desktop URL preference
     if "item.m.jd.com" in DESKTOP_ITEM_TMPL:

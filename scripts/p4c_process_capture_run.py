@@ -62,15 +62,45 @@ sel_spec = load_sibling("priceradar_selected_spec")
 
 
 def normalize_selection_snapshot(snap: dict[str, Any] | None) -> dict[str, Any]:
-    """Re-parse core option+qty from legacy noisy selected_spec_text blobs."""
+    """
+    Normalize before/after snapshots for consistency compare.
+
+    BSK selected_status=SELECTED_SPEC_EXTRACTED carries option text without the
+    legacy 「已选 …，N个」 wrapper — adapt without wiping selected_spec_text.
+    Eval/observation errors stay UNKNOWN and never invent selected text.
+    """
     if not isinstance(snap, dict):
         return {"core_status": "UNKNOWN", "reason": "missing_snapshot"}
-    if snap.get("error"):
+    if snap.get("eval_error") or snap.get("error"):
         out = dict(snap)
         out["core_status"] = "UNKNOWN"
+        out["normalize_source"] = "eval_or_capture_error"
+        # Preserve any partial fields; do not fabricate selected_spec_text.
         return out
     if snap.get("core_status") == "EXTRACTED" and snap.get("core_selected_spec"):
         return snap
+
+    # Modern BSK SELECTION_STATE_JS path
+    if str(snap.get("selected_status") or "") == "SELECTED_SPEC_EXTRACTED":
+        option = snap.get("selected_spec_text")
+        if not option and snap.get("selected_options"):
+            option = " | ".join(
+                str(o.get("text") or "")
+                for o in (snap.get("selected_options") or [])
+                if o.get("text")
+            ) or None
+        out = dict(snap)
+        out["core_status"] = "EXTRACTED"
+        out["selected_option_text"] = option
+        out["core_selected_spec"] = option
+        out["selected_spec_text"] = option
+        out["purchase_qty"] = snap.get("purchase_quantity")
+        out["normalize_source"] = "bsk_selected_status_extracted"
+        out["normalize_note"] = (
+            "purchase_qty may be UNKNOWN; qty UNKNOWN ≠ selected option missing"
+        )
+        return out
+
     raw = (
         snap.get("selected_spec_text")
         or snap.get("selected_spec_text_raw")
@@ -80,7 +110,14 @@ def normalize_selection_snapshot(snap: dict[str, Any] | None) -> dict[str, Any]:
     parsed = p2d.parse_core_selected_spec(str(raw) if raw is not None else None)
     out = dict(snap)
     out.update(parsed)
-    out["selected_spec_text"] = parsed.get("core_selected_spec")
+    if parsed.get("core_status") == "EXTRACTED" and parsed.get("core_selected_spec"):
+        out["selected_spec_text"] = parsed.get("core_selected_spec")
+        out["normalize_source"] = "p2d_core_selected_spec_pattern"
+    else:
+        # Do not replace a real option string with None when legacy pattern misses.
+        if snap.get("selected_spec_text"):
+            out["selected_spec_text"] = snap.get("selected_spec_text")
+        out["normalize_source"] = "p2d_core_pattern_unmatched_preserved_raw"
     return out
 
 
@@ -135,16 +172,14 @@ def enrich_selection_snapshot_from_discover(
         return snap
     selector = str(spec.get("selector") or "")
     text = str(spec["text"])
-    # Evidence-based: only --selected node text is current selection.
-    if "selected" in selector and "page-right-spec" not in selector.replace(
-        "specification-item-sku--selected", "X"
-    ):
-        out = dict(snap)
-        out["selected_spec_text"] = text
-        out["selected_status"] = "SELECTED_SPEC_EXTRACTED"
-        out["selected_spec_source"] = f"region_discover:{selector}"
-        return out
-    if selector.endswith("--selected") or "sku--selected" in selector:
+    # Evidence-based: only true --selected node text is current selection.
+    # Reject legacy --sel and full .page-right-spec panel text.
+    selected_node = (
+        "specification-item-sku--selected" in selector
+        or selector.rstrip().endswith("--selected")
+        or "sku--selected" in selector
+    ) and "--sel" not in selector.replace("specification-item-sku--selected", "")
+    if selected_node:
         out = dict(snap)
         out["selected_spec_text"] = text
         out["selected_status"] = "SELECTED_SPEC_EXTRACTED"
@@ -1171,13 +1206,16 @@ def process_capture_run(
             or selection_state.get("after") is not None
             or selection_state.get("consistency_status") == "UNKNOWN"
         ):
-            detail["warnings"].append(
-                "核心已选规格状态未知，不得默认一致: "
-                + "; ".join(selection_state.get("inconsistency_reasons") or [])
+            # Defer UNKNOWN warning until after current_selection / stable-text gate.
+            detail["_pending_selection_unknown_warning"] = "; ".join(
+                selection_state.get("inconsistency_reasons") or []
             )
 
     # Prefer DOM selected options; never treat full-panel OCR packs as selected.
-    current_selection = sel_spec.prefer_selection_side(selection_state_raw)
+    # Use normalized before/after when available so BSK EXTRACTED texts are kept.
+    current_selection = sel_spec.prefer_selection_side(
+        selection_state if isinstance(selection_state, dict) else selection_state_raw
+    )
     detail["current_selection"] = {
         "selected_status": current_selection.get("selected_status"),
         "selected_spec_text": current_selection.get("selected_spec_text"),
@@ -1248,6 +1286,20 @@ def process_capture_run(
         detail["model_scope_policy"] = str(
             model_scope_policy.get("model_scope_policy") or ""
         )
+    detail["selection_gates"] = {
+        "current_selected_status": current_selection.get("selected_status"),
+        "current_selected_spec_text": current_selection.get("selected_spec_text"),
+        "purchase_quantity_status": current_selection.get("purchase_quantity_status"),
+        "consistency_status": (
+            selection_state.get("consistency_status")
+            if isinstance(selection_state, dict)
+            else None
+        ),
+        "consistency_consistent": selection_consistent,
+        "packaging_match_label": packaging_match_value,
+        "box_comparable_before_consistency_gate": unit_info.get("box_comparable"),
+    }
+    pending_unknown = detail.pop("_pending_selection_unknown_warning", None)
     if isinstance(selection_state, dict) and selection_consistent is not True:
         # Only enforce when capture recorded a selection_state block.
         if (
@@ -1256,11 +1308,12 @@ def process_capture_run(
             or selection_state.get("consistency_status")
         ):
             unit_info = dict(unit_info)
-            unit_info["box_comparable"] = False
-            unit_info["unit_status"] = "PENDING_VERIFY"
             reasons = list(unit_info.get("unit_review_reasons") or [])
             if selection_consistent is False:
+                unit_info["box_comparable"] = False
+                unit_info["unit_status"] = "PENDING_VERIFY"
                 reasons.append("核心已选规格/商品状态在截图前后变化，证据不可合并")
+                detail["selection_gates"]["box_gate"] = "BLOCKED_INCONSISTENT"
             else:
                 # Purchase qty UNKNOWN on both sides is OK for single-box unit price;
                 # only block when selected option text cannot be compared.
@@ -1278,13 +1331,31 @@ def process_capture_run(
                     sel_before.get("selected_status") == sel_spec.SELECTED_EXTRACTED
                     and sel_after.get("selected_status") == sel_spec.SELECTED_EXTRACTED
                     and sel_before.get("selected_spec_text")
+                    and sel_before.get("selected_spec_text")
                     == sel_after.get("selected_spec_text")
                 ):
-                    # Selected text stable; do not force-block solely on qty UNKNOWN.
-                    pass
+                    # Selected text stable across shots; do NOT force box_comparable=false
+                    # solely because legacy core_pattern / qty UNKNOWN left consistency=None.
+                    detail["selection_gates"]["box_gate"] = (
+                        "PASS_SELECTED_TEXT_STABLE_QTY_MAY_BE_UNKNOWN"
+                    )
+                    detail["selection_gates"]["stable_selected_spec_text"] = (
+                        sel_after.get("selected_spec_text")
+                    )
+                    pending_unknown = None
                 else:
+                    unit_info["box_comparable"] = False
+                    unit_info["unit_status"] = "PENDING_VERIFY"
                     reasons.append("核心已选规格状态未知，证据不可合并")
+                    detail["selection_gates"]["box_gate"] = "BLOCKED_SELECTED_UNKNOWN"
             unit_info["unit_review_reasons"] = list(dict.fromkeys(reasons))
+    if pending_unknown:
+        detail["warnings"].append(
+            "核心已选规格状态未知，不得默认一致: " + pending_unknown
+        )
+    detail["selection_gates"]["box_comparable_after_consistency_gate"] = unit_info.get(
+        "box_comparable"
+    )
 
     comparison = p4b.compare_to_red_line(
         price_selection.get("selected_price"),

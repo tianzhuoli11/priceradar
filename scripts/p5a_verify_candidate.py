@@ -371,9 +371,24 @@ def detect_session_block_from_capture(capture_result: dict[str, Any]) -> str | N
         if any(x in err for x in ("验证码", "安全验证", "滑动验证")):
             return "VERIFICATION_REQUIRED"
     # JD detail rate-limit / challenge sink (not a product identity miss).
-    if "limit.html" in final_l or "/common/limit" in final_l:
+    # Prefer DETAIL_RATE_LIMITED over ordinary WRONG_PAGE / identity mismatch.
+    if (
+        "limit.html" in final_l
+        or "/common/limit" in final_l
+        or "pc-frequent-pro.pf.jd.com" in final_l
+        or ("reason=403" in final_l and "item." not in final_l)
+    ):
         return "DETAIL_RATE_LIMITED"
-    if "访问受限" in err or "频繁访问" in err:
+    if isinstance(page, dict):
+        page_href = str(page.get("href") or "").lower()
+        page_title = str(page.get("title") or "")
+        if (
+            "pc-frequent-pro.pf.jd.com" in page_href
+            or ("reason=403" in page_href and "item." not in page_href)
+            or "频控" in page_title
+        ):
+            return "DETAIL_RATE_LIMITED"
+    if "访问受限" in err or "频繁访问" in err or "频控" in err:
         return "DETAIL_RATE_LIMITED"
     if status == "WRONG_PAGE_OR_CHALLENGE" and "item." not in final_l:
         return "WRONG_PAGE_OR_CHALLENGE"
@@ -638,6 +653,116 @@ def verify_one(
             )
             _finalize(out_dir, result)
             return result
+        # Honor original capture failure labels; do not OCR empty/blocked captures
+        # into a fake COMPLETED packaging result.
+        meta_path = capture_dir / "metadata.json"
+        page_path = capture_dir / "page_classify.json"
+        offline_meta: dict[str, Any] = {}
+        if meta_path.is_file():
+            try:
+                offline_meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                offline_meta = {}
+        if page_path.is_file() and "page_classify" not in offline_meta:
+            try:
+                offline_meta["page_classify"] = json.loads(
+                    page_path.read_text(encoding="utf-8-sig")
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
+        if offline_meta:
+            result["capture"]["source_navigation_status"] = offline_meta.get(
+                "navigation_status"
+            )
+            result["capture"]["source_capture_status"] = offline_meta.get(
+                "capture_status"
+            )
+            result["capture"]["source_error"] = offline_meta.get("error")
+            result["capture"]["page_classify"] = offline_meta.get("page_classify")
+            result["capture"]["actual_product_url"] = offline_meta.get(
+                "actual_product_url"
+            )
+            result["capture"]["session_block"] = offline_meta.get("session_block")
+            result["capture"]["identity"] = offline_meta.get("identity")
+            result["capture"]["product_identity_ok"] = offline_meta.get(
+                "product_identity_ok"
+            )
+            # Build a capture_result-shaped dict for shared detectors.
+            offline_cap = {
+                "navigation_status": offline_meta.get("navigation_status"),
+                "actual_product_url": offline_meta.get("actual_product_url"),
+                "final_url": offline_meta.get("actual_product_url"),
+                "error": offline_meta.get("error"),
+                "session_block": offline_meta.get("session_block"),
+                "page_classify": offline_meta.get("page_classify"),
+                "product_identity_ok": offline_meta.get("product_identity_ok"),
+                "identity": offline_meta.get("identity"),
+                "observation_failure": offline_meta.get("observation_failure"),
+            }
+            paused = detect_session_block_from_capture(offline_cap)
+            if paused:
+                result.update(
+                    {
+                        "task_status": "PAUSED_SESSION",
+                        "match_status": paused,
+                        "price_evidence_status": "NOT_EVALUATED",
+                        "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                        "system_verdict_zh": "源采集会话受限（离线保留，不伪造详情结论）",
+                        "failure_reason": offline_meta.get("error") or paused,
+                        "ended_at_utc": utc_iso(),
+                    }
+                )
+                _finalize(out_dir, result)
+                return result
+            nav = str(offline_meta.get("navigation_status") or "")
+            err = str(offline_meta.get("error") or "")
+            ident_reason = str((offline_meta.get("identity") or {}).get("reason") or "")
+            page = offline_meta.get("page_classify") or {}
+            obs_like = (
+                nav == "OBSERVATION_FAILED"
+                or err == "OBSERVATION_FAILED"
+                or ident_reason == "OBSERVATION_FAILED"
+                or (
+                    isinstance(page, dict)
+                    and (
+                        str(page.get("code") or "") == "permission_denied"
+                        or "observation_changed" in json.dumps(page, ensure_ascii=False)
+                    )
+                    and not str(offline_meta.get("actual_product_url") or "").strip()
+                )
+            )
+            if obs_like:
+                result.update(
+                    {
+                        "task_status": "FAILED",
+                        "match_status": "OBSERVATION_FAILED",
+                        "price_evidence_status": "NOT_EVALUATED",
+                        "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                        "system_verdict_zh": "源采集观察失败（离线无法补采页面，不得计身份不符）",
+                        "failure_reason": "offline_reused_observation_failed_capture",
+                        "ended_at_utc": utc_iso(),
+                    }
+                )
+                _finalize(out_dir, result)
+                return result
+            if (
+                nav == "IDENTITY_FAILED"
+                or offline_meta.get("product_identity_ok") is False
+            ) and str(offline_meta.get("actual_product_url") or "").strip():
+                # Trusted URL present but identity failed in source — keep identity label.
+                result.update(
+                    {
+                        "task_status": "FAILED",
+                        "match_status": "IDENTITY_FAILED",
+                        "price_evidence_status": "NOT_EVALUATED",
+                        "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                        "system_verdict_zh": "源采集身份核验未通过（离线不重开详情）",
+                        "failure_reason": offline_meta.get("error") or ident_reason,
+                        "ended_at_utc": utc_iso(),
+                    }
+                )
+                _finalize(out_dir, result)
+                return result
     else:
         expected_cap = adapt.expected_product_for_candidate_capture(
             cfg, candidate_product_id=pid
@@ -750,7 +875,53 @@ def verify_one(
             )
             _finalize(out_dir, result)
             return result
+
+        # observation_changed / evaluate sync failure ≠ product-id mismatch
+        cap_err = str(capture_result.get("error") or "")
+        ident_reason = str((capture_result.get("identity") or {}).get("reason") or "")
+        if (
+            nav_status == "OBSERVATION_FAILED"
+            or cap_err == "OBSERVATION_FAILED"
+            or ident_reason == "OBSERVATION_FAILED"
+        ):
+            result.update(
+                {
+                    "task_status": "FAILED",
+                    "match_status": "OBSERVATION_FAILED",
+                    "price_evidence_status": "NOT_EVALUATED",
+                    "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                    "system_verdict_zh": "页面观察/采集失败，不得计为商品身份不符",
+                    "failure_reason": capture_result.get("error") or "OBSERVATION_FAILED",
+                    "observation_failure": capture_result.get("observation_failure")
+                    or (capture_result.get("identity") or {}).get("observation_error"),
+                    "ended_at_utc": utc_iso(),
+                }
+            )
+            _finalize(out_dir, result)
+            return result
+
         if not ident.get("ok") or not capture_result.get("product_identity_ok"):
+            # Refuse to label observation errors as IDENTITY_FAILED even if older captures
+            # left navigation_status=IDENTITY_FAILED with empty URL.
+            page = capture_result.get("page_classify") or {}
+            if isinstance(page, dict) and (
+                str(page.get("code") or "") == "permission_denied"
+                or "observation_changed"
+                in json.dumps(page, ensure_ascii=False)
+            ) and not str(capture_result.get("actual_product_url") or "").strip():
+                result.update(
+                    {
+                        "task_status": "FAILED",
+                        "match_status": "OBSERVATION_FAILED",
+                        "price_evidence_status": "NOT_EVALUATED",
+                        "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                        "system_verdict_zh": "页面观察/采集失败，不得计为商品身份不符",
+                        "failure_reason": "legacy_identity_label_corrected_to_observation_failed",
+                        "ended_at_utc": utc_iso(),
+                    }
+                )
+                _finalize(out_dir, result)
+                return result
             result.update(
                 {
                     "task_status": "FAILED",
