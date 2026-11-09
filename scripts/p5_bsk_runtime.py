@@ -30,13 +30,43 @@ SENSITIVE_KEY_RE = re.compile(
 # plugin_goodsCardWrapper — NOT a[title]. Old selector a[title],…,a hit chat
 # anchors with empty text → all titles blank.
 EXTRACT_STATE_JS = r"""(() => {
-  const visible = (el) => {
+  // Entrance fade-in still pending: a finite, running/paused animation whose explicit
+  // keyframes go from opacity <= 0.05 to an explicit final opacity > 0.05.
+  // Such a card is rendered (opacity frozen at the first frame, e.g. background tab),
+  // not hidden. Anything else with low opacity stays rejected: no animation, an
+  // animation ending transparent, implicit/unknown end keyframe, or infinite timing.
+  // Read-only: never calls finish()/cancel() or changes styles.
+  const fadeInPending = (el) => {
+    const anims = el.getAnimations ? el.getAnimations() : [];
+    for (const a of anims) {
+      if (a.playState !== 'running' && a.playState !== 'paused') continue;
+      const eff = a.effect;
+      if (!eff || !eff.getComputedTiming || !eff.getKeyframes) continue;
+      const timing = eff.getComputedTiming();
+      if (!Number.isFinite(timing.endTime)) continue;
+      const kfs = eff.getKeyframes().filter(k => k.opacity !== undefined && k.opacity !== null && k.opacity !== '');
+      if (kfs.length < 2) continue;
+      const rev = /reverse/.test(String(timing.direction || ''));
+      const first = Number((rev ? kfs[kfs.length - 1] : kfs[0]).opacity);
+      const last = Number((rev ? kfs[0] : kfs[kfs.length - 1]).opacity);
+      const lastOffset = (rev ? kfs[0] : kfs[kfs.length - 1]).computedOffset;
+      if (first <= 0.05 && last > 0.05 && (rev ? lastOffset === 0 : lastOffset === 1)) {
+        return { name: a.animationName || null, first, last };
+      }
+    }
+    return null;
+  };
+  const visibilityVerdict = (el) => {
     const st = window.getComputedStyle(el);
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0
-      && st.visibility !== 'hidden' && st.display !== 'none'
-      && Number(st.opacity || '1') > 0.05;
+    if (!(r.width > 0 && r.height > 0)) return { ok: false, why: 'zero_size' };
+    if (st.display === 'none') return { ok: false, why: 'display_none' };
+    if (st.visibility === 'hidden') return { ok: false, why: 'visibility_hidden' };
+    if (Number(st.opacity || '1') > 0.05) return { ok: true, why: 'visible' };
+    if (fadeInPending(el)) return { ok: true, why: 'opacity_entrance_animation_pending' };
+    return { ok: false, why: 'opacity_low' };
   };
+  const visible = (el) => visibilityVerdict(el).ok;
   const inViewport = (r) => r.bottom > 0 && r.top < window.innerHeight
     && r.right > 0 && r.left < window.innerWidth;
 
@@ -121,10 +151,36 @@ EXTRACT_STATE_JS = r"""(() => {
   let recommend_count = 0;
   let main_count = 0;
   let hidden_skipped = 0;
+  const hidden_reasons = {};
+  const animation_pending_ids = [];
+  const hidden_samples = [];
   for (const el of nodes) {
     const id = (el.getAttribute('data-sku') || '').trim();
     if (!id || !/^\d{5,}$/.test(id)) continue;
-    if (!visible(el)) { hidden_skipped += 1; continue; }
+    const _vv = visibilityVerdict(el);
+    if (_vv.ok && _vv.why === 'opacity_entrance_animation_pending') {
+      // Rendered but still at the first frame of a fade-in: NOT counted as a visible
+      // candidate yet (future visibility is not current evidence).
+      if (!animation_pending_ids.includes(id)) animation_pending_ids.push(id);
+      continue;
+    }
+    if (!_vv.ok) {
+      hidden_skipped += 1;
+      // same-moment evidence for why the card was judged hidden (filter unchanged)
+      const _st = window.getComputedStyle(el); const _r = el.getBoundingClientRect();
+      const _k = (_r.width <= 0 || _r.height <= 0 ? 'zero_size;' : '')
+        + (_st.display === 'none' ? 'display_none;' : '')
+        + (_st.visibility === 'hidden' ? 'visibility_hidden;' : '')
+        + (Number(_st.opacity || '1') <= 0.05 ? 'opacity_low;' : '');
+      hidden_reasons[_k || 'unknown'] = (hidden_reasons[_k || 'unknown'] || 0) + 1;
+      if (hidden_samples.length < 3) hidden_samples.push({ id, w: Math.round(_r.width), h: Math.round(_r.height),
+        display: _st.display, visibility: _st.visibility, opacity: _st.opacity,
+        transition: (_st.transitionProperty || '') + ' ' + (_st.transitionDuration || ''),
+        animation: _st.animationName || null,
+        running_animations: el.getAnimations ? el.getAnimations().length : null,
+        doc_visibility: document.visibilityState, has_focus: document.hasFocus() });
+      continue;
+    }
     const parentSkuEl = el.parentElement
       ? el.parentElement.closest('[data-sku]')
       : null;
@@ -316,6 +372,13 @@ EXTRACT_STATE_JS = r"""(() => {
       recommend_count: recommend_count,
       main_count: main_count,
       hidden_skipped: hidden_skipped,
+      hidden_reasons: hidden_reasons,
+      visible_now: out.length,
+      animation_pending: animation_pending_ids.length,
+      animation_pending_ids: animation_pending_ids.slice(0, 60),
+      has_focus: document.hasFocus(),
+      hidden_samples: hidden_samples,
+      document_visibility: document.visibilityState,
       with_title: out.filter(x => x.title).length,
     },
     pager_text,
@@ -617,6 +680,33 @@ def _append_cooperate_receipt(
         obs = sync.get("observation_id")
         if obs:
             args.extend(["--observation", str(obs)])
+
+
+def run_page_action(
+    client: BskClient,
+    session: str,
+    args: list[str],
+    *,
+    timeout: int = 45,
+    cooperate_policy: str = "strict",
+) -> dict[str, Any]:
+    """Page-changing action (click/scroll-to) carrying the latest cooperate context.
+
+    BSK 0.4.x/protocol 1.8 refuses actions without it (``cooperation_sync_required``,
+    effect_state=none). One sync, one action; no retry of an uncertain action.
+    """
+    sync = cooperate_sync(client, session, policy=cooperate_policy)
+    if not sync.get("context_id"):
+        return {
+            "ok": False,
+            "exit_code": None,
+            "cmd": args,
+            "data": {"reason": "cooperate_sync_failed"},
+            "sync": sync,
+        }
+    full = list(args)
+    _append_cooperate_receipt(full, sync, include_observation=False)
+    return client.run(full, timeout=timeout)
 
 
 def eval_json(
@@ -958,11 +1048,15 @@ def click_next_page(client: BskClient, session_id: str) -> dict[str, Any]:
     if not mv.get("ok"):
         return {"ok": False, "reason": "no_unique_enabled_next", "mark": sanitize(mark)}
     sel = str(mv.get("selector") or '[data-pr-next="1"]')
-    client.run(
+    run_page_action(
+        client,
+        session_id,
         ["scroll-to", "--session", session_id, "--selector", sel],
         timeout=30,
     )
-    native = client.run(
+    native = run_page_action(
+        client,
+        session_id,
         ["click", "--session", session_id, "--selector", sel],
         timeout=45,
     )
@@ -1068,7 +1162,50 @@ def turn_to_next_page(
 
 PAGE_MAX_SCROLLS = 18
 PAGE_SCROLL_PAUSE_MS = 750
+PENDING_RECHECKS = 4
+PENDING_RECHECK_WAIT_MS = 1500
 PAGE_STABLE_ROUNDS = 3  # idle rounds alone are NOT enough without bottom+pager
+
+VISIBILITY_DIAG_JS = r"""(() => {
+  // Read-only: why are [data-sku] cards judged hidden? (no clicks, no style changes)
+  const cs = (el) => getComputedStyle(el);
+  const rect = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; };
+  const why = (el) => {
+    const st = cs(el); const r = el.getBoundingClientRect(); const out = [];
+    if (r.width <= 0 || r.height <= 0) out.push('zero_size');
+    if (st.display === 'none') out.push('display_none');
+    if (st.visibility === 'hidden') out.push('visibility_hidden');
+    if (Number(st.opacity || '1') <= 0.05) out.push('opacity_low');
+    return out;
+  };
+  const cards = Array.from(document.querySelectorAll('[data-sku]')).filter(e => /^\d{5,}$/.test((e.getAttribute('data-sku') || '').trim()));
+  const sample = cards.slice(0, 3).map(el => {
+    const chain = []; let n = el; let d = 0;
+    while (n && n !== document.documentElement && d < 10) {
+      const st = cs(n);
+      chain.push({ depth: d, tag: n.tagName, cls: String(n.className || '').slice(0, 60), rect: rect(n),
+        display: st.display, visibility: st.visibility, opacity: st.opacity, overflow: st.overflow,
+        content_visibility: st.contentVisibility || null, hidden_reasons: why(n) });
+      n = n.parentElement; d += 1;
+    }
+    return { data_sku: el.getAttribute('data-sku'), self_reasons: why(el), chain };
+  });
+  const se = document.scrollingElement || document.documentElement;
+  const box = document.querySelector('.plugin_goodsContainer, [class*="goodsContainer"], [class*="_goodsContainer"]');
+  const bs = box ? cs(box) : null;
+  return {
+    visibility_state: document.visibilityState,
+    document_hidden: document.hidden,
+    has_focus: document.hasFocus(),
+    inner: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
+    window_scroll: { y: window.scrollY, scroll_height: se.scrollHeight, client_height: se.clientHeight },
+    goods_container: box ? { cls: String(box.className || '').slice(0, 80), scroll_top: box.scrollTop, scroll_height: box.scrollHeight,
+      client_height: box.clientHeight, overflow_y: bs.overflowY, rect: rect(box) } : null,
+    card_total: cards.length,
+    card_hidden_reason_counts: cards.reduce((acc, el) => { why(el).forEach(k => { acc[k] = (acc[k] || 0) + 1; }); return acc; }, {}),
+    sample,
+  };
+})()"""
 
 SCROLL_STEP_JS = r"""(() => {
   const box = document.querySelector(
@@ -1106,6 +1243,7 @@ def collect_one_page_bsk(
     stop_reason_detail = "in_progress"
     stable = 0
     scrolls = 0
+    scroll_errors: list[dict[str, Any]] = []
     wait_info: dict[str, Any] = {}
 
     client.run(
@@ -1243,10 +1381,15 @@ def collect_one_page_bsk(
                 page_load_coverage = "UNCONFIRMED_SCROLL_BUDGET"
                 stop_reason_detail = "scroll_budget_not_at_bottom"
             break
-        client.run(
-            ["evaluate", "--session", session_id, SCROLL_STEP_JS],
-            timeout=30,
-        )
+        scroll_res = eval_json(client, session_id, SCROLL_STEP_JS)
+        if not scroll_res.get("ok"):
+            scroll_errors.append(
+                {
+                    "scroll_pass": scroll_pass,
+                    "reason": ((scroll_res.get("raw") or {}).get("data") or {}).get("code")
+                    or "scroll_eval_failed",
+                }
+            )
         client.run(["wait-ms", str(PAGE_SCROLL_PAUSE_MS)], timeout=15)
         scrolls += 1
 
@@ -1254,6 +1397,44 @@ def collect_one_page_bsk(
     client.run(["wait-ms", "400"], timeout=10)
     final = eval_json(client, session_id, EXTRACT_STATE_JS)
     fv = final.get("value") if isinstance(final.get("value"), dict) else {}
+    pending_rechecks: list[dict[str, Any]] = []
+    # Only animation-pending cards and no visible one: wait on the SAME page (no
+    # refresh, no re-search, no style change) and re-read; at most PENDING_RECHECKS.
+    for i in range(PENDING_RECHECKS):
+        cs_now = fv.get("card_stats") or {}
+        if by_id or not int(cs_now.get("animation_pending") or 0):
+            break
+        client.run(["wait-ms", str(PENDING_RECHECK_WAIT_MS)], timeout=15)
+        final = eval_json(client, session_id, EXTRACT_STATE_JS)
+        fv = final.get("value") if isinstance(final.get("value"), dict) else {}
+        cs_now = fv.get("card_stats") or {}
+        rows_rc = cards_to_rows(
+            list(fv.get("cards") or []), query=query, page_index=page_index,
+            source_url=str(fv.get("url") or ""),
+        )
+        for rec in rows_rc:
+            pid = str(rec.get("product_id") or "")
+            if pid and pid not in by_id:
+                item = dict(rec)
+                item["position_on_page"] = len(by_id) + 1
+                item["scroll_pass_first"] = f"pending_recheck_{i + 1}"
+                item["scroll_passes_seen"] = [f"pending_recheck_{i + 1}"]
+                by_id[pid] = item
+        pending_rechecks.append(
+            {
+                "recheck": i + 1,
+                "visible_now": cs_now.get("visible_now"),
+                "animation_pending": cs_now.get("animation_pending"),
+                "hidden_reasons": cs_now.get("hidden_reasons"),
+                "document_visibility": cs_now.get("document_visibility"),
+                "has_focus": cs_now.get("has_focus"),
+            }
+        )
+    final_pending = int((fv.get("card_stats") or {}).get("animation_pending") or 0)
+    if final_pending and page_load_coverage == "CONFIRMED":
+        # future visibility (keyframes) is not evidence that this page finished loading
+        page_load_coverage = "UNCONFIRMED_ANIMATION_PENDING"
+        stop_reason_detail = "cards_still_animation_pending"
     pager = pager_from_state(fv)
     rows_out = sorted(by_id.values(), key=lambda r: int(r.get("position_on_page") or 0))
     peak = (
@@ -1282,6 +1463,20 @@ def collect_one_page_bsk(
         "wait_info": wait_info,
         "rows": rows_out,
         "scroll_meta": scroll_meta,
+        "scroll_errors": scroll_errors,
+        "pending_rechecks": pending_rechecks,
+        "visible_candidates": len(by_id),
+        "animation_pending_final": final_pending,
+        "scroll_effect": {
+            "first_scroll_y": scroll_meta[0].get("scroll_y") if scroll_meta else None,
+            "max_scroll_y": max((m.get("scroll_y") or 0) for m in scroll_meta) if scroll_meta else None,
+            "last_scroll_y": scroll_meta[-1].get("scroll_y") if scroll_meta else None,
+            "scroll_max": scroll_meta[-1].get("scroll_max") if scroll_meta else None,
+            "reached_bottom": any(m.get("at_bottom") for m in scroll_meta),
+            "effective": bool(scroll_meta)
+            and max((m.get("scroll_y") or 0) for m in scroll_meta)
+            > (scroll_meta[0].get("scroll_y") or 0),
+        },
         "scroll_count": scrolls,
         "raw_card_peaks": peak,
         "title_coverage_on_page": {
@@ -1299,9 +1494,12 @@ def collect_one_page_bsk(
 
 
 
-def start_session(client: BskClient, browser: str) -> dict[str, Any]:
+def start_session(client: BskClient, browser: str, *, focus: bool = False) -> dict[str, Any]:
     start = client.run(
-        ["session", "start", "--no-focus", "--browser", str(browser), "--name", "priceradar-collect-all"]
+        [
+            "session", "start", "--focus" if focus else "--no-focus",
+            "--browser", str(browser), "--name", "priceradar-collect-all",
+        ]
     )
     data = start.get("data")
     session_id = None

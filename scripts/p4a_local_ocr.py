@@ -40,7 +40,8 @@ MODEL_RE = re.compile(
     rf"(?<![A-Za-z0-9]){re.escape(DEFAULT_EXPECTED_MODEL)}(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-LAYER_RE = re.compile(r"(\d+)\s*层")
+LAYER_RE = re.compile(r"(\d+|单|双)\s*层")
+_LAYER_WORD = {"单": "1", "双": "2"}  # 单层=1层、双层=2层
 SHEET_RE = re.compile(r"(\d+)\s*(?:抽|张)")
 PACK_RE = re.compile(r"(\d+)\s*包")
 QTY_RE = re.compile(r"(\d+)\s*个")
@@ -370,7 +371,7 @@ def extract_from_blocks(
         }
         m = LAYER_RE.search(text)
         if m:
-            spec_obj["layers"] = m.group(1)
+            spec_obj["layers"] = _LAYER_WORD.get(m.group(1), m.group(1))
             spec_hit = True
         m = SHEET_RE.search(text)
         if m:

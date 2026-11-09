@@ -200,6 +200,107 @@ def run_self_checks() -> int:
     if mapped != take_home.PRICE_TYPE_PAGE_PRIMARY:
         failures.append("¥168 should stay PAGE_PRIMARY")
 
+    # ---- OBSERVATION_FAILED diagnostics: capture -> final result (synthetic) ----
+    import tempfile
+    import types
+
+    real_bsk = load_sibling("p5_bsk_detail")
+    obs_page = {
+        "page_kind": "OBSERVATION_FAILED",
+        "code": "permission_denied",
+        "message": "The strict observation changed before this action",
+        "reason": None,
+        "data": {"reason": "observation_changed", "phase": "observation"},
+        "settle_attempts": 8,
+        "observation_resync_attempted": True,
+        "observation_resync_sync_ok": True,
+        "observation_resync_recovered": False,
+    }
+    ident_obs = real_bsk.identity_from_page(obs_page, candidate_product_id="999001")
+    oe = ident_obs.get("observation_error") or {}
+    if ident_obs.get("reason") != "OBSERVATION_FAILED" or oe.get("stage") != "PAGE_CLASSIFY":
+        failures.append(f"observation_error must carry stage: {ident_obs}")
+    if oe.get("reason") != "observation_changed" or (oe.get("same_page_resync") or {}).get("recovered") is not False:
+        failures.append(f"observation_error must carry reason and resync outcome: {oe}")
+
+    cfg_obs = PROJECT_ROOT / "config" / "products" / "b913a.json"
+    if cfg_obs.is_file():
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            cand_path = td_p / "candidates.json"
+            cand_path.write_text(
+                json.dumps(
+                    [{
+                        "query": "清风 B913A", "rank": 1, "title": "清风商用擦手纸 B913A 整箱",
+                        "product_id": "999001", "shop_name": "店", "ad_marked": False,
+                        "normalized_url": "https://item.jd.com/999001.html",
+                        "observed_url": "https://item.jd.com/999001.html",
+                    }],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            def _fake_capture(**kw):
+                out = Path(kw["out_dir"])
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "metadata.json").write_text("{}", encoding="utf-8")
+                (out / "page_classify.json").write_text("{}", encoding="utf-8")
+                kind = fake_state["kind"]
+                base = {
+                    "out_dir": str(out), "run_id": "capture", "backend": "bsk",
+                    "browser_started": True, "regions": {}, "actual_product_url": "",
+                    "product_identity_ok": False, "page_classify": obs_page,
+                }
+                if kind == "obs":
+                    base.update(
+                        navigation_status="OBSERVATION_FAILED", capture_status="FAILED",
+                        error="OBSERVATION_FAILED", identity=ident_obs,
+                        observation_failure={
+                            **oe,
+                            "diagnostic_files": {
+                                "metadata": str(out / "metadata.json"),
+                                "page_classify": str(out / "page_classify.json"),
+                            },
+                            "navigation_retried": False,
+                        },
+                    )
+                else:  # rate limit with an observation error also present
+                    base.update(
+                        navigation_status="DETAIL_RATE_LIMITED", capture_status="FAILED",
+                        error="DETAIL_RATE_LIMITED", session_block="DETAIL_RATE_LIMITED",
+                        identity=ident_obs,
+                    )
+                return base
+
+            fake_state = {"kind": "obs"}
+            fake_mod = types.SimpleNamespace(run_bsk_detail_capture=_fake_capture)
+            _orig_ls = globals()["load_sibling"]
+            globals()["load_sibling"] = lambda stem: fake_mod if stem == "p5_bsk_detail" else _orig_ls(stem)
+            try:
+                r_obs = verify_one(
+                    business_config=cfg_obs, candidates_path=cand_path, product_id="999001",
+                    out_dir=td_p / "v_obs", backend="bsk",
+                )
+                fake_state["kind"] = "rate"
+                r_rate = verify_one(
+                    business_config=cfg_obs, candidates_path=cand_path, product_id="999001",
+                    out_dir=td_p / "v_rate", backend="bsk",
+                )
+            finally:
+                globals()["load_sibling"] = _orig_ls
+            if r_obs.get("match_status") != "OBSERVATION_FAILED" or r_obs.get("task_status") != "FAILED":
+                failures.append(f"observation failure must stay OBSERVATION_FAILED: {r_obs.get('match_status')}")
+            if r_obs.get("failure_stage") != "PAGE_CLASSIFY":
+                failures.append("failure_stage must reach final result")
+            rr = " ".join(r_obs.get("review_reasons") or [])
+            if "PAGE_CLASSIFY" not in rr or "metadata.json" not in rr or "未增加导航" not in rr:
+                failures.append(f"review_reasons must show stage and diagnostic path: {rr}")
+            if r_rate.get("task_status") != "PAUSED_SESSION" or r_rate.get("match_status") != "DETAIL_RATE_LIMITED":
+                failures.append(
+                    f"rate limit must still win over observation error: {r_rate.get('task_status')}/{r_rate.get('match_status')}"
+                )
+
     print("=== P5-A offline self-check ===")
     if failures:
         print(f"FAILED ({len(failures)}):")
@@ -257,6 +358,22 @@ def load_pipeline_extractions(pipeline_dir: Path) -> dict[str, Any]:
         "promotion_text": promotion_text,
         "ocr_image_texts": ocr_image_texts,
     }
+
+
+def observation_failure_summary(obs: dict[str, Any] | None) -> str:
+    """One-line sanitized summary for reports (no raw command lines / ids)."""
+    o = obs or {}
+    rs = o.get("same_page_resync") or {}
+    if rs.get("attempted"):
+        resync = f"同页重新同步已做(sync_ok={rs.get('sync_ok')}, 恢复={rs.get('recovered')})"
+    else:
+        resync = "未做同页重新同步"
+    files = o.get("diagnostic_files") or {}
+    return (
+        f"页面观察失败(非身份不符、非会话暂停): 阶段={o.get('stage') or '未知'}; "
+        f"code={o.get('code')}; reason={o.get('reason')}; 观察重试={o.get('settle_attempts')}次; "
+        f"{resync}; 未增加导航; 诊断文件={files.get('metadata') or files.get('page_classify') or '无'}"
+    )
 
 
 def load_capture_panel_contexts(capture_dir: Path) -> list[dict[str, Any]]:
@@ -329,6 +446,29 @@ def load_capture_panel_contexts(capture_dir: Path) -> list[dict[str, Any]]:
             add(pg.get("price_preview"), "capture:page_classify.price_preview")
         except (OSError, json.JSONDecodeError):
             pass
+    # Same-capture DOM price-role evidence (amount/label nodes + line-through).
+    role_files: dict[str, Any] = {}
+    for key, name in (
+        ("before", "price_role_evidence_before.json"),
+        ("after", "price_role_evidence_after.json"),
+    ):
+        rp = capture_dir / name
+        if rp.is_file():
+            try:
+                role_files[key] = json.loads(rp.read_text(encoding="utf-8-sig"))
+            except (OSError, json.JSONDecodeError):
+                role_files[key] = {"status": "READ_ERROR"}
+    if role_files:
+        if not contexts:
+            ev_any = role_files.get("after") or role_files.get("before") or {}
+            add(ev_any.get("panel_text"), "capture:price_role_evidence.panel_text")
+        if contexts:
+            contexts[0]["role_evidence"] = {
+                "before": role_files.get("before"),
+                "after": role_files.get("after"),
+                "target_product_id": product_id,
+                "selected_spec_text": selected_spec,
+            }
     return contexts
 
 
@@ -743,6 +883,12 @@ def verify_one(
                         "ended_at_utc": utc_iso(),
                     }
                 )
+                _obs_hist = offline_meta.get("observation_failure") or {}
+                result["review_reasons"] = [
+                    observation_failure_summary(_obs_hist)
+                    + ("" if _obs_hist.get("stage") else "（历史产物无失败阶段字段：历史原因未知）")
+                ]
+                result["failure_stage"] = _obs_hist.get("stage")
                 _finalize(out_dir, result)
                 return result
             if (
@@ -897,6 +1043,8 @@ def verify_one(
                     "ended_at_utc": utc_iso(),
                 }
             )
+            result["review_reasons"] = [observation_failure_summary(result["observation_failure"])]
+            result["failure_stage"] = (result["observation_failure"] or {}).get("stage")
             _finalize(out_dir, result)
             return result
 
@@ -996,6 +1144,7 @@ def verify_one(
     page_matched = bool(unit_analysis.get("page_spec_matched"))
     if unit_analysis.get("page_spec_matched") is None:
         page_matched = row.get("packaging_match") == "PASSED"
+    role_status: dict[str, Any] = {}
     clues = take_home.build_price_clues_from_extraction(
         extraction,
         red_line=red,
@@ -1004,7 +1153,9 @@ def verify_one(
         packs_per_box=cfg["_packs_per_box_int"],
         evidence_path=str(pipeline_dir),
         panel_contexts=load_capture_panel_contexts(capture_dir),
+        role_status_out=role_status,
     )
+    result["price_role_evidence"] = role_status or {"status": "NOT_AVAILABLE"}
     rollup = take_home.aggregate_system_verdict(clues)
     result["price_clues"] = clues
     result["take_home_rollup"] = rollup
@@ -1052,6 +1203,11 @@ def verify_one(
             + [r for c in clues for r in (c.get("review_reasons") or [])]
             + [rollup.get("note") or ""]
             + list(low_signal.get("signal_review_reasons") or [])
+            + [
+                "价格角色证据(" + str(role_status.get("status")) + "): " + str(x)
+                for x in (role_status.get("reasons") or [])
+                if role_status.get("status") not in {"RESOLVED", "NOT_AVAILABLE"}
+            ]
         )
     )
     result["screenshot_dir"] = str(capture_dir)

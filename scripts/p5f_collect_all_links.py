@@ -352,15 +352,26 @@ def classify_completeness(
     page_failures: list[str],
     budget_hit: bool,
     restricted: bool,
+    page_loads_all_confirmed: bool | None = None,
 ) -> dict[str, Any]:
-    """COMPLETE only with explicit end-of-results evidence and no early budget stop."""
+    """COMPLETE only with POSITIVE end-of-results evidence, no early budget stop, and
+    (when supplied) every visited page's load confirmed.
+
+    Three different facts are kept apart:
+    - control NOT_FOUND  -> weak signal only (``weak_end_signals``); never end evidence;
+    - control DISABLED   -> positive evidence (``next_page_disabled``);
+    - pager text says current page >= total pages -> positive evidence.
+    ``pagination_reached_end`` (end of paging) is separate from ``page_loads_confirmed``
+    (each page fully loaded); the integrity needs both.
+    """
     continuous = pages_visited == list(range(1, len(pages_visited) + 1))
     last = last_pager or {}
-    end_evidence = []
+    end_evidence: list[str] = []
+    weak_signals: list[str] = []
     if last.get("status") == "DISABLED" or last.get("disabled"):
         end_evidence.append("next_page_disabled")
     if last.get("status") == "NOT_FOUND" and pages_visited:
-        end_evidence.append("no_next_control")
+        weak_signals.append("no_next_control")
     hint_cur = last.get("current_page_hint")
     hint_total = last.get("total_pages_hint")
     if (
@@ -373,7 +384,7 @@ def classify_completeness(
             f"pager_text_implies_last_page cur={hint_cur} total_hint={hint_total}"
         )
 
-    can_complete = (
+    reached_end = (
         continuous
         and not page_failures
         and not budget_hit
@@ -387,17 +398,41 @@ def classify_completeness(
             "NO_NEXT_CONTROL",
         }
     )
+    loads_ok = page_loads_all_confirmed is not False
+    can_complete = reached_end and loads_ok
+    incomplete_reasons: list[str] = []
+    if not reached_end:
+        if budget_hit:
+            incomplete_reasons.append(f"budget_or_cap_stop:{stop_reason}")
+        if restricted:
+            incomplete_reasons.append("restricted")
+        if page_failures:
+            incomplete_reasons.append("page_failures")
+        if not end_evidence:
+            incomplete_reasons.append(
+                "no_positive_end_evidence"
+                + (" (only next control not found)" if weak_signals else "")
+            )
+        if not continuous:
+            incomplete_reasons.append("pages_not_continuous")
+    if reached_end and not loads_ok:
+        incomplete_reasons.append("page_load_unconfirmed")
     integrity = "COMPLETE" if can_complete else "PARTIAL"
     return {
         "integrity": integrity,
         "statement_zh": (
             "本次关键词搜索结果页收集完成"
             if integrity == "COMPLETE"
-            else "本次关键词搜索结果页部分完成"
+            else "本次关键词搜索结果页部分完成（覆盖未确认）"
         ),
         "not_platform_wide": "不得写成京东全平台全部同款",
         "continuous_pages": continuous,
+        "pagination_reached_end": reached_end,
+        "page_loads_confirmed": page_loads_all_confirmed,
+        "next_control_status": last.get("status"),
         "end_page_evidence": end_evidence,
+        "weak_end_signals": weak_signals,
+        "incomplete_reasons": incomplete_reasons,
         "page_failures": page_failures,
         "budget_hit": budget_hit,
         "restricted": restricted,
@@ -566,7 +601,12 @@ th{{background:#f5f5f5}} .warn{{color:#a40}} .muted{{color:#666}}
 <li>overall_integrity：{esc(str(coverage.get('overall_integrity')))}</li>
 </ul>
 <p class="warn">标题命中只是线索，不能代替详情同款核验。最终条数以实测为准，100 不是通过门槛。不用搜索词填标题。</p>
-<p>末页证据：{esc(json.dumps(integrity.get('end_page_evidence'), ensure_ascii=False))}</p>
+<p>末页证据（正向）：{esc(json.dumps(integrity.get('end_page_evidence'), ensure_ascii=False))}
+ · 弱信号（不算末页）：{esc(json.dumps(integrity.get('weak_end_signals'), ensure_ascii=False))}
+ · 下一页控件：{esc(str(integrity.get('next_control_status')))}</p>
+<p>分页到达末页：{esc(str(integrity.get('pagination_reached_end')))}
+ · 各页加载完整：{esc(str(integrity.get('page_loads_confirmed')))}
+ · 未完整原因：{esc(json.dumps(integrity.get('incomplete_reasons'), ensure_ascii=False))}</p>
 <p>目标页数文案（参考）：{esc(str(integrity.get('pager_text_raw')))}</p>
 </div>
 <h2>逐页统计</h2>
@@ -593,6 +633,7 @@ def run_collect_all(
     browser: str | None = None,
     bsk_exe: Path | None = None,
     reuse_search_tab: bool = True,
+    focus_window: bool = False,
 ) -> dict[str, Any]:
     query = (query or "").strip()
     if not query:
@@ -845,6 +886,16 @@ def run_collect_all(
                     "page_hint": (page_result.get("pager") or {}).get("current_page_hint"),
                     "id_fingerprint": page_result.get("id_fingerprint"),
                     "pager_text": (page_result.get("pager") or {}).get("pager_text"),
+                    "next_control_status": (page_result.get("pager") or {}).get("status"),
+                    "total_pages_hint": (page_result.get("pager") or {}).get("total_pages_hint"),
+                    "scroll_effect": page_result.get("scroll_effect"),
+                    "scroll_error_count": len(page_result.get("scroll_errors") or []),
+                    "hidden_cards_skipped": (page_result.get("card_stats_last") or {}).get("hidden_skipped"),
+                    "visible_candidates": len(rows),
+                    "animation_pending_final": page_result.get("animation_pending_final"),
+                    "hidden_reasons_final": (page_result.get("card_stats_last") or {}).get("hidden_reasons"),
+                    "document_visibility_final": (page_result.get("card_stats_last") or {}).get("document_visibility"),
+                    "pending_rechecks": page_result.get("pending_rechecks"),
                     "collected_at_utc": page_result.get("collected_at_utc"),
                 }
             )
@@ -923,7 +974,7 @@ def run_collect_all(
                     "多个实例时加 --browser <instance_id>。"
                     f" options={pick.get('options')}"
                 )
-            sess = bsk_rt.start_session(client, str(pick["selector"]))
+            sess = bsk_rt.start_session(client, str(pick["selector"]), focus=focus_window)
             write_json_atomic(run_dir / "bsk_session_start.json", sess)
             if not sess.get("ok") or not sess.get("session_id"):
                 raise RuntimeError(f"session start 失败: {sess}")
@@ -1143,6 +1194,20 @@ def run_collect_all(
                             break
                         if pager.get("status") != "FOUND":
                             stop_reason = "NO_NEXT_CONTROL"
+                            break
+                        if not (pr.get("rows") or []):
+                            # No visible candidate on this page: save a read-only
+                            # visibility diagnostic and stop — never flip blindly and
+                            # never count hidden cards as candidates.
+                            diag = bsk_rt.eval_json(client, session_id, bsk_rt.VISIBILITY_DIAG_JS)
+                            write_json_atomic(
+                                run_dir / f"page_{page_index:03d}_visibility_diag.json",
+                                bsk_rt.sanitize(
+                                    diag.get("value") if diag.get("ok") else {"eval_error": diag.get("raw")}
+                                ),
+                            )
+                            stop_reason = "NO_VISIBLE_CANDIDATES"
+                            page_failures.append(f"page_{page_index}_no_visible_candidates")
                             break
                         if page_index >= max_pages:
                             budget_hit = True
@@ -1522,6 +1587,11 @@ def _finalize(
             match_stats["未知"] += 1
 
     pages_visited = [int(p["page"]) for p in pages_summary]
+    page_loads_all_confirmed = (
+        bool(pages_summary)
+        and all(p.get("page_load_coverage") == "CONFIRMED" for p in pages_summary)
+        and not page_failures
+    )
     completeness = classify_completeness(
         stop_reason=stop_reason,
         pages_visited=pages_visited,
@@ -1532,6 +1602,7 @@ def _finalize(
         page_failures=page_failures,
         budget_hit=budget_hit,
         restricted=restricted,
+        page_loads_all_confirmed=page_loads_all_confirmed,
     )
     # Enrich last pager from last page file if needed
     if pages_summary and not (completeness.get("end_page_evidence")):
@@ -1546,6 +1617,7 @@ def _finalize(
                     page_failures=page_failures,
                     budget_hit=budget_hit,
                     restricted=restricted,
+                    page_loads_all_confirmed=page_loads_all_confirmed,
                 )
             except (OSError, json.JSONDecodeError):
                 pass
@@ -1575,7 +1647,8 @@ def _finalize(
         and not page_failures,
         "note": "CONFIRMED 需到底部+空闲+分页证据；仅无新增不足",
     }
-    pagination_complete = completeness["integrity"] == "COMPLETE"
+    # "reached the end of paging" is separate from "every page fully loaded"
+    pagination_complete = bool(completeness.get("pagination_reached_end"))
     # overall: pagination + page loads + useful title rate (informational)
     if (
         pagination_complete
@@ -1616,7 +1689,8 @@ def _finalize(
             if completeness["integrity"] == "COMPLETE"
             else (
                 f"未完成范围：自 page>={checkpoint.get('next_page_to_collect')} 起可能缺失；"
-                f"stop={stop_reason}; failures={page_failures}"
+                f"stop={stop_reason}; failures={page_failures}; "
+                f"reasons={completeness.get('incomplete_reasons')}"
             )
         ),
         "close_ok": close_ok,
@@ -1706,6 +1780,59 @@ def _finalize(
         "checkpoint": checkpoint,
         "candidates": candidates,
     }
+
+
+def run_card_visibility_fixture_check() -> tuple[list[str], str]:
+    """Run EXTRACT_STATE_JS on scripts/fixtures/bsk_card_visibility_fixture.html in
+    headless Chrome (local file, no network). Returns (failures, status)."""
+    import html as _html
+    import re as _re
+    import subprocess
+    import tempfile
+
+    fixture = PROJECT_ROOT / "scripts" / "fixtures" / "bsk_card_visibility_fixture.html"
+    chrome = next(
+        (
+            c
+            for c in (
+                Path(r"C:/Program Files/Google/Chrome/Application/chrome.exe"),
+                Path(r"C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+            )
+            if c.is_file()
+        ),
+        None,
+    )
+    if chrome is None:
+        return [], "SKIPPED_NO_CHROME"
+    page = fixture.read_text(encoding="utf-8").replace(
+        "__EXTRACT_STATE_JS__", bsk_rt.EXTRACT_STATE_JS
+    )
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "cards.html"
+        f.write_text(page, encoding="utf-8")
+        proc = subprocess.run(
+            [str(chrome), "--headless=new", "--disable-gpu", "--window-size=1200,800",
+             "--virtual-time-budget=500", "--dump-dom", f.as_uri()],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+        )
+    m = _re.search(r'<pre id="out">(.*?)</pre>', proc.stdout or "", _re.S)
+    if not m or not m.group(1).strip():
+        return ["card visibility fixture produced no output"], "FAILED"
+    d = json.loads(_html.unescape(m.group(1)))
+    cs = d.get("card_stats") or {}
+    fails: list[str] = []
+    if d.get("unique_ids") != ["100001", "100002"]:
+        fails.append(f"visible-now ids must be normal + out-of-viewport only: {d.get('unique_ids')}")
+    if cs.get("visible_now") != 2:
+        fails.append(f"visible_now must be 2: {cs.get('visible_now')}")
+    if cs.get("animation_pending_ids") != ["100006"] or cs.get("animation_pending") != 1:
+        fails.append(f"only the first-frame fade-in card is animation_pending: {cs.get('animation_pending_ids')}")
+    if "100006" in (d.get("unique_ids") or []):
+        fails.append("animation_pending card must not be counted as a visible candidate")
+    reasons = cs.get("hidden_reasons") or {}
+    if cs.get("hidden_skipped") != 5 or reasons.get("opacity_low;") != 3 or reasons.get("visibility_hidden;") != 1:
+        fails.append(f"hidden cards/reasons wrong: {cs.get('hidden_skipped')} {reasons}")
+    return fails, ("OK" if not fails else "FAILED")
 
 
 def run_offline_self_checks() -> int:
@@ -2188,6 +2315,162 @@ def run_offline_self_checks() -> int:
     if r_unc["coverage"]["page_load_coverage"].get("all_confirmed"):
         failures.append("UNCONFIRMED page must not all_confirmed")
 
+    # ---- Coverage verdict regression (synthetic; reproduces collect_851578 state mix) ----
+    def _mk_page(ids, load_status, load_cov, pager):
+        def _f(page_index: int, query: str) -> dict[str, Any]:
+            real_ids = [f"{page_index}{i:03d}" for i in ids]
+            return {
+                "page": page_index,
+                "load_status": load_status[page_index],
+                "page_load_coverage": load_cov[page_index],
+                "rows": [
+                    {
+                        "product_id": pid, "jd_product_id": pid, "title": "清风 B913A 纸",
+                        "title_source": "attr_title", "result_region": "main_results",
+                        "normalized_url": f"https://item.jd.com/{pid}.html",
+                        "ad_status": "广告标识未知，不能写 false", "ad_marked": None,
+                        "position_on_page": n + 1, "discovered_at_utc": utc_iso(),
+                    }
+                    for n, pid in enumerate(real_ids)
+                ],
+                "id_fingerprint": id_set_fingerprint(real_ids),
+                "pager": pager[page_index],
+                "collected_at_utc": utc_iso(),
+            }
+        return _f
+
+    def _cov_case(tag, page_fn, max_pages):
+        res = run_collect_all(
+            query=f"coverage regression {tag}", max_pages=max_pages, search_timeout_seconds=60,
+            allow_browser=False, page_fn=page_fn, next_page_fn=fake_next,
+            business_config=PROJECT_ROOT / "config" / "products" / "b913a.json",
+        )
+        cov_json = read_json(Path(res["run_dir"]) / "coverage.json")
+        html_txt = (Path(res["run_dir"]) / "report.html").read_text(encoding="utf-8")
+        cp = read_json(Path(res["run_dir"]) / "checkpoint.json")
+        # JSON / HTML / checkpoint consistency
+        comp = cov_json["completeness"]
+        if comp["integrity"] != cp.get("integrity"):
+            failures.append(f"{tag}: checkpoint integrity != coverage integrity")
+        if f"integrity={comp['integrity']}" not in html_txt:
+            failures.append(f"{tag}: html integrity differs from coverage.json")
+        if f"pagination_complete：{cov_json['pagination_complete']}" not in html_txt:
+            failures.append(f"{tag}: html pagination_complete differs")
+        if f"overall_integrity：{cov_json['overall_integrity']}" not in html_txt:
+            failures.append(f"{tag}: html overall_integrity differs")
+        if cov_json["pagination_complete"] != comp["pagination_reached_end"]:
+            failures.append(f"{tag}: pagination_complete must equal pagination_reached_end")
+        return cov_json
+
+    NF = {"status": "NOT_FOUND", "disabled": False, "current_page_hint": None, "total_pages_hint": None, "pager_text": None}
+    # (1) 851578 mix: not scrolled to bottom + next control not found
+    c1 = _cov_case("a_not_found_unscrolled", _mk_page(range(3), {1: "PAGE_SCROLL_BUDGET"}, {1: "UNCONFIRMED_SCROLL_BUDGET"}, {1: NF}), 2)
+    if c1["completeness"]["integrity"] == "COMPLETE" or c1["pagination_complete"] or c1["overall_integrity"] != "PARTIAL":
+        failures.append(f"851578 mix must not be COMPLETE: {c1['completeness']['integrity']} {c1['overall_integrity']}")
+    if c1["completeness"]["end_page_evidence"] or c1["completeness"]["weak_end_signals"] != ["no_next_control"]:
+        failures.append("missing control must be a weak signal, not end evidence")
+    if c1["completeness"]["stop_reason"] != "NO_NEXT_CONTROL":
+        failures.append("actual stop reason must be preserved")
+    # (2) at bottom + stable + confirmed but control simply absent -> still not end
+    c2 = _cov_case("b_not_found_at_bottom", _mk_page(range(3), {1: "PAGE_LOAD_STABLE"}, {1: "CONFIRMED"}, {1: NF}), 2)
+    if c2["completeness"]["integrity"] == "COMPLETE" or c2["pagination_complete"]:
+        failures.append("control not found alone must never prove the last page")
+    # (3) positive end: found on p1, disabled + page text says last on p2
+    FOUND = {"status": "FOUND", "disabled": False, "current_page_hint": 1, "total_pages_hint": 2, "pager_text": "1 2 下一页 共2页"}
+    DIS = {"status": "DISABLED", "disabled": True, "current_page_hint": 2, "total_pages_hint": 2, "pager_text": "1 2 下一页 共2页"}
+    ok_ls = {1: "PAGE_LOAD_STABLE", 2: "PAGE_LOAD_STABLE"}
+    ok_cv = {1: "CONFIRMED", 2: "CONFIRMED"}
+    c3 = _cov_case("c_positive_end", _mk_page(range(3), ok_ls, ok_cv, {1: FOUND, 2: DIS}), 5)
+    if c3["completeness"]["integrity"] != "COMPLETE" or not c3["pagination_complete"] or c3["overall_integrity"] != "COMPLETE_EXPLAINABLE":
+        failures.append(f"explicit last page with confirmed loads should be complete: {c3['completeness']['integrity']} {c3['overall_integrity']}")
+    # (3b) reached the end but a page load unconfirmed -> end reached yet not complete
+    c3b = _cov_case("c2_end_but_unconfirmed_load", _mk_page(range(3), {1: "PAGE_SCROLL_BUDGET", 2: "PAGE_LOAD_STABLE"}, {1: "UNCONFIRMED_SCROLL_BUDGET", 2: "CONFIRMED"}, {1: FOUND, 2: DIS}), 5)
+    if not c3b["pagination_complete"] or c3b["completeness"]["integrity"] == "COMPLETE" or c3b["overall_integrity"] == "COMPLETE_EXPLAINABLE":
+        failures.append("reached end + unconfirmed page load: end reached but must not claim complete")
+    if "page_load_unconfirmed" not in c3b["completeness"]["incomplete_reasons"]:
+        failures.append("unconfirmed page load must be listed in incomplete_reasons")
+    # (4) page budget reached first
+    c4 = _cov_case("d_page_budget", _mk_page(range(3), ok_ls, ok_cv, {1: FOUND, 2: {**FOUND, "current_page_hint": 2}}), 2)
+    if c4["completeness"]["stop_reason"] != "HIT_PAGE_BUDGET" and "BUDGET" not in str(c4["completeness"]["stop_reason"]).upper():
+        failures.append(f"page budget stop reason lost: {c4['completeness']['stop_reason']}")
+    if c4["completeness"]["integrity"] == "COMPLETE" or c4["pagination_complete"] or not c4["completeness"]["budget_hit"]:
+        failures.append("page budget must not look like a natural end")
+    # (5) candidate cap truncation
+    global SAFETY_CANDIDATE_CAP
+    _cap = SAFETY_CANDIDATE_CAP
+    SAFETY_CANDIDATE_CAP = 2
+    try:
+        c5 = _cov_case("e_candidate_cap", _mk_page(range(3), ok_ls, ok_cv, {1: FOUND, 2: DIS}), 5)
+    finally:
+        SAFETY_CANDIDATE_CAP = _cap
+    if c5["completeness"]["stop_reason"] != "HIT_SAFETY_CANDIDATE_CAP" or c5["completeness"]["integrity"] == "COMPLETE" or c5["pagination_complete"]:
+        failures.append(f"candidate cap truncation must stay partial with its own stop reason: {c5['completeness']}")
+
+    # ---- BSK page actions must carry the cooperate context (synthetic client) ----
+    class _FakeBsk:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def run(self, args, *, timeout=120):
+            self.calls.append(list(args))
+            if args[:2] == ["cooperate", "sync"]:
+                return {"ok": True, "data": {"context_id": "CTX1", "observation_id": "OBS1"}}
+            if args and args[0] == "evaluate":
+                mark = {"ok": True, "selector": '[data-pr-next="1"]', "className": "n", "candidate_count": 1}
+                return {"ok": True, "data": {"value": mark if "data-pr-next" in " ".join(args) else {"ok": True}}}
+            return {"ok": True, "data": {}}
+
+    fb = _FakeBsk()
+    bsk_rt.click_next_page(fb, "S1")
+    clicks = [c for c in fb.calls if c and c[0] == "click"]
+    scrolls = [c for c in fb.calls if c and c[0] == "scroll-to"]
+    if not clicks or "--context" not in clicks[0] or "CTX1" not in clicks[0]:
+        failures.append(f"click must carry cooperate --context: {clicks}")
+    if not scrolls or "--context" not in scrolls[0]:
+        failures.append(f"scroll-to must carry cooperate --context: {scrolls}")
+    syncs_before_click = [
+        i for i, c in enumerate(fb.calls) if c[:2] == ["cooperate", "sync"]
+    ]
+    click_idx = next((i for i, c in enumerate(fb.calls) if c and c[0] == "click"), -1)
+    if not any(i < click_idx for i in syncs_before_click):
+        failures.append("a cooperate sync must precede the click")
+
+    vis_fails, vis_status = run_card_visibility_fixture_check()
+    failures.extend(vis_fails)
+    print(f"card visibility fixture: {vis_status}")
+
+    # ---- only animation-pending cards: bounded same-page recheck, no flip (synthetic) ----
+    class _PendingBsk:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def run(self, args, *, timeout=120):
+            self.calls.append(list(args))
+            if args[:2] == ["cooperate", "sync"]:
+                return {"ok": True, "data": {"context_id": "C", "observation_id": "O"}}
+            if args and args[0] == "evaluate" and "card_stats" in args[3]:
+                return {"ok": True, "data": {"value": {
+                    "cards": [], "unique_ids": [], "data_sku_count": 30,
+                    "card_stats": {"visible_now": 0, "animation_pending": 30, "hidden_skipped": 0,
+                                   "hidden_reasons": {}, "document_visibility": "hidden", "has_focus": False},
+                    "scroll_y": 2000, "scroll_max": 2000, "loading_hint": False, "pager_near_bottom": True,
+                    "next_control": {"visible": True, "disabled": False}, "pager_text": "1 2 下一页 共16页",
+                    "current_page_hint": 1, "total_pages_hint": 16,
+                    "host": "search.jd.com", "url": "https://search.jd.com/Search",
+                }}}
+            return {"ok": True, "data": {"value": {"ok": True}}}
+
+    pb = _PendingBsk()
+    pres = bsk_rt.collect_one_page_bsk(pb, "S", query="q", page_index=1, expected_page=1, log=lambda *_a, **_k: None)
+    if pres.get("rows"):
+        failures.append("animation-pending cards must not become candidate rows")
+    if len(pres.get("pending_rechecks") or []) != bsk_rt.PENDING_RECHECKS:
+        failures.append(f"pending-only page must recheck exactly {bsk_rt.PENDING_RECHECKS} times: {len(pres.get('pending_rechecks') or [])}")
+    if pres.get("animation_pending_final") != 30 or pres.get("page_load_coverage") == "CONFIRMED":
+        failures.append(f"pending page must stay unconfirmed: {pres.get('page_load_coverage')}")
+    if any(c and c[0] in {"click", "navigate", "reload"} for c in pb.calls):
+        failures.append("pending recheck must not click/navigate/reload")
+
     print("=== P5-F offline self-check ===")
     if failures:
         print(f"FAILED ({len(failures)}):")
@@ -2224,6 +2507,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--force-navigate",
         action="store_true",
         help="BSK: do not borrow an existing user search tab",
+    )
+    p.add_argument(
+        "--focus-window",
+        action="store_true",
+        help="BSK: open the Agent Window in the foreground (bsk session start --focus)",
     )
     p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
     p.add_argument(
@@ -2269,6 +2557,7 @@ def main(argv: list[str] | None = None) -> int:
             browser=args.browser,
             bsk_exe=args.bsk_exe,
             reuse_search_tab=not args.force_navigate,
+            focus_window=bool(args.focus_window),
         )
     except (ValueError, RuntimeError, FileNotFoundError, PlaywrightError) as exc:
         print(f"错误: {exc}", file=sys.stderr)

@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  Offline fixture for p5_bsk_runtime.EXTRACT_STATE_JS card visibility (synthetic, not JD).
+  The checker in p5f_collect_all_links.py replaces __EXTRACT_STATE_JS__ and runs headless Chrome.
+  Expected:
+    visible now ............ 100001 (normal), 100002 (rendered, far outside the viewport)
+    animation pending ...... 100006 (fade-in still at its first frame) -> NOT a visible candidate
+    hidden ................. 100003 display:none, 100004 visibility:hidden,
+                             100005 opacity:0 without animation,
+                             100008 fade keyframes with implicit end (unknown final opacity),
+                             100009 infinite fade (no settled state)
+-->
+<meta charset="utf-8">
+<style>
+  @keyframes slideIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: none; } }
+  @keyframes fromOnly { from { opacity: 0; } }
+  @keyframes pulse { from { opacity: 0; } to { opacity: 1; } }
+  [data-sku] { width: 200px; height: 300px; }
+</style>
+<body>
+<div class="plugin_goodsContainer">
+  <div data-sku="100001"><div title="清风擦手纸 B913A 100001">清风擦手纸 B913A 100001</div></div>
+  <div data-sku="100002" style="margin-top:5000px"><div title="清风擦手纸 B913A 100002">清风擦手纸 B913A 100002</div></div>
+  <div data-sku="100003" style="display:none"><div title="清风擦手纸 B913A 100003">清风擦手纸 B913A 100003</div></div>
+  <div data-sku="100004" style="visibility:hidden"><div title="清风擦手纸 B913A 100004">清风擦手纸 B913A 100004</div></div>
+  <div data-sku="100005" style="opacity:0"><div title="清风擦手纸 B913A 100005">清风擦手纸 B913A 100005</div></div>
+  <div data-sku="100006" style="animation:slideIn 1000s linear"><div title="清风擦手纸 B913A 100006">清风擦手纸 B913A 100006</div></div>
+  <div data-sku="100008" style="opacity:0;animation:fromOnly 1000s linear"><div title="清风擦手纸 B913A 100008">清风擦手纸 B913A 100008</div></div>
+  <div data-sku="100009" style="animation:pulse 1000s linear infinite"><div title="清风擦手纸 B913A 100009">清风擦手纸 B913A 100009</div></div>
+</div>
+<div style="height:3000px"></div>
+<pre id="out"></pre>
+<script>
+  setTimeout(function () {
+    window.scrollTo(0, 4000);
+    document.getElementById("out").textContent = JSON.stringify(__EXTRACT_STATE_JS__);
+  }, 50);
+</script>
+</body>

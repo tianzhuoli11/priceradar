@@ -238,6 +238,20 @@ def aggregate_batch(
                 "candidates_found": summary.get("candidates_found"),
                 "detail_pages_opened": summary.get("detail_pages_opened"),
                 "not_verified_budget": summary.get("not_verified_budget"),
+                "sku_job_id": ir.get("sku_job_id"),
+                "coverage_status": (
+                    "PAUSED_RESUMABLE"
+                    if status == "PAUSED_SESSION"
+                    else "NOT_STARTED"
+                    if status == "PAUSED_UNSTARTED"
+                    else "PARTIAL_BUDGET"
+                    if status == "DONE" and int(summary.get("not_verified_budget") or 0) > 0
+                    else "ALL_VERIFIED"
+                    if status == "DONE" and summary.get("all_verified")
+                    else "PARTIAL_OR_UNKNOWN"
+                    if status == "DONE"
+                    else status
+                ),
                 "products_possible_break": summary.get("products_possible_break"),
                 "products_primary_low_price_signal": summary.get(
                     "products_primary_low_price_signal"
@@ -270,10 +284,10 @@ def aggregate_batch(
     n_valid = parse_result.get("counts", {}).get("valid", 0)
     done = sum(1 for s in sku_summaries if s["status"] == "DONE")
     failed = sum(1 for s in sku_summaries if s["status"] == "FAILED")
-    paused = sum(
-        1
-        for s in sku_summaries
-        if s["status"] in {"PAUSED_UNSTARTED", "PAUSED_SESSION"}
+    paused = sum(1 for s in sku_summaries if s["status"] == "PAUSED_UNSTARTED")
+    paused_session = sum(1 for s in sku_summaries if s["status"] == "PAUSED_SESSION")
+    partial_budget = sum(
+        1 for s in sku_summaries if s.get("coverage_status") == "PARTIAL_BUDGET"
     )
     interrupted = sum(1 for s in sku_summaries if s["status"] == "INTERRUPTED")
     pending = sum(1 for s in sku_summaries if s["status"] == "PENDING")
@@ -294,9 +308,46 @@ def aggregate_batch(
     detail_opens = sum(int(s.get("detail_pages_opened") or 0) for s in sku_summaries)
     candidates_total = sum(int(s.get("candidates_found") or 0) for s in sku_summaries)
 
+    # Product-level mutually exclusive buckets (each row counted exactly once).
+    _not_visited = {
+        p5b.STATUS_NOT_VERIFIED_BUDGET,
+        p5b.STATUS_NOT_VISITED_BUDGET,
+        "PAUSED_BEFORE_VISIT",
+        "NOT_VISITED",
+    }
+    prod_buckets = {
+        "not_visited": 0,
+        "classification_skipped": 0,
+        "execution_failed": 0,
+        "comparable": 0,
+        "review_required": 0,
+    }
+    seen_keys: set[tuple[str, str]] = set()
+    duplicate_rows = 0
+    for r in product_rows:
+        key = (str(r.get("item_id")), str(r.get("jd_product_id")))
+        if key in seen_keys:
+            duplicate_rows += 1
+        seen_keys.add(key)
+        ms = str(r.get("match_status") or "")
+        if ms in _not_visited or str(r.get("execution_status") or "") in (
+            _not_visited | {"NOT_VISITED_SESSION_PAUSE"}
+        ):
+            prod_buckets["not_visited"] += 1
+        elif ms == "MODEL_MISMATCH_SKIPPED":
+            prod_buckets["classification_skipped"] += 1
+        elif "FAILED" in (str(r.get("execution_status")), str(r.get("task_status"))):
+            prod_buckets["execution_failed"] += 1
+        elif r.get("lowest_observed_take_home_price") not in (None, ""):
+            prod_buckets["comparable"] += 1
+        else:
+            prod_buckets["review_required"] += 1
+
     return {
         "batch_id": batch_id,
         "rules_version": RULES_VERSION,
+        "product_buckets": prod_buckets,
+        "product_duplicate_rows": duplicate_rows,
         "sku_summaries": sku_summaries,
         "product_rows": product_rows,
         "price_options": price_options,
@@ -307,6 +358,8 @@ def aggregate_batch(
             "sku_done": done,
             "sku_failed": failed,
             "sku_paused_unstarted": paused,
+            "sku_paused_session_resumable": paused_session,
+            "sku_done_partial_budget": partial_budget,
             "sku_interrupted": interrupted,
             "sku_pending": pending,
             "candidates_total": candidates_total,
@@ -315,7 +368,8 @@ def aggregate_batch(
             "products_primary_low_price_signal_total": primary_low,
             "business_review_skus_among_done": business_review_skus,
             "stat_notes": [
-                "sku_done/failed/paused/interrupted/pending 为流程状态，互斥可相加≈valid_skus",
+                "sku_done/failed/paused_unstarted/paused_session_resumable/interrupted/pending 为流程状态，互斥可相加≈valid_skus",
+                "sku_done_partial_budget 是 sku_done 的子集：已完成流程但预算内未核验完候选（部分覆盖）",
                 "business_review_skus_among_done 是业务待核验（子集），不要与 sku_done 相加",
                 "products_possible_break 与 primary_low 按商品计数，跨SKU仅求和展示，最低价不跨SKU",
             ],
@@ -366,6 +420,8 @@ th{{background:#f5f5f5}}
 <li>输入有效SKU：{esc(str(st.get('valid_skus')))}</li>
 <li>流程：完成 {esc(str(st.get('sku_done')))} / 失败 {esc(str(st.get('sku_failed')))} /
 暂停未执行 {esc(str(st.get('sku_paused_unstarted')))} /
+暂停可恢复 {esc(str(st.get('sku_paused_session_resumable')))} /
+完成但部分覆盖 {esc(str(st.get('sku_done_partial_budget')))} /
 中断 {esc(str(st.get('sku_interrupted')))} / 待办 {esc(str(st.get('sku_pending')))}</li>
 <li>候选总数：{esc(str(st.get('candidates_total')))} · 详情访问：{esc(str(st.get('detail_pages_opened_total')))}</li>
 <li>疑似破价商品数：{esc(str(st.get('products_possible_break_total')))}</li>
@@ -377,7 +433,7 @@ th{{background:#f5f5f5}}
  pause={esc(str(agg.get('pause_reason')))}</p>
 </div>
 <div class="card"><h2>SKU汇总（最低价不跨SKU）</h2>
-{table(rows, ['item_id','business_sku','status','candidates_found','detail_pages_opened','products_possible_break','products_primary_low_price_signal','lowest_comparable_take_home','lowest_conditions','evidence_captured_at_utc','error'])}
+{table(rows, ['item_id','business_sku','status','coverage_status','sku_job_id','candidates_found','not_verified_budget','detail_pages_opened','products_possible_break','products_primary_low_price_signal','lowest_comparable_take_home','lowest_conditions','evidence_captured_at_utc','error'])}
 </div>
 <div class="card"><h2>输入错误</h2>
 {table(agg.get('input_errors') or [], ['excel_row','raw_sku','errors'])}
@@ -493,6 +549,67 @@ def run_validate_only(excel_path: Path, out_dir: Path | None = None) -> dict[str
     }
 
 
+def _row_is_session_pause(r: dict[str, Any]) -> bool:
+    return (
+        r.get("match_status") in p5b.SESSION_PAUSE_MATCH
+        or r.get("execution_status") == p5b.SESSION_PAUSE_TASK
+    )
+
+
+def prepare_resume_checkpoint(batch_dir: Path, checkpoint: dict[str, Any]) -> list[str]:
+    """
+    Validate a checkpoint before resuming. Never writes to disk.
+
+    - New format: PAUSED_SESSION items carry sku_job_id/sku_job_dir (checked later).
+    - Legacy format (pause recorded on the batch, current SKU marked DONE): re-label the
+      current SKU PAUSED_SESSION only if its sub-job can be located reliably from the
+      recorded sku_job_dir/job_progress.json; otherwise refuse (no silent skip).
+    Returns notes about in-memory migrations.
+    """
+    notes: list[str] = []
+    prior_path = batch_dir / "item_results.json"
+    prior_by_id: dict[str, dict[str, Any]] = {}
+    if prior_path.exists():
+        try:
+            for row in read_json(prior_path):
+                prior_by_id[row["item"]["item_id"]] = row
+        except (OSError, json.JSONDecodeError, KeyError):
+            prior_by_id = {}
+    for ci in checkpoint.get("items") or []:
+        if ci.get("status") != "DONE" or ci.get("sku_job_id"):
+            continue
+        prior = prior_by_id.get(ci.get("item_id")) or {}
+        summ = prior.get("sku_summary") or {}
+        paused_evidence = (
+            int(summ.get("candidates_paused_unvisited") or 0) > 0
+            or any(_row_is_session_pause(r) for r in (prior.get("product_rows") or []))
+        )
+        job_dir = Path(ci.get("sku_job_dir") or "")
+        prog_path = job_dir / "job_progress.json"
+        if prog_path.is_file():
+            try:
+                prog = read_json(prog_path)
+            except (OSError, json.JSONDecodeError):
+                prog = {}
+            if prog.get("session_paused"):
+                paused_evidence = True
+        else:
+            prog = {}
+        if not paused_evidence:
+            continue
+        if not prog.get("job_id") or not (job_dir / "search" / "candidates.json").is_file():
+            raise RuntimeError(
+                f"旧 checkpoint 无法安全恢复：SKU {ci.get('business_sku')}（{ci.get('item_id')}）"
+                "曾因会话暂停而被标为 DONE，但找不到可用的子任务进度/候选文件；"
+                "未改动任何进度文件，请人工处理或新建批次，不会静默跳过该 SKU"
+            )
+        ci["status"] = "PAUSED_SESSION"
+        ci["sku_job_id"] = prog["job_id"]
+        ci["pause_reason"] = prog.get("pause_reason") or checkpoint.get("pause_reason")
+        notes.append(f"legacy item {ci.get('item_id')} -> PAUSED_SESSION job_id={prog['job_id']}")
+    return notes
+
+
 def run_batch(
     *,
     excel_path: Path,
@@ -505,6 +622,10 @@ def run_batch(
     search_fn: Callable[..., dict[str, Any]] | None = None,
     verify_fn: Callable[..., dict[str, Any]] | None = None,
     allow_browser: bool = True,
+    backend: str | None = None,
+    bsk_browser: str | None = None,
+    model_scope_policy: Path | None = None,
+    focus_window: bool = False,
 ) -> dict[str, Any]:
     excel_path = Path(excel_path).resolve()
     parsed = excel_in.parse_batch_excel(excel_path)
@@ -537,6 +658,7 @@ def run_batch(
                 f"current={RULES_VERSION}），请新建批次"
             )
         batch_id = resume_batch_id
+        prepare_resume_checkpoint(batch_dir, checkpoint)  # raises, writes nothing
         # rebuild item list from checkpoint order + current parse by sku
         by_sku = {it["business_sku"]: it for it in parsed["valid_items"]}
         items: list[dict[str, Any]] = []
@@ -644,11 +766,62 @@ def run_batch(
                     f"item {item_id} 业务配置指纹变更，拒绝恢复混用；请新建批次"
                 )
 
-            # New attempt directory for interrupted retries
-            attempt = int(cp_item.get("attempt") or 0) + 1
-            sku_job_dir = item_dir / f"attempt_{attempt:02d}"
-            if sku_job_dir.exists():
-                sku_job_dir = item_dir / f"attempt_{attempt:02d}_{secrets.token_hex(2)}"
+            # Paused sub-job: resume the SAME sku job (no re-search, no re-create)
+            resume_sku_job_id = None
+            prior_item_opens = 0
+            if cp_item.get("status") == "PAUSED_SESSION" and cp_item.get("sku_job_id"):
+                _jd = Path(cp_item.get("sku_job_dir") or "")
+                if not (_jd / "job_progress.json").is_file() or not (
+                    _jd / "search" / "candidates.json"
+                ).is_file():
+                    raise RuntimeError(
+                        f"item {item_id} 的暂停子任务目录/进度缺失，不能安全恢复；"
+                        "未改动进度，请人工处理（不会跳过该 SKU）"
+                    )
+                resume_sku_job_id = str(cp_item["sku_job_id"])
+                sku_job_dir = _jd
+                attempt = int(cp_item.get("attempt") or 1)
+                prior_item_opens = int(
+                    read_json(_jd / "job_progress.json").get("detail_pages_opened") or 0
+                )
+                detail_used_total += prior_item_opens
+                if detail_used_total >= int(budgets["max_verify_total"]):
+                    # whole-batch budget already consumed: stay paused, do not navigate
+                    cp_item["status"] = "PAUSED_SESSION"
+                    cp_item["error"] = (
+                        f"整批详情预算耗尽 max_verify_total={budgets['max_verify_total']}；"
+                        "当前 SKU 保持暂停（部分覆盖）"
+                    )
+                    checkpoint["status"] = "PAUSED_SESSION"
+                    checkpoint["pause_reason"] = "BATCH_DETAIL_BUDGET"
+                    item_results.append(
+                        {
+                            "item": item,
+                            "status": "PAUSED_SESSION",
+                            "sku_job_dir": str(sku_job_dir),
+                            "sku_job_id": resume_sku_job_id,
+                            "sku_summary": {},
+                            "product_rows": [],
+                            "price_options": [],
+                            "evidence_captured_at_utc": None,
+                            "error": cp_item["error"],
+                        }
+                    )
+                    save_checkpoint(batch_dir, checkpoint)
+                    for j in range(idx + 1, len(items)):
+                        if checkpoint["items"][j]["status"] in {"PENDING", "RUNNING"}:
+                            checkpoint["items"][j]["status"] = "PAUSED_UNSTARTED"
+                    save_checkpoint(batch_dir, checkpoint)
+                    break
+            elif cp_item.get("status") == "PAUSED_SESSION" and cp_item.get("sku_job_dir"):
+                # search-phase pause with no candidates yet: nothing to resume, new attempt
+                pass
+            if resume_sku_job_id is None:
+                # New attempt directory for interrupted retries
+                attempt = int(cp_item.get("attempt") or 0) + 1
+                sku_job_dir = item_dir / f"attempt_{attempt:02d}"
+                if sku_job_dir.exists():
+                    sku_job_dir = item_dir / f"attempt_{attempt:02d}_{secrets.token_hex(2)}"
 
             cp_item["status"] = "RUNNING"
             cp_item["attempt"] = attempt
@@ -669,6 +842,11 @@ def run_batch(
                     raise RuntimeError(
                         "allow_browser=False 且未注入 search_fn；离线模式需要注入"
                     )
+                _job_kw: dict[str, Any] = (
+                    {"resume_job_id": resume_sku_job_id}
+                    if resume_sku_job_id
+                    else {"job_id": f"{batch_id}_{item_id}"}
+                )
                 result = p5b.run_sku_job(
                     business_config=cfg_path,
                     query=item.get("search_query"),
@@ -681,7 +859,11 @@ def run_batch(
                     search_fn=search_fn,
                     verify_fn=verify_fn,
                     job_dir=sku_job_dir,
-                    job_id=f"{batch_id}_{item_id}",
+                    **_job_kw,
+                    backend=backend,
+                    bsk_browser=bsk_browser,
+                    model_scope_policy=model_scope_policy,
+                    focus_window=focus_window,
                 )
                 summary = result.get("summary") or {}
                 # Restore manual overrides if any
@@ -697,24 +879,41 @@ def run_batch(
 
                 evidence_time = summary.get("ended_at_utc") or utc_iso()
                 status = "DONE"
+                item_paused = False
                 search_status = (result.get("search_result") or {}).get("run_status")
+                pause_why = None
                 if search_status in p5b.SEARCH_BLOCK_STATUSES:
+                    item_paused = True
+                    pause_why = search_status
+                # A visited candidate that hit login/captcha/rate-limit pauses the
+                # whole batch even if no unvisited candidates remain in this SKU.
+                if not item_paused and (
+                    int(summary.get("candidates_paused_unvisited") or 0) > 0
+                    or summary.get("session_paused")
+                    or any(_row_is_session_pause(r) for r in (result.get("product_rows") or []))
+                ):
+                    item_paused = True
+                    for r in result.get("product_rows") or []:
+                        if _row_is_session_pause(r):
+                            pause_why = r.get("match_status")
+                            break
+                    pause_why = pause_why or "SESSION_PAUSED"
+                if item_paused:
+                    # Current SKU stays resumable: NOT done; later SKUs stay unstarted.
+                    status = "PAUSED_SESSION"
                     checkpoint["status"] = "PAUSED_SESSION"
-                    checkpoint["pause_reason"] = search_status
-                    status = "DONE"  # this item finished with restricted search
-                # Also pause if verify paused remaining inside sku job
-                if int(summary.get("candidates_paused_unvisited") or 0) > 0:
-                    if checkpoint.get("status") != "PAUSED_SESSION":
-                        for r in result.get("product_rows") or []:
-                            if r.get("match_status") in p5b.SESSION_PAUSE_MATCH:
-                                checkpoint["status"] = "PAUSED_SESSION"
-                                checkpoint["pause_reason"] = r.get("match_status")
-                                break
+                    checkpoint["pause_reason"] = pause_why
+                    cp_item["pause_reason"] = pause_why
+                    cp_item["sku_job_id"] = str(
+                        result.get("job_id") or resume_sku_job_id or f"{batch_id}_{item_id}"
+                    )
 
-                detail_used_total += int(summary.get("detail_pages_opened") or 0)
+                # summary opens are cumulative for a resumed sub-job
+                detail_used_total += int(summary.get("detail_pages_opened") or 0) - prior_item_opens
                 ir = {
                     "item": item,
                     "status": status,
+                    "sku_job_id": cp_item.get("sku_job_id"),
                     "sku_job_dir": str(sku_job_dir),
                     "sku_summary": summary,
                     "product_rows": result.get("product_rows") or [],
@@ -726,6 +925,8 @@ def run_batch(
                 item_results.append(ir)
                 cp_item["status"] = status
                 cp_item["ended_at_utc"] = utc_iso()
+                if status == "DONE":
+                    cp_item["pause_reason"] = None
                 cp_item["evidence_captured_at_utc"] = evidence_time
                 cp_item["summary_excerpt"] = {
                     "candidates_found": summary.get("candidates_found"),
@@ -992,6 +1193,7 @@ def run_offline_self_checks() -> int:
         }
 
     batch1 = run_batch(
+        backend="p2d",
         excel_path=offline_xlsx,
         max_candidates=3,
         max_pages=1,
@@ -1041,6 +1243,7 @@ def run_offline_self_checks() -> int:
         }
 
     batch2 = run_batch(
+        backend="p2d",
         excel_path=offline_xlsx,
         max_verify=1,
         max_verify_total=5,
@@ -1060,6 +1263,7 @@ def run_offline_self_checks() -> int:
     # Resume fingerprint change rejection
     try:
         run_batch(
+            backend="p2d",
             excel_path=tpl,  # different fingerprint (only 1 valid)
             resume_batch_id=batch1["batch_id"],
             search_fn=fake_search,
@@ -1073,6 +1277,7 @@ def run_offline_self_checks() -> int:
     # DONE items not re-run on resume of batch1
     calls.clear()
     batch1_resume = run_batch(
+        backend="p2d",
         excel_path=offline_xlsx,
         resume_batch_id=batch1["batch_id"],
         search_fn=fake_search,
@@ -1085,6 +1290,268 @@ def run_offline_self_checks() -> int:
     for ir in read_json(Path(batch1["batch_dir"]) / "item_results.json"):
         if ir.get("status") == "DONE" and not ir.get("evidence_captured_at_utc"):
             failures.append("evidence time missing on done item")
+
+    # product-level buckets: exclusive, no duplicate rows (synthetic)
+    pb = agg.get("product_buckets") or {}
+    if sum(pb.values()) != len(agg["product_rows"]):
+        failures.append(f"product_buckets must partition rows: {pb} vs {len(agg['product_rows'])}")
+    if agg.get("product_duplicate_rows"):
+        failures.append("duplicate (item_id, product_id) rows in aggregate")
+    _mk = lambda item, pid, ms, ex, low=None: {  # noqa: E731
+        "item_id": item, "jd_product_id": pid, "match_status": ms,
+        "execution_status": ex, "task_status": ex, "lowest_observed_take_home_price": low,
+    }
+    _it = {"item_id": "i1", "business_sku": "SYNTH", "excel_row": 2}
+    _agg = aggregate_batch(
+        batch_id="synthetic_unit",
+        checkpoint={"status": "DONE"},
+        item_results=[{
+            "item": _it, "status": "DONE", "sku_summary": {}, "price_options": [],
+            "product_rows": [
+                _mk("i1", "1", "PACKAGING_PASSED", "COMPLETED", "120.00"),
+                _mk("i1", "2", "PACKAGING_PASSED", "COMPLETED"),
+                _mk("i1", "3", "OCR_FAILED", "FAILED"),
+                _mk("i1", "4", "NOT_VERIFIED_BUDGET", "NOT_VISITED_BUDGET"),
+                _mk("i1", "5", "PAUSED_BEFORE_VISIT", "NOT_VISITED_SESSION_PAUSE"),
+                _mk("i1", "6", "MODEL_MISMATCH_SKIPPED", "CLASSIFICATION_SKIPPED"),
+                _mk("i1", "2", "PACKAGING_PASSED", "COMPLETED"),
+            ],
+        }],
+        parse_result={"counts": {"valid": 1, "rejected": 0, "skipped": 0}},
+    )
+    if _agg["product_buckets"] != {
+        "not_visited": 2, "classification_skipped": 1, "execution_failed": 1,
+        "comparable": 1, "review_required": 2,
+    } or _agg["product_duplicate_rows"] != 1:
+        failures.append(f"synthetic bucket unit wrong: {_agg['product_buckets']} dup={_agg['product_duplicate_rows']}")
+
+    # Verify-level session pause: no further navigation; resume skips finished items
+    pause_calls: list[str] = []
+    pause_state = {"fired": False}
+
+    def fake_verify_pause_once(**kwargs):
+        pid = str(kwargs["product_id"])
+        pause_calls.append(pid)
+        if not pause_state["fired"]:
+            pause_state["fired"] = True
+            out = Path(kwargs["out_dir"])
+            out.mkdir(parents=True, exist_ok=True)
+            return {
+                "task_status": "PAUSED_SESSION",
+                "match_status": "VERIFICATION_REQUIRED",
+                "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                "system_verdict_zh": "会话暂停",
+                "manual_verdict": None,
+                "price_clues": [],
+                "ended_at_utc": utc_iso(),
+                "verify_dir": str(out),
+                "candidate": {"product_id": pid, "title": "x"},
+            }
+        return fake_verify(**kwargs)
+
+    batch_p = run_batch(
+        backend="p2d",
+        excel_path=offline_xlsx,
+        max_verify=3,
+        max_verify_total=10,
+        search_fn=fake_search,
+        verify_fn=fake_verify_pause_once,
+        allow_browser=False,
+    )
+    if len(pause_calls) != 1:
+        failures.append(f"after verify-level pause no more navigation expected, calls={pause_calls}")
+    cp_p = batch_p["checkpoint"]
+    if cp_p.get("status") != "PAUSED_SESSION":
+        failures.append("verify-level pause should pause batch")
+    if not any(it["status"] == "PAUSED_UNSTARTED" for it in cp_p["items"]):
+        failures.append("second SKU must be PAUSED_UNSTARTED after verify pause")
+    agg_p = batch_p["aggregate"]
+    if (
+        agg_p["stats"].get("sku_paused_unstarted") != 1
+        or agg_p["stats"].get("sku_paused_session_resumable") != 1
+        or agg_p["stats"].get("sku_done") != 0
+    ):
+        failures.append(
+            f"paused SKU must stay resumable (not DONE) and next SKU unstarted: {agg_p['stats']}"
+        )
+    item1_cp = cp_p["items"][0]
+    if item1_cp.get("status") != "PAUSED_SESSION" or not item1_cp.get("sku_job_id") or not item1_cp.get("pause_reason"):
+        failures.append(f"checkpoint must record paused SKU job id/reason: {item1_cp}")
+    if agg_p.get("product_duplicate_rows"):
+        failures.append("duplicate rows after pause")
+
+
+    # ---- Two-SKU pause / same-subjob resume (synthetic; NOT live evidence) ----
+    def _mk_scenario(pause_plan):
+        """pause_plan: list of product ids (in order of calls) at which verify pauses once each."""
+        log: dict[str, Any] = {"search": 0, "calls": [], "pauses": list(pause_plan)}
+
+        def s_search(query, max_candidates=None, **kwargs):
+            log["search"] += 1
+            base = 1000 * log["search"]
+            out = Path(kwargs["out_dir"])
+            cands = [
+                {
+                    "query": query,
+                    "rank": i,
+                    "title": f"清风 {"B913A" if log["search"] == 1 else "TEST_SYNTH_BATCH"} SYNTH {base + i}",
+                    "product_id": str(base + i),
+                    "shop_name": "店",
+                    "ad_marked": False,
+                    "normalized_url": f"https://item.jd.com/{base + i}.html",
+                    "observed_url": f"https://item.jd.com/{base + i}.html",
+                }
+                for i in range(1, 4)
+            ]
+            p5b.p3a.write_candidates_json(out / "candidates.json", cands)
+            meta = {
+                "run_status": "SUCCESS",
+                "candidate_count": 3,
+                "unique_candidates_collected": 3,
+                "coverage_stop_reason": "HIT_CANDIDATE_LIMIT",
+                "query": query,
+                "extract_stats": {},
+                "scroll": {},
+            }
+            p5b.p3a.write_metadata(out / "run_metadata.json", meta)
+            return {
+                "ok": True, "exit_code": 0, "run_id": out.name, "out_dir": out,
+                "candidates_path": out / "candidates.json", "candidates": cands,
+                "run_status": "SUCCESS", "coverage_stop_reason": "HIT_CANDIDATE_LIMIT",
+                "metadata": meta, "close_ok": True,
+            }
+
+        def s_verify(**kwargs):
+            pid = str(kwargs["product_id"])
+            log["calls"].append(pid)
+            if log["pauses"] and log["pauses"][0] == pid:
+                log["pauses"].pop(0)
+                out = Path(kwargs["out_dir"])
+                out.mkdir(parents=True, exist_ok=True)
+                return {
+                    "task_status": "PAUSED_SESSION",
+                    "match_status": "RATE_LIMITED",
+                    "system_verdict": take_home.SYSTEM_REVIEW_REQUIRED,
+                    "system_verdict_zh": "会话暂停",
+                    "manual_verdict": None,
+                    "price_clues": [],
+                    "ended_at_utc": utc_iso(),
+                    "verify_dir": str(out),
+                    "candidate": {"product_id": pid, "title": "x"},
+                }
+            return fake_verify(**kwargs)
+
+        return log, s_search, s_verify
+
+    def _batch(resume_id, s_search, s_verify, **kw):
+        return run_batch(
+            backend="p2d",
+            excel_path=offline_xlsx,
+            max_candidates=3,
+            max_pages=1,
+            max_verify=kw.get("max_verify", 3),
+            max_verify_total=kw.get("max_verify_total", 20),
+            resume_batch_id=resume_id,
+            search_fn=s_search,
+            verify_fn=s_verify,
+            allow_browser=False,
+        )
+
+    # Scenario A: SKU1 completes a1 then pauses at a2; resume pauses again at a2; resume completes
+    logA, sA, vA = _mk_scenario(["1002", "1002"])
+    bA = _batch(None, sA, vA)
+    if logA["calls"] != ["1001", "1002"]:
+        failures.append(f"scenarioA first run calls should be [1001,1002], got {logA['calls']}")
+    if any(c.startswith("2") for c in logA["calls"]):
+        failures.append("scenarioA: SKU2 must have zero navigation while SKU1 paused")
+    cpA = bA["checkpoint"]
+    if [i["status"] for i in cpA["items"]] != ["PAUSED_SESSION", "PAUSED_UNSTARTED"]:
+        failures.append(f"scenarioA: item states after pause: {[i['status'] for i in cpA['items']]}")
+    jobA = cpA["items"][0].get("sku_job_id")
+    dirA = cpA["items"][0].get("sku_job_dir")
+    logA["calls"].clear()
+    bA2 = _batch(bA["batch_id"], sA, vA)
+    if logA["calls"] != ["1002"]:
+        failures.append(f"scenarioA resume#1 should only retry the paused candidate 1002, got {logA['calls']}")
+    cpA2 = bA2["checkpoint"]
+    if [i["status"] for i in cpA2["items"]] != ["PAUSED_SESSION", "PAUSED_UNSTARTED"]:
+        failures.append("scenarioA: second pause must keep SKU2 unstarted")
+    if cpA2["items"][0].get("sku_job_id") != jobA or cpA2["items"][0].get("sku_job_dir") != dirA:
+        failures.append("scenarioA: resume must reuse the same sub-job id/dir")
+    logA["calls"].clear()
+    bA3 = _batch(bA["batch_id"], sA, vA)
+    if logA["calls"] != ["1002", "1003", "2001", "2002", "2003"]:
+        failures.append(f"scenarioA final resume order wrong: {logA['calls']}")
+    if "1001" in logA["calls"]:
+        failures.append("scenarioA: completed candidate 1001 must not be re-fetched")
+    if logA["search"] != 2:
+        failures.append(f"scenarioA: no re-search on resume (searches={logA['search']})")
+    if bA3["checkpoint"]["status"] != "DONE" or [i["status"] for i in bA3["checkpoint"]["items"]] != ["DONE", "DONE"]:
+        failures.append("scenarioA: both SKUs DONE after final resume")
+    prodA = bA3["aggregate"]["product_rows"]
+    if len({(r["item_id"], r["jd_product_id"]) for r in prodA}) != len(prodA):
+        failures.append("scenarioA: duplicate product rows after resume")
+    if bA3["aggregate"].get("product_duplicate_rows"):
+        failures.append("scenarioA: aggregate reports duplicate rows")
+
+    # Scenario B: pause on the LAST candidate of SKU1 must still stop the batch
+    logB, sB, vB = _mk_scenario(["1003"])
+    bB = _batch(None, sB, vB)
+    if logB["calls"] != ["1001", "1002", "1003"] or any(c.startswith("2") for c in logB["calls"]):
+        failures.append(f"scenarioB: last-candidate pause must stop before SKU2: {logB['calls']}")
+    if [i["status"] for i in bB["checkpoint"]["items"]] != ["PAUSED_SESSION", "PAUSED_UNSTARTED"]:
+        failures.append("scenarioB: item states after last-candidate pause")
+    logB["calls"].clear()
+    bB2 = _batch(bB["batch_id"], sB, vB)
+    if logB["calls"] != ["1003", "2001", "2002", "2003"]:
+        failures.append(f"scenarioB: resume should redo only 1003 then SKU2: {logB['calls']}")
+
+    # Scenario C: budget exhaustion keeps partial coverage visible (not "all verified")
+    logC, sC, vC = _mk_scenario([])
+    bC = _batch(None, sC, vC, max_verify=1)
+    covC = {r["item_id"]: r.get("coverage_status") for r in bC["aggregate"]["sku_summaries"]}
+    if set(covC.values()) != {"PARTIAL_BUDGET"}:
+        failures.append(f"scenarioC: budget-limited SKUs must show PARTIAL_BUDGET: {covC}")
+    if not bC["aggregate"]["stats"].get("sku_done_partial_budget"):
+        failures.append("scenarioC: stats must count partial-budget SKUs")
+
+    # Scenario D: legacy checkpoint (paused SKU recorded as DONE) -> migrate or refuse, never skip
+    logD, sD, vD = _mk_scenario(["1002"])
+    bD = _batch(None, sD, vD)
+    cp_path = Path(bD["batch_dir"]) / "checkpoint.json"
+    legacy = read_json(cp_path)
+    legacy["items"][0]["status"] = "DONE"
+    legacy["items"][0].pop("sku_job_id", None)
+    legacy["status"] = "PAUSED_SESSION"
+    write_json_atomic(cp_path, legacy)
+    results_path = Path(bD["batch_dir"]) / "item_results.json"
+    item_results_old = read_json(results_path)
+    for r in item_results_old:
+        if r["item"]["item_id"] == legacy["items"][0]["item_id"]:
+            r["status"] = "DONE"
+    write_json_atomic(results_path, item_results_old)
+    logD["calls"].clear()
+    _batch(bD["batch_id"], sD, vD)
+    if logD["calls"][:1] != ["1002"]:
+        failures.append(f"scenarioD: legacy paused SKU must be resumed first, got {logD['calls']}")
+    # unsafe legacy: candidates file missing -> refuse, files untouched
+    logE, sE, vE = _mk_scenario(["1002"])
+    bE = _batch(None, sE, vE)
+    cp_pathE = Path(bE["batch_dir"]) / "checkpoint.json"
+    legacyE = read_json(cp_pathE)
+    legacyE["items"][0]["status"] = "DONE"
+    legacyE["items"][0].pop("sku_job_id", None)
+    write_json_atomic(cp_pathE, legacyE)
+    (Path(legacyE["items"][0]["sku_job_dir"]) / "search" / "candidates.json").unlink()
+    before_bytes = cp_pathE.read_bytes()
+    try:
+        _batch(bE["batch_id"], sE, vE)
+        failures.append("scenarioE: unsafe legacy checkpoint must refuse resume")
+    except RuntimeError as exc:
+        if "无法安全恢复" not in str(exc):
+            failures.append(f"scenarioE: wrong refusal text: {exc}")
+    if cp_pathE.read_bytes() != before_bytes:
+        failures.append("scenarioE: refusal must not modify checkpoint")
 
     # Total budget
     def fake_search_many(query, max_candidates=None, **kwargs):
@@ -1127,6 +1594,7 @@ def run_offline_self_checks() -> int:
         }
 
     batch3 = run_batch(
+        backend="p2d",
         excel_path=offline_xlsx,
         max_verify=2,
         max_verify_total=2,  # first sku consumes 2, second paused
@@ -1144,6 +1612,34 @@ def run_offline_self_checks() -> int:
     v = run_validate_only(tpl, out_dir=tmp / "validate_out")
     if not v.get("ok"):
         failures.append("validate-only should succeed for template")
+
+    # ---- focus_window reaches the search call; default stays background (synthetic) ----
+    seen_focus: list[Any] = []
+
+    def focus_search(query, **kwargs):
+        seen_focus.append(kwargs.get("focus_window"))
+        return fake_search(query, **kwargs)
+
+    for want in (True, False):
+        seen_focus.clear()
+        run_batch(
+            backend="p2d", excel_path=offline_xlsx, max_verify=1, max_verify_total=4,
+            search_fn=focus_search, verify_fn=fake_verify, allow_browser=False,
+            **({"focus_window": True} if want else {}),
+        )
+        if not seen_focus or any(v is not want for v in seen_focus):
+            failures.append(f"focus_window={want} must reach every SKU search call: {seen_focus}")
+
+    # ---- B913A OTHER authorization must not apply to another SKU ----
+    _pol_path = PROJECT_ROOT / "config" / "policies" / "b913a_model_scope_include_other_20261027.json"
+    if _pol_path.is_file():
+        _pol = read_json(_pol_path)
+        _gate = {"classification": "OTHER_MODEL", "skip_browse": True}
+        _p5a = p5b.p5a
+        own = _p5a.model_scope_allows_title_browse(_pol, gate=_gate, business_sku="B913A")
+        other = _p5a.model_scope_allows_title_browse(_pol, gate=_gate, business_sku="SECOND_SKU")
+        if not own.get("allowed") or other.get("allowed") or other.get("reason") != "policy_sku_mismatch":
+            failures.append(f"OTHER policy must be SKU-scoped: own={own.get('reason')} other={other.get('reason')}")
 
     print("=== P5-D offline self-check ===")
     if failures:
@@ -1180,6 +1676,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Whole-batch detail visit budget",
     )
+    p.add_argument("--backend", choices=["p2d", "bsk"], default=None,
+                   help="Required for live runs (no silent backend switching)")
+    p.add_argument("--bsk-browser", default=None)
+    p.add_argument(
+        "--focus-window",
+        action="store_true",
+        help="BSK live-search: open the Agent Window in the foreground (default: background)",
+    )
+    p.add_argument("--model-scope-policy", type=Path, default=None)
     p.add_argument("--self-check", action="store_true")
     return p.parse_args(argv)
 
@@ -1219,6 +1724,10 @@ def main(argv: list[str] | None = None) -> int:
             max_verify_total=args.max_verify_total,
             resume_batch_id=args.resume,
             allow_browser=True,
+            backend=args.backend,
+            bsk_browser=args.bsk_browser,
+            focus_window=bool(args.focus_window),
+            model_scope_policy=args.model_scope_policy,
         )
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         print(f"错误: {exc}")

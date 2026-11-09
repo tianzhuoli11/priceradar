@@ -486,6 +486,20 @@ def materialize_candidates_file(
     return path
 
 
+def mark_candidate_budget_truncation(
+    meta: dict[str, Any], *, collected: int, kept: int
+) -> None:
+    """Candidate budget cut the list: keep the real stop reason, never "naturally finished"."""
+    meta["truncated_by_max_candidates"] = True
+    meta["candidates_collected_before_cap"] = collected
+    meta["candidates_kept_after_cap"] = kept
+    meta.setdefault("source_overall_integrity", meta.get("overall_integrity"))
+    meta.setdefault("source_stop_reason", meta.get("coverage_stop_reason"))
+    meta["overall_integrity"] = "PARTIAL"
+    meta["coverage_stop_reason"] = "HIT_CANDIDATE_BUDGET"
+    meta["stop_reason"] = "HIT_CANDIDATE_BUDGET"
+
+
 def run_live_search(
     *,
     query: str,
@@ -497,11 +511,13 @@ def run_live_search(
     search_dir: Path,
     bsk_browser: str | None,
     search_fn: Callable[..., dict[str, Any]] | None,
+    focus_window: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], Path, dict[str, Any]]:
     """Execute live search with explicit backend. Returns candidates, meta, path, raw."""
     if search_fn is not None:
         search_result = search_fn(
             query,
+            focus_window=focus_window,
             limit=max_cand,
             max_candidates=max_cand,
             max_pages=max_pg,
@@ -550,6 +566,7 @@ def run_live_search(
             backend=search_backend_for(backend),
             browser=bsk_browser,
             reuse_search_tab=True,
+            focus_window=focus_window,
         )
         collect_dir = Path(collect.get("run_dir") or collect.get("out_dir") or "")
         if not collect_dir.is_dir():
@@ -580,8 +597,10 @@ def run_live_search(
             c["discovery_source"] = SOURCE_LIVE_SEARCH
             c["discovered_at_utc"] = c.get("discovered_at_utc") or now
             c["live_collect_run_dir"] = str(collect_dir)
+        _collected_n = len(candidates)
         if max_cand and len(candidates) > max_cand:
             candidates = candidates[:max_cand]
+            mark_candidate_budget_truncation(meta, collected=_collected_n, kept=len(candidates))
         meta["candidate_source"] = SOURCE_LIVE_SEARCH
         meta["reuse_mode"] = False
         meta["live_collect_run_dir"] = str(collect_dir)
@@ -1661,6 +1680,7 @@ def run_sku_job(
     verify_fn: Callable[..., dict[str, Any]] | None = None,
     job_dir: Path | None = None,
     job_id: str | None = None,
+    focus_window: bool = False,
 ) -> dict[str, Any]:
     started = utc_now()
     cfg, errs = adapt.load_business_baseline(business_config)
@@ -1726,7 +1746,13 @@ def run_sku_job(
 
     if resuming:
         job_id = str(resume_job_id)
-        job_dir = resolve_job_dir(job_id)
+        if job_dir is not None:
+            # Caller-owned directory (e.g. batch sub-job); same job_id/progress rules.
+            job_dir = Path(job_dir).resolve()
+            if not job_dir.is_dir():
+                raise FileNotFoundError(f"resume job 不存在: {job_dir}")
+        else:
+            job_dir = resolve_job_dir(job_id)
         progress_path = job_dir / "job_progress.json"
         if not progress_path.is_file():
             raise FileNotFoundError(f"缺少 job_progress.json: {progress_path}")
@@ -1804,7 +1830,12 @@ def run_sku_job(
             if isinstance(loaded_opts, list):
                 prior_options = loaded_opts
         prior_detail_opens = int(prior_progress.get("detail_pages_opened") or 0)
-        max_ver = int(prior_progress.get("max_verify") or max_ver)
+        if max_verify_explicit and max_verify is not None:
+            # Resume: explicit --max-verify N = N MORE navigations this run
+            # (cumulative cap recorded in progress = prior opens + N).
+            max_ver = prior_detail_opens + int(max_verify)
+        else:
+            max_ver = int(prior_progress.get("max_verify") or max_ver)
         max_cand = int(prior_progress.get("max_candidates") or max_cand)
         max_pg = int(prior_progress.get("max_pages") or max_pg)
         timeout_s = int(prior_progress.get("search_timeout_seconds") or timeout_s)
@@ -1903,10 +1934,13 @@ def run_sku_job(
         coll = Path(existing_dir_resolved or existing_collection_dir)  # type: ignore[arg-type]
         candidates, search_meta, used = load_existing_collection(coll)
         if max_cand and len(candidates) > max_cand:
+            _collected_n = len(candidates)
             candidates = candidates[:max_cand]
             search_meta["unique_candidates_collected"] = len(candidates)
             search_meta["candidate_count"] = len(candidates)
-            search_meta["truncated_by_max_candidates"] = True
+            mark_candidate_budget_truncation(
+                search_meta, collected=_collected_n, kept=len(candidates)
+            )
         # Copy pointer + materialize handoff file (no “latest”)
         write_json(
             search_dir / "existing_collection_pointer.json",
@@ -1938,6 +1972,7 @@ def run_sku_job(
             search_dir=search_dir,
             bsk_browser=bsk_browser,
             search_fn=search_fn,
+            focus_window=focus_window,
         )
 
     search_meta.setdefault("candidate_count", len(candidates))
@@ -3378,28 +3413,36 @@ def run_offline_self_checks() -> int:
         failures.append(f"resume2 unexpected pid {pid}")
         return {"task_status": "FAILED", "price_clues": [], "verify_dir": str(out)}
 
-    # Resume with higher max_verify recorded in progress — update progress max_verify
+    # Resume: explicit --max-verify N = N MORE navigations this run (cumulative cap).
+    # Job already opened 1 detail (r1). Resume +1 → only r2; resume +1 again → only r3.
     prog_path = JOB_ROOT / resume_job_id / "job_progress.json"
-    prog = read_json(prog_path)
-    prog["max_verify"] = 3
-    write_json(prog_path, prog)
-
-    job_b = run_sku_job(
-        business_config=cfg_path,
-        query="清风 B913A",
-        candidate_source=SOURCE_EXISTING_COLLECTION,
-        existing_collection_dir=synth2,
-        backend=BACKEND_P2D,
-        resume_job_id=resume_job_id,
-        max_verify=3,
-        max_verify_explicit=True,
-        verify_fn=fake_verify_resume2,
-    )
-    # r1 completed → no re-nav; r2/r3 previously budget → now visited
-    if "r1" in resume_nav:
-        failures.append("v3: completed r1 must not be re-fetched on resume")
-    if resume_nav != ["r2", "r3"]:
-        failures.append(f"v3: resume should nav [r2,r3], got {resume_nav}")
+    if int(read_json(prog_path).get("detail_pages_opened") or 0) != 1:
+        failures.append("v3: precondition: 1 detail opened before resume")
+    for step, expect_nav, expect_opened in ((1, ["r2"], 2), (2, ["r3"], 3)):
+        resume_nav.clear()
+        job_b = run_sku_job(
+            business_config=cfg_path,
+            query="清风 B913A",
+            candidate_source=SOURCE_EXISTING_COLLECTION,
+            existing_collection_dir=synth2,
+            backend=BACKEND_P2D,
+            resume_job_id=resume_job_id,
+            max_verify=1,
+            max_verify_explicit=True,
+            verify_fn=fake_verify_resume2,
+        )
+        if resume_nav != expect_nav:
+            failures.append(
+                f"v3: resume step{step} (+1) should nav {expect_nav}, got {resume_nav}"
+            )
+        pg = read_json(prog_path)
+        if int(pg.get("detail_pages_opened") or 0) != expect_opened or int(
+            pg.get("max_verify") or 0
+        ) != expect_opened:
+            failures.append(
+                f"v3: resume step{step} cumulative opens/cap should be {expect_opened}, got "
+                f"{pg.get('detail_pages_opened')}/{pg.get('max_verify')}"
+            )
     # Ordinary failure not auto-retried: run again without retry_failed
     resume_nav.clear()
     job_c = run_sku_job(
@@ -3449,6 +3492,18 @@ def run_offline_self_checks() -> int:
     )
     print(f"v3 synthetic offline dir: {synth_root}")
 
+
+    # candidate budget truncation must stay visible as partial coverage (synthetic)
+    _m = {"overall_integrity": "COMPLETE_EXPLAINABLE", "coverage_stop_reason": "NEXT_DISABLED"}
+    mark_candidate_budget_truncation(_m, collected=30, kept=20)
+    if (
+        _m["overall_integrity"] != "PARTIAL"
+        or _m["coverage_stop_reason"] != "HIT_CANDIDATE_BUDGET"
+        or _m["source_overall_integrity"] != "COMPLETE_EXPLAINABLE"
+        or _m["source_stop_reason"] != "NEXT_DISABLED"
+        or _m["candidates_collected_before_cap"] != 30
+    ):
+        failures.append(f"candidate budget truncation must be partial with real stop reason: {_m}")
 
     print("=== P5-B offline self-check ===")
     if failures:
@@ -3503,6 +3558,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="BSK 浏览器实例 id/label（多实例时显式指定）",
     )
     p.add_argument(
+        "--focus-window",
+        action="store_true",
+        help="BSK live-search: open the Agent Window in the foreground (default: background)",
+    )
+    p.add_argument(
         "--model-scope-policy",
         type=Path,
         default=None,
@@ -3541,7 +3601,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-verify",
         type=int,
         default=None,
-        help="Max detail navigations (default 5; classification-skip does not consume)",
+        help="Max detail navigations (default 5; classification-skip does not consume). With --resume-job-id: N MORE navigations this run (cumulative cap = already opened + N)",
     )
     p.add_argument("--self-check", action="store_true")
     return p.parse_args(argv)
@@ -3587,6 +3647,7 @@ def main(argv: list[str] | None = None) -> int:
             resume_job_id=args.resume_job_id,
             backend=backend,
             bsk_browser=args.bsk_browser,
+            focus_window=bool(args.focus_window),
             model_scope_policy=args.model_scope_policy,
             retry_failed=bool(args.retry_failed),
         )

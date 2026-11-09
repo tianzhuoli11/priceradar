@@ -20,7 +20,8 @@ OBSERVED_MISMATCH = "OBSERVED_SPEC_MISMATCH"
 PACKAGING_PASSED = "PASSED"
 
 PACK_RE = re.compile(r"(\d+)\s*包")
-LAYER_RE = re.compile(r"(\d+)\s*层")
+LAYER_RE = re.compile(r"(\d+|单|双)\s*层")
+_LAYER_WORD = {"单": "1", "双": "2"}  # 单层=1层、双层=2层
 SHEET_RE = re.compile(r"(\d+)\s*(?:抽|张)")
 
 
@@ -40,7 +41,7 @@ def parse_spec_tokens(text: str | None) -> dict[str, Any]:
         out["packs"] = m.group(1)
     m = LAYER_RE.search(t)
     if m:
-        out["layers"] = m.group(1)
+        out["layers"] = _LAYER_WORD.get(m.group(1), m.group(1))
     m = SHEET_RE.search(t)
     if m:
         out["sheets_or_pulls"] = m.group(1)

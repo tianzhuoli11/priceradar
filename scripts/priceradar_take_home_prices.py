@@ -327,6 +327,204 @@ def parse_panel_price_clues(
     return clues
 
 
+RULES_VERSION_PRICE_ROLE = "price-role-evidence-v1"
+
+
+def _role_signature(ev: dict[str, Any]) -> list[tuple[str, Any]]:
+    return sorted(
+        (str(n.get("text")), n.get("struck")) for n in (ev.get("amount_nodes") or [])
+    )
+
+
+def resolve_price_roles_from_dom_evidence(
+    evidence_before: dict[str, Any] | None,
+    evidence_after: dict[str, Any] | None,
+    *,
+    target_product_id: str | None,
+    selected_spec_text: str | None,
+    ocr_amounts: set[str] | None = None,
+    evidence_source: str,
+    evidence_path: str | None = None,
+    evidence_meta: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """
+    Resolve amount roles from same-observation DOM node evidence (never from flat text).
+
+    Returns (clues|None, status). None => evidence unusable; caller keeps the flat-text
+    path (ambiguity stays REVIEW_REQUIRED). Rules:
+    - line-through amounts are excluded from take-home candidates;
+    - exactly one non-struck amount AND exactly one DOM-adjacent take-home label
+      => PANEL_LABEL_UNIQUE conditional take-home (gates in
+      evaluate_clue_against_red_line are unchanged);
+    - several non-struck amounts, several/no labels, missing strike evidence,
+      DOM/OCR conflict, unstable or cross-spec evidence => review, no winner picked.
+    """
+    st: dict[str, Any] = {
+        "rules_version": RULES_VERSION_PRICE_ROLE,
+        "status": "NOT_AVAILABLE",
+        "reasons": [],
+        "struck_amounts_excluded": [],
+        "resolved_amount": None,
+        "resolved_label": None,
+    }
+    evs = [e for e in (evidence_before, evidence_after) if isinstance(e, dict)]
+    if not evs or any(e.get("status") != "CAPTURED" for e in evs):
+        st["reasons"].append("无可用的同次 DOM 价格角色证据（未采集或采集失败）")
+        return None, st
+    st["status"] = "INVALID"
+    for e in evs:
+        if target_product_id and str(e.get("url_product_id") or "") != str(target_product_id):
+            st["reasons"].append("价格角色证据的商品 ID 与目标不一致")
+            return None, st
+        if selected_spec_text and str(e.get("selected_spec_text") or "") != str(selected_spec_text):
+            st["reasons"].append("价格角色证据的选中规格与当前选中规格不一致")
+            return None, st
+    if len(evs) == 2 and (
+        _role_signature(evs[0]) != _role_signature(evs[1])
+        or evs[0].get("selected_spec_text") != evs[1].get("selected_spec_text")
+    ):
+        st["reasons"].append("前后两次价格角色证据金额/划线状态不一致（页面不稳定）")
+        return None, st
+    ev = evs[-1]
+    amounts = list(ev.get("amount_nodes") or [])
+    labels = {str(l.get("id")): l for l in (ev.get("label_nodes") or [])}
+    if not amounts:
+        st["status"] = "NO_AMOUNT_NODES"
+        st["reasons"].append("价格区未发现可见金额节点")
+        return None, st
+    if any("struck" not in n for n in amounts):
+        st["status"] = "STRIKE_EVIDENCE_MISSING"
+        st["reasons"].append("缺少删除线证据，不能排除划线金额")
+        return None, st
+
+    meta = dict(evidence_meta or {})
+    panel_text = str(ev.get("panel_text") or "")
+
+    def _mk(node, ptype, assoc, label, basis):
+        m = re.search(r"\d+(?:\.\d+)?", str(node.get("text") or ""))
+        amount = m.group(0) if m else None
+        clue = empty_clue_template()
+        clue.update(
+            {
+                "price_type": ptype,
+                "amount": amount,
+                "raw_label": label,
+                "conditions": (
+                    f"panel={panel_text[:140]} | node={node.get('id')} struck={node.get('struck')}"
+                    f" | label={label} | assoc={assoc}"
+                )[:240],
+                "minimum_quantity": None,
+                "eligibility_status": eligibility_from_text(label or ""),
+                "evidence_source": evidence_source,
+                "evidence_path": evidence_path,
+                "evidence_kind": "DOM_PRICE_ROLE_EVIDENCE",
+                "evidence_parts": [
+                    {
+                        "kind": "DOM_PRICE_ROLE_EVIDENCE",
+                        "source": evidence_source,
+                        "text": panel_text[:240],
+                        "amount": amount,
+                        "label": label,
+                        "association": assoc,
+                        "struck": node.get("struck"),
+                        "struck_by": node.get("struck_by"),
+                        "adjacent_labels": node.get("adjacent_labels"),
+                        "node_box": node.get("box"),
+                        "product_id": meta.get("product_id") or ev.get("url_product_id"),
+                        "captured_at_utc": meta.get("captured_at_utc"),
+                        "selected_spec_text": ev.get("selected_spec_text"),
+                        "purchase_quantity": meta.get("purchase_quantity"),
+                    }
+                ],
+                "calculation_basis": basis,
+                "association_confidence": assoc,
+                "panel_full_text": panel_text[:240],
+            }
+        )
+        return clue
+
+    clues: list[dict[str, Any]] = []
+    non_struck = []
+    for n in amounts:
+        if n.get("struck"):
+            st["struck_amounts_excluded"].append(n.get("text"))
+            clues.append(
+                _mk(
+                    n,
+                    PRICE_TYPE_UNVERIFIED_PANEL,
+                    "DOM_STRIKETHROUGH_EXCLUDED",
+                    "划线价（已排除，不作到手价）",
+                    "DOM 删除线证据：该金额带 line-through，排除出到手价候选",
+                )
+            )
+        else:
+            non_struck.append(n)
+
+    def _ambiguous(reason: str) -> None:
+        st["status"] = "AMBIGUOUS"
+        st["reasons"].append(reason)
+        for n in non_struck:
+            clues.append(
+                _mk(
+                    n,
+                    PRICE_TYPE_CONDITIONAL_CANDIDATE,
+                    "PANEL_LABEL_NON_UNIQUE",
+                    "条件到手价（关联待核验）",
+                    "DOM 角色证据未能唯一确定：" + reason + "；保留候选待核验，不强行选定",
+                )
+            )
+
+    if not non_struck:
+        st["status"] = "ALL_STRUCK"
+        st["reasons"].append("所有金额均为划线价，无到手价候选")
+        return clues, st
+    if len(non_struck) > 1:
+        _ambiguous("存在多个非划线金额")
+        return clues, st
+    node = non_struck[0]
+    adj_ids = sorted(
+        {a.get("label_id") for a in (node.get("adjacent_labels") or []) if a.get("label_id") in labels}
+    )
+    if not adj_ids:
+        st["status"] = "NO_LABEL"
+        st["reasons"].append("唯一非划线金额没有 DOM 相邻的条件标签，角色未证实")
+        clues.append(
+            _mk(
+                node,
+                PRICE_TYPE_UNVERIFIED_PANEL,
+                "PANEL_AMOUNT_UNASSIGNED",
+                "面板未证实金额",
+                "无 DOM 相邻条件标签；不计入主售价/到手价/最低价统计",
+            )
+        )
+        return clues, st
+    if len(adj_ids) > 1:
+        _ambiguous("唯一非划线金额的相邻标签不止一个")
+        return clues, st
+    amt_m = re.search(r"\d+(?:\.\d+)?", str(node.get("text") or ""))
+    amt_s = amt_m.group(0) if amt_m else None
+    if ocr_amounts:
+        norm_ocr = {str(to_decimal(a)) for a in ocr_amounts if to_decimal(a) is not None}
+        if amt_s is None or str(to_decimal(amt_s)) not in norm_ocr:
+            _ambiguous("DOM 金额与截图 OCR 金额冲突")
+            return clues, st
+    label_text = str(labels[adj_ids[0]].get("text") or "")
+    st["status"] = "RESOLVED"
+    st["resolved_amount"] = amt_s
+    st["resolved_label"] = label_text
+    clues.append(
+        _mk(
+            node,
+            PRICE_TYPE_DECLARED_CONDITIONAL,
+            "PANEL_LABEL_UNIQUE",
+            label_text,
+            "DOM 角色证据：唯一非划线金额 + 唯一相邻条件标签（划线金额已排除）；"
+            "资格是否满足仍未知",
+        )
+    )
+    return clues, st
+
+
 def parse_minimum_quantity(text: str) -> int | None:
     m = QTY_HINT_RE.search(text or "")
     if not m:
@@ -596,6 +794,7 @@ def build_price_clues_from_extraction(
     packs_per_box: int | None,
     evidence_path: str | None = None,
     panel_contexts: list[dict[str, Any]] | None = None,
+    role_status_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build one clue per OCR price candidate (dedupe by type+amount+label)."""
     ext = extraction or {}
@@ -717,12 +916,58 @@ def build_price_clues_from_extraction(
                         )
                     )
 
+    role_panel_key: str | None = None
+    for ctx in panel_contexts or []:
+        re_ev = ctx.get("role_evidence") if isinstance(ctx, dict) else None
+        if not isinstance(re_ev, dict):
+            continue
+        role_clues, role_status = resolve_price_roles_from_dom_evidence(
+            re_ev.get("before"),
+            re_ev.get("after"),
+            target_product_id=re_ev.get("target_product_id"),
+            selected_spec_text=re_ev.get("selected_spec_text"),
+            ocr_amounts={str(p.get("amount")) for p in candidates if p.get("amount") is not None},
+            evidence_source="capture:price_role_evidence",
+            evidence_path=evidence_path,
+            evidence_meta={
+                "product_id": ctx.get("product_id"),
+                "captured_at_utc": ctx.get("captured_at_utc"),
+                "purchase_quantity": ctx.get("purchase_quantity"),
+            },
+        )
+        if role_status_out is not None:
+            role_status_out.update(role_status)
+        if role_clues is not None:
+            ev_last = re_ev.get("after") or re_ev.get("before") or {}
+            role_panel_key = re.sub(r"\s+", "", str(ev_last.get("panel_text") or ""))
+            for clue in role_clues:
+                key = (
+                    clue.get("price_type"),
+                    str(clue.get("amount")),
+                    str(clue.get("raw_label")),
+                    str(clue.get("association_confidence")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                clue = evaluate_clue_against_red_line(
+                    clue,
+                    red_line=red_line,
+                    box_comparable=box_comparable,
+                    page_spec_matched=page_spec_matched,
+                    packs_per_box=packs_per_box,
+                )
+                clues.append(clue)
+        break
+
     for ctx in panel_contexts or []:
         if not isinstance(ctx, dict):
             continue
         panel_text = str(ctx.get("text") or "").strip()
         if not panel_text:
             continue
+        if role_panel_key and re.sub(r"\s+", "", panel_text)[:200] == role_panel_key[:200]:
+            continue  # same panel already resolved from DOM node evidence
         src = str(ctx.get("source") or "capture:panel")
         for clue in parse_panel_price_clues(
             panel_text,
@@ -1339,5 +1584,117 @@ def run_local_take_home_checks() -> list[str]:
         for c in cross
     ):
         failures.append("OCR cross-block unique label+amount must DECLARED")
+
+    # ---- DOM price-role evidence (synthetic; NOT live evidence) ----
+    def _role_ev(amount_nodes, label_ids=("L0",), spec="SYNTH 规格", pid="SYNTH1", status="CAPTURED"):
+        return {
+            "schema": "price-role-evidence-v1",
+            "status": status,
+            "url_product_id": pid,
+            "selected_spec_text": spec,
+            "panel_text": "".join(n["text"] for n in amount_nodes) + " 到手价",
+            "label_nodes": [{"id": i, "text": "到手价"} for i in label_ids],
+            "amount_nodes": amount_nodes,
+        }
+
+    def _amt(i, text, struck, adj=("L0",)):
+        n = {"id": f"A{i}", "text": text, "adjacent_labels": [{"label_id": a, "level": 0} for a in adj]}
+        if struck is not None:
+            n["struck"] = struck
+        return n
+
+    def _role_run(ev_before, ev_after=None, *, spec="SYNTH 规格", ocr=None):
+        st: dict[str, Any] = {}
+        ctx = {
+            "text": ev_before.get("panel_text") or "",
+            "source": "synthetic",
+            "product_id": "SYNTH1",
+            "role_evidence": {
+                "before": ev_before,
+                "after": ev_after if ev_after is not None else ev_before,
+                "target_product_id": "SYNTH1",
+                "selected_spec_text": spec,
+            },
+        }
+        cl = build_price_clues_from_extraction(
+            {"price_candidates": ocr or []},
+            red_line=Decimal("127.00"),
+            box_comparable=True,
+            page_spec_matched=True,
+            packs_per_box=20,
+            panel_contexts=[ctx],
+            role_status_out=st,
+        )
+        return cl, st
+
+    def _declared(cl):
+        return [c for c in cl if c.get("price_type") == PRICE_TYPE_DECLARED_CONDITIONAL]
+
+    # 1) labelled single non-struck amount; struck one excluded
+    ev1 = _role_ev([_amt(0, "¥120", False), _amt(1, "¥160", True, adj=("L0",))])
+    cl1, st1 = _role_run(ev1)
+    d1 = _declared(cl1)
+    if st1.get("status") != "RESOLVED" or len(d1) != 1 or d1[0].get("amount") != "120":
+        failures.append(f"role: single labelled non-struck must resolve: {st1}")
+    if d1 and d1[0].get("association_confidence") != "PANEL_LABEL_UNIQUE":
+        failures.append("role: resolved clue must use PANEL_LABEL_UNIQUE")
+    if any(c.get("amount") == "160" and c.get("price_type") != PRICE_TYPE_UNVERIFIED_PANEL for c in cl1):
+        failures.append("role: struck amount must not be a take-home candidate")
+    if not any(c.get("association_confidence") == "DOM_STRIKETHROUGH_EXCLUDED" for c in cl1):
+        failures.append("role: struck amount must be recorded as excluded")
+    if aggregate_system_verdict(cl1).get("system_verdict") != SYSTEM_POSSIBLE_BREAK:
+        failures.append("role: resolved unique take-home below red on comparable box keeps normal gates")
+
+    # 1b) same, but gates not met (box not comparable) -> no break, gates unchanged
+    st_b: dict[str, Any] = {}
+    cl1b = build_price_clues_from_extraction(
+        {"price_candidates": []},
+        red_line=Decimal("127.00"),
+        box_comparable=False,
+        page_spec_matched=False,
+        packs_per_box=20,
+        panel_contexts=[{"text": ev1["panel_text"], "source": "synthetic", "product_id": "SYNTH1",
+                         "role_evidence": {"before": ev1, "after": ev1, "target_product_id": "SYNTH1",
+                                           "selected_spec_text": "SYNTH 规格"}}],
+        role_status_out=st_b,
+    )
+    if aggregate_system_verdict(cl1b).get("system_verdict") == SYSTEM_POSSIBLE_BREAK:
+        failures.append("role: must not POSSIBLE_BREAK when packaging gate is not met")
+
+    # 2) several non-struck amounts stay ambiguous
+    ev2 = _role_ev([_amt(0, "¥120", False), _amt(1, "¥160", False)])
+    cl2, st2 = _role_run(ev2)
+    if st2.get("status") != "AMBIGUOUS" or _declared(cl2):
+        failures.append(f"role: multiple non-struck must stay ambiguous: {st2}")
+    if aggregate_system_verdict(cl2).get("system_verdict") == SYSTEM_POSSIBLE_BREAK:
+        failures.append("role: ambiguous amounts must not POSSIBLE_BREAK")
+
+    # 3) strike evidence missing -> no exclusion, review
+    ev3 = _role_ev([_amt(0, "¥120", None), _amt(1, "¥160", None)])
+    cl3, st3 = _role_run(ev3)
+    if st3.get("status") != "STRIKE_EVIDENCE_MISSING" or _declared(cl3):
+        failures.append(f"role: missing strike evidence must not resolve: {st3}")
+
+    # 4) single non-struck amount but no adjacent label -> unassigned, not take-home
+    ev4 = _role_ev([_amt(0, "¥120", False, adj=()), _amt(1, "¥160", True, adj=())])
+    cl4, st4 = _role_run(ev4)
+    if st4.get("status") != "NO_LABEL" or _declared(cl4):
+        failures.append(f"role: unlabelled amount must not become take-home: {st4}")
+
+    # 5) other spec than the currently selected one -> evidence rejected
+    cl5, st5 = _role_run(ev1, spec="另一规格")
+    if st5.get("status") != "INVALID" or _declared(cl5):
+        failures.append(f"role: cross-spec evidence must be rejected: {st5}")
+
+    # 6) DOM/OCR amount conflict -> review
+    cl6, st6 = _role_run(ev1, ocr=[{"amount": "150", "source_text": "¥150", "role": "PAGE_PRIMARY_SELLING"}])
+    if st6.get("status") != "AMBIGUOUS" or _declared(cl6):
+        failures.append(f"role: DOM/OCR conflict must not resolve: {st6}")
+
+    # 7) before/after unstable -> rejected
+    ev7b = _role_ev([_amt(0, "¥120", False), _amt(1, "¥160", False)])
+    cl7, st7 = _role_run(ev1, ev7b)
+    if st7.get("status") != "INVALID" or _declared(cl7):
+        failures.append(f"role: unstable before/after must be rejected: {st7}")
 
     return failures

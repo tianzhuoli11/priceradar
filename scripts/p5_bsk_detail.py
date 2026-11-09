@@ -362,6 +362,90 @@ SELECTION_STATE_JS = r"""(() => {
   };
 })()"""
 
+PRICE_ROLE_EVIDENCE_JS = r"""(() => {
+  // Same-observation price-role evidence inside the price panel only.
+  // Records visible amount nodes, take-home label nodes, DOM adjacency and
+  // line-through evidence. Does not infer roles; resolution happens offline.
+  const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+  const AMT = /^[¥￥]\s*\d+(?:\.\d+)?$/;
+  const LABEL = /(到手价|首单|新人|会员|PLUS|plus|券后|预估|优惠后|折后)/;
+  const m = String(location.href || '').match(/item\.jd\.com\/(\d+)\.html/i);
+  const sel = document.querySelector('.specification-item-sku--selected');
+  const out = {
+    schema: 'price-role-evidence-v1',
+    url_product_id: m ? m[1] : null,
+    selected_spec_text: sel ? norm(sel.innerText || sel.textContent) : null,
+    captured_at_ms: Date.now(),
+    panel_selector: null,
+    panel_text: null,
+    status: 'PANEL_NOT_FOUND',
+    amount_nodes: [],
+    label_nodes: [],
+  };
+  const panel = document.querySelector('.product-price-panel') || document.querySelector('.page-right-price');
+  if (!panel) return out;
+  out.panel_selector = panel.matches('.product-price-panel') ? '.product-price-panel' : '.page-right-price';
+  out.panel_text = norm(panel.innerText || panel.textContent).slice(0, 240);
+  const all = Array.from(panel.querySelectorAll('*'));
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+  };
+  const cls = (el) => String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : (el.className || '')).slice(0, 80);
+  const ln = (el) => {
+    const cs = getComputedStyle(el);
+    return String(cs.textDecorationLine || cs.textDecoration || '');
+  };
+  const box = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x*10)/10, y: Math.round(r.y*10)/10, w: Math.round(r.width*10)/10, h: Math.round(r.height*10)/10 }; };
+  const isAmt = (el) => AMT.test(norm(el.textContent));
+  const amtEls = all.filter(el => visible(el) && isAmt(el) && !Array.from(el.children).some(isAmt));
+  const lblEls = all.filter(el => visible(el) && norm(el.textContent).length <= 12 && LABEL.test(norm(el.textContent))
+    && !Array.from(el.children).some(c => LABEL.test(norm(c.textContent)) && norm(c.textContent).length <= 12));
+  out.label_nodes = lblEls.map((el, i) => ({ id: 'L' + i, text: norm(el.textContent), tag: el.tagName, cls: cls(el), box: box(el) }));
+  out.amount_nodes = amtEls.map((el, i) => {
+    let struck = false; let struck_by = null; let scope = null;
+    let cur = el; let depth = 0;
+    while (cur && cur !== panel.parentElement) {
+      const tag = cur.tagName;
+      const dec = ln(cur);
+      if (/line-through/.test(dec) || tag === 'DEL' || tag === 'S' || tag === 'STRIKE') {
+        struck = true; scope = 'self_or_ancestor';
+        struck_by = { tag, cls: cls(cur), depth, text_decoration_line: dec };
+        break;
+      }
+      cur = cur.parentElement; depth += 1;
+    }
+    if (!struck) {
+      const d = Array.from(el.querySelectorAll('*')).find(x => /line-through/.test(ln(x)) || ['DEL','S','STRIKE'].includes(x.tagName));
+      if (d) { struck = true; scope = 'descendant'; struck_by = { tag: d.tagName, cls: cls(d), depth: -1, text_decoration_line: ln(d) }; }
+    }
+    // DOM adjacency: label is the neighbouring element sibling of the amount
+    // node or of one of its ancestors (up to 3 levels, stopping at the panel).
+    const adjacent = [];
+    let x = el; let lvl = 0;
+    while (x && x !== panel && lvl <= 3) {
+      [x.previousElementSibling, x.nextElementSibling].forEach((sib, si) => {
+        if (!sib) return;
+        lblEls.forEach((l, li) => {
+          if (sib === l || sib.contains(l)) adjacent.push({ label_id: 'L' + li, level: lvl, side: si === 0 ? 'previous' : 'next' });
+        });
+      });
+      x = x.parentElement; lvl += 1;
+    }
+    const ab = el.getBoundingClientRect();
+    return {
+      id: 'A' + i, text: norm(el.textContent), tag: el.tagName, cls: cls(el), box: box(el),
+      text_decoration_line: ln(el), struck, struck_scope: scope, struck_by,
+      font_size: getComputedStyle(el).fontSize, color: getComputedStyle(el).color,
+      adjacent_labels: adjacent,
+      same_row_labels: lblEls.map((l, li) => ({ l, li })).filter(({ l }) => { const lb = l.getBoundingClientRect(); return Math.abs((lb.y + lb.height/2) - (ab.y + ab.height/2)) < Math.max(ab.height, lb.height) * 0.6; }).map(({ li }) => 'L' + li),
+    };
+  });
+  out.status = 'CAPTURED';
+  return out;
+})()"""
+
 DOM_DISCOVER_DIAGNOSTIC_JS = r"""(() => {
   const q = (s) => { try { return document.querySelectorAll(s).length; } catch (e) { return -1; } };
   return {
@@ -484,6 +568,12 @@ def identity_from_page(
                     else page_info.get("reason")
                 ),
                 "settle_attempts": page_info.get("settle_attempts"),
+                "stage": "PAGE_CLASSIFY",
+                "same_page_resync": {
+                    "attempted": bool(page_info.get("observation_resync_attempted")),
+                    "sync_ok": page_info.get("observation_resync_sync_ok"),
+                    "recovered": page_info.get("observation_resync_recovered"),
+                },
             },
         }
     kind = str(page_info.get("page_kind") or "")
@@ -686,6 +776,62 @@ def eval_value_or_error(raw: dict[str, Any] | None) -> tuple[Any, dict[str, Any]
             }
         return None, {"status": "EVAL_ERROR", "detail": sanitize(raw)}
     return raw.get("value"), None
+
+
+def eval_selection_state_with_one_resync(
+    client: Any,
+    session_id: str,
+    *,
+    cooperate_policy: str,
+) -> tuple[Any, dict[str, Any] | None, bool]:
+    """SELECTION_STATE_JS with one same-tab sync+retry on observation_changed only.
+
+    Rate-limit/login/other errors are returned unchanged (no retry).
+    """
+    def _once() -> tuple[Any, dict[str, Any] | None]:
+        return eval_value_or_error(
+            eval_json(
+                client,
+                session_id,
+                SELECTION_STATE_JS,
+                cooperate_policy=cooperate_policy,
+            )
+        )
+
+    val, err = _once()
+    if isinstance(err, dict) and "observation_changed" in json.dumps(
+        err, ensure_ascii=False
+    ):
+        cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
+        time.sleep(0.35)
+        val, err = _once()
+        return val, err, True
+    return val, err, False
+
+
+def _capture_price_role_evidence(
+    client: Any, session_id: str, cooperate_policy: str, path: Path
+) -> dict[str, Any]:
+    """Read-only DOM probe of the price panel; one resync on observation_changed."""
+    def _once() -> tuple[Any, dict[str, Any] | None]:
+        return eval_value_or_error(
+            eval_json(client, session_id, PRICE_ROLE_EVIDENCE_JS, cooperate_policy=cooperate_policy)
+        )
+
+    val, err = _once()
+    if isinstance(err, dict) and "observation_changed" in json.dumps(err, ensure_ascii=False):
+        cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
+        time.sleep(0.35)
+        val, err = _once()
+    payload: dict[str, Any] = val if isinstance(val, dict) and not err else {
+        "schema": "price-role-evidence-v1",
+        "status": "EVAL_ERROR",
+        "eval_error": err,
+        "amount_nodes": [],
+        "label_nodes": [],
+    }
+    write_json(path, sanitize(payload))
+    return payload
 
 
 def vom_find_ref(
@@ -1426,10 +1572,19 @@ def run_bsk_detail_capture(
                     "capture_status": "FAILED",
                     "product_identity_ok": False,
                     "error": "OBSERVATION_FAILED",
-                    "observation_failure": ident.get("observation_error")
-                    or {
-                        "stage": "classify_after_settle",
-                        "page_classify": sanitize(page_info),
+                    "observation_failure": {
+                        **(
+                            ident.get("observation_error")
+                            or {
+                                "stage": "PAGE_CLASSIFY",
+                                "page_kind": page_info.get("page_kind"),
+                            }
+                        ),
+                        "diagnostic_files": {
+                            "metadata": str(out_dir / "metadata.json"),
+                            "page_classify": str(out_dir / "page_classify.json"),
+                        },
+                        "navigation_retried": False,
                     },
                     "ended_at_utc": utc_iso_now(),
                 }
@@ -1462,16 +1617,15 @@ def run_bsk_detail_capture(
             "页面标题/规格/价格/店铺仍依赖分区证据。"
         )
 
-        sel_before_raw = eval_json(
-            client,
-            session_id,
-            SELECTION_STATE_JS,
-            cooperate_policy=cooperate_policy,
+        selection_before, sel_err, _sel_b_retry = eval_selection_state_with_one_resync(
+            client, session_id, cooperate_policy=cooperate_policy
         )
-        selection_before, sel_err = eval_value_or_error(sel_before_raw)
         if sel_err:
             selection_before = {"eval_error": sel_err}
         write_json(out_dir / "selection_state_before.json", sanitize(selection_before))
+        role_before = _capture_price_role_evidence(
+            client, session_id, cooperate_policy, out_dir / "price_role_evidence_before.json"
+        )
 
         disc_raw = eval_json(
             client,
@@ -1572,16 +1726,15 @@ def run_bsk_detail_capture(
             regions_out["viewport_diagnostic"] = vp
             write_json(out_dir / "region_viewport_diagnostic.json", vp)
 
-        sel_after_raw = eval_json(
-            client,
-            session_id,
-            SELECTION_STATE_JS,
-            cooperate_policy=cooperate_policy,
+        selection_after, sel_after_err, _sel_a_retry = eval_selection_state_with_one_resync(
+            client, session_id, cooperate_policy=cooperate_policy
         )
-        selection_after, sel_after_err = eval_value_or_error(sel_after_raw)
         if sel_after_err:
             selection_after = {"eval_error": sel_after_err}
         write_json(out_dir / "selection_state_after.json", sanitize(selection_after))
+        _capture_price_role_evidence(
+            client, session_id, cooperate_policy, out_dir / "price_role_evidence_after.json"
+        )
 
         consistency: dict[str, Any] = {"url_id_unchanged": None, "spec_unchanged": None}
         if isinstance(selection_before, dict) and isinstance(selection_after, dict):
@@ -1729,6 +1882,43 @@ def run_offline_bsk_detail_checks() -> list[str]:
         failures.append("observation error must classify OBSERVATION_FAILED not identity")
     if obs_ident.get("priority") != "observation_error_not_identity":
         failures.append("observation error priority must be observation_error_not_identity")
+
+    # selection-state eval: one resync on observation_changed, none for other errors
+    _g = globals()
+    _orig_eval, _orig_sync = _g["eval_json"], _g["cooperate_sync"]
+    try:
+        _calls = {"eval": 0, "sync": 0}
+        _obs_fail = {
+            "ok": False,
+            "raw": {"code": "permission_denied", "data": {"reason": "observation_changed"}},
+        }
+
+        def _fake_eval(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _calls["eval"] += 1
+            if _calls["eval"] == 1:
+                return _obs_fail
+            return {"ok": True, "value": {"selected_status": "SELECTED_SPEC_EXTRACTED"}}
+
+        def _fake_sync(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _calls["sync"] += 1
+            return {"ok": True}
+
+        _g["eval_json"], _g["cooperate_sync"] = _fake_eval, _fake_sync
+        _v, _e, _r = eval_selection_state_with_one_resync(None, "s", cooperate_policy="strict")
+        if _e or not _r or _calls != {"eval": 2, "sync": 1}:
+            failures.append(f"selection_state observation_changed must resync once: {_calls} {_e}")
+        _calls.update(eval=0, sync=0)
+
+        def _fake_rate(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _calls["eval"] += 1
+            return {"ok": False, "raw": {"code": "x", "data": {"reason": "rate_limited"}}}
+
+        _g["eval_json"] = _fake_rate
+        _v, _e, _r = eval_selection_state_with_one_resync(None, "s", cooperate_policy="strict")
+        if not _e or _r or _calls != {"eval": 1, "sync": 0}:
+            failures.append("selection_state non-observation error must not retry")
+    finally:
+        _g["eval_json"], _g["cooperate_sync"] = _orig_eval, _orig_sync
 
     # Recovered classify after resync → normal identity path
     recovered = {
