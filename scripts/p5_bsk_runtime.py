@@ -958,6 +958,10 @@ def cards_to_rows(
     return rows
 
 
+WAIT_MAX_SETTLED_RESYNCS = 2  # bounded recovery for refused state reads per wait
+PAGE_TURN_UNCONFIRMED = "page_turn_unconfirmed_state_read_refused"
+
+
 def wait_grid_and_page(
     client: BskClient,
     session_id: str,
@@ -967,10 +971,25 @@ def wait_grid_and_page(
     expect_page: int | None = None,
     timeout_s: int = 28,
 ) -> dict[str, Any]:
+    """Wait (read-only) until the page label and grid confirm the turn.
+
+    Each state read is classified as one of:
+      confirmed  - valid read, expected page + changed grid, not loading
+      same_page  - valid read, not (yet) the new page
+      refused    - no valid page state (BSK refused / errored the read)
+    A refused read is never treated as an empty page or as the original page.
+    Sync-required refusals get a bounded settled resync (WAIT_MAX_SETTLED_RESYNCS)
+    before the next read, within the same timeout; any other error stops the wait
+    at once (no retry). No clicks or navigation happen here.
+    """
     started = time.time()
     transitions: list[dict[str, Any]] = []
-    last: dict[str, Any] = {}
+    last_valid: dict[str, Any] = {}
     before_fp = id_fingerprint(before_ids)
+    stats = {"reads": 0, "valid_reads": 0, "same_page_reads": 0, "refused_reads": 0, "settled_resyncs": 0}
+    last_error: dict[str, Any] | None = None
+    next_receipt: dict[str, Any] | None = None
+    last_kind = None
     client.run(
         [
             "wait-for-element",
@@ -985,25 +1004,55 @@ def wait_grid_and_page(
         ],
         timeout=timeout_s + 15,
     )
+
+    def _result(ok: bool, reason: str) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "reason": reason,
+            "value": last_valid,
+            "transitions": transitions,
+            "read_stats": dict(stats),
+            "last_read_error": sanitize(last_error),
+        }
+
     while time.time() - started < timeout_s:
-        snap = eval_json(client, session_id, EXTRACT_STATE_JS)
-        v = snap.get("value") if isinstance(snap.get("value"), dict) else {}
+        if next_receipt:
+            snap = eval_json(
+                client, session_id, EXTRACT_STATE_JS,
+                context_id=next_receipt.get("context_id"),
+                observation_id=next_receipt.get("observation_id"),
+            )
+            next_receipt = None
+        else:
+            snap = eval_json(client, session_id, EXTRACT_STATE_JS)
+        stats["reads"] += 1
+        last_kind = "refused"
+        t_ms = int((time.time() - started) * 1000)
+        err = _bsk_error_payload(snap)
+        v = snap.get("value") if not err and isinstance(snap.get("value"), dict) else None
+        if v is None:
+            stats["refused_reads"] += 1
+            last_error = err or {"message": "state_read_not_a_dict"}
+            transitions.append({"t_ms": t_ms, "read": "refused", "code": (err or {}).get("code"),
+                                "reason": ((err or {}).get("data") or {}).get("reason") if isinstance((err or {}).get("data"), dict) else (err or {}).get("reason")})
+            if not is_sync_required_error(err):
+                return _result(False, PAGE_TURN_UNCONFIRMED)  # non-sync error: stop, no retry
+            if stats["settled_resyncs"] < WAIT_MAX_SETTLED_RESYNCS:
+                s = cooperate_sync(client, session_id, settle=True)
+                stats["settled_resyncs"] += 1
+                if s.get("ok"):
+                    next_receipt = s
+            client.run(["wait-ms", "700"], timeout=15)
+            continue
+
+        stats["valid_reads"] += 1
+        last_kind = "valid"
+        last_valid = v
         ids = [str(x) for x in (v.get("unique_ids") or [])]
         cur = v.get("current_page_hint")
         loading = bool(v.get("loading_hint"))
         fp = id_fingerprint(ids)
         new_n = len(set(ids) - set(before_ids))
-        tr = {
-            "t_ms": int((time.time() - started) * 1000),
-            "page": cur,
-            "page_source": v.get("page_source"),
-            "cards": len(ids),
-            "new_vs_before": new_n,
-            "loading": loading,
-            "fp": fp,
-        }
-        transitions.append(tr)
-        last = v
         page_ok = False
         if isinstance(cur, int):
             if expect_page is not None:
@@ -1013,14 +1062,15 @@ def wait_grid_and_page(
             else:
                 page_ok = cur >= 2
         grid_ok = len(ids) > 0 and (new_n > 0 or (page_ok and fp != before_fp))
+        transitions.append({
+            "t_ms": t_ms, "read": "valid", "page": cur, "page_source": v.get("page_source"),
+            "cards": len(ids), "new_vs_before": new_n, "loading": loading, "fp": fp,
+        })
         if page_ok and len(ids) > 0 and not loading and grid_ok:
-            return {
-                "ok": True,
-                "reason": "page_and_grid_ready",
-                "value": v,
-                "transitions": transitions,
-            }
-        if len(ids) == 0 and tr["t_ms"] > 8000:
+            return _result(True, "page_and_grid_ready")
+        stats["same_page_reads"] += 1
+        if len(ids) == 0 and t_ms > 8000:
+            # Valid read showing an empty grid (not a refused read): nudge lazy load.
             client.run(
                 [
                     "evaluate",
@@ -1031,60 +1081,202 @@ def wait_grid_and_page(
                 timeout=30,
             )
         client.run(["wait-ms", "700"], timeout=15)
+
+    # Unconfirmed when no valid read at all, or the final read was refused
+    # (an earlier same-page read no longer describes the current page).
+    if stats["valid_reads"] == 0 or last_kind == "refused":
+        return _result(False, PAGE_TURN_UNCONFIRMED)
+    return _result(False, "timeout_waiting_page_or_grid")
+
+
+# BSK "observation moved, synchronize first" refusals (shared with p5_bsk_detail).
+# Protocol 1.8: reason=observation_changed. Protocol 1.9 (extension 0.5.x):
+# code=permission_denied + reason=cooperation_sync_required. Rate-limit / login /
+# disconnect / other errors never match.
+SYNC_REQUIRED_REASONS = ("observation_changed", "cooperation_sync_required")
+
+
+def is_sync_required_error(err: Any) -> bool:
+    if not err:
+        return False
+    blob = err if isinstance(err, str) else json.dumps(err, ensure_ascii=False, default=str)
+    return any(r in blob for r in SYNC_REQUIRED_REASONS)
+
+
+def _bsk_error_payload(res: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Error dict of a failed evaluate/action result (None when it succeeded)."""
+    if not isinstance(res, dict) or res.get("ok"):
+        return None
+    raw = res.get("raw") if isinstance(res.get("raw"), dict) else {}
+    for cand in (res.get("value"), raw.get("data"), res.get("data")):
+        if isinstance(cand, dict) and (cand.get("code") or cand.get("message") or cand.get("reason")):
+            return cand
+    return {"code": None, "message": "bsk_call_failed", "detail": sanitize(res)}
+
+
+def _effect_state(err: dict[str, Any] | None) -> str | None:
+    if not isinstance(err, dict):
+        return None
+    data = err.get("data") if isinstance(err.get("data"), dict) else {}
+    return data.get("effect_state") or err.get("effect_state")
+
+
+def _page_state(client: BskClient, session_id: str) -> dict[str, Any]:
+    snap = eval_json(client, session_id, EXTRACT_STATE_JS)
+    v = snap.get("value") if snap.get("ok") and isinstance(snap.get("value"), dict) else {}
     return {
-        "ok": False,
-        "reason": "timeout_waiting_page_or_grid",
-        "value": last,
-        "transitions": transitions,
+        "ok": bool(v),
+        "page": v.get("current_page_hint"),
+        "ids": [str(x) for x in (v.get("unique_ids") or [])],
+        "visibility": (v.get("card_stats") or {}).get("document_visibility"),
+        "error": None if v else _bsk_error_payload(snap),
     }
 
 
-def click_next_page(client: BskClient, session_id: str) -> dict[str, Any]:
-    """Scroll, re-locate unique enabled next, native bsk click (P5-G verified)."""
-    eval_json(client, session_id, SCROLL_TO_NEXT_JS)
-    client.run(["wait-ms", "400"], timeout=10)
-    mark = eval_json(client, session_id, MARK_NEXT_JS)
-    mv = mark.get("value") if isinstance(mark.get("value"), dict) else {}
-    if not mv.get("ok"):
-        return {"ok": False, "reason": "no_unique_enabled_next", "mark": sanitize(mark)}
+_JS_CLICK_FALLBACK = r"""(() => {
+  const el = document.querySelector('[data-pr-next="1"]');
+  if (!el) return { ok: false, reason: 'marker_gone' };
+  el.scrollIntoView({ block: 'center' });
+  el.click();
+  return { ok: true, path: 'js_click_fallback' };
+})()"""
+
+
+def click_next_page(
+    client: BskClient,
+    session_id: str,
+    *,
+    from_page: int | None = None,
+    before_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Scroll, re-locate unique enabled next, native bsk click (P5-G verified).
+
+    Recovery is bounded to ONE settled resync per turn:
+    - mark/scroll refused with a sync-required error -> resync, then redo scroll +
+      mark with the fresh context/observation (fresh element marker);
+    - no_unique_enabled_next only when the mark script actually ran and found no
+      unique enabled button;
+    - a failed native click is re-attempted once only when the page is verified to
+      still be on from_page with the same IDs AND BSK reported effect_state=none;
+      if the page already moved, the click counts as effective (no double click);
+      otherwise click_outcome_uncertain (no further click).
+    Other errors (rate limit / login / disconnect) are reported, never retried.
+    """
+    stages: list[dict[str, Any]] = []
+    state = {"resync_used": False}
+
+    def _scroll_and_mark() -> dict[str, Any]:
+        sc = eval_json(client, session_id, SCROLL_TO_NEXT_JS)
+        stages.append({"stage": "scroll_to_next", "ok": bool(sc.get("ok")), "error": sanitize(_bsk_error_payload(sc))})
+        client.run(["wait-ms", "400"], timeout=10)
+        mk = eval_json(client, session_id, MARK_NEXT_JS)
+        stages.append({"stage": "mark_next", "ok": bool(mk.get("ok")), "error": sanitize(_bsk_error_payload(mk))})
+        return mk
+
+    def _remark_with(sync: dict[str, Any]) -> dict[str, Any]:
+        # Re-locate with the resync's fresh context + observation receipt; the mark
+        # script re-marks the element and scrolls it into view (fresh reference).
+        mk = eval_json(client, session_id, MARK_NEXT_JS,
+                       context_id=sync.get("context_id"), observation_id=sync.get("observation_id"))
+        stages.append({"stage": "mark_next_after_resync", "ok": bool(mk.get("ok")),
+                       "context_id": sync.get("context_id"), "error": sanitize(_bsk_error_payload(mk))})
+        return mk
+
+    def _resync() -> dict[str, Any]:
+        state["resync_used"] = True
+        s = cooperate_sync(client, session_id, settle=True)
+        stages.append({"stage": "resync_settle", "ok": bool(s.get("ok")), "context_id": s.get("context_id")})
+        return s
+
+    def _mark_result(mark: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        err = _bsk_error_payload(mark)
+        if err:
+            return None, {
+                "ok": False,
+                "reason": "mark_sync_refused_after_resync" if is_sync_required_error(err) else "mark_eval_error",
+                "failed_stage": "mark_next",
+                "error": sanitize(err),
+            }
+        mv = mark.get("value") if isinstance(mark.get("value"), dict) else {}
+        if not mv.get("ok"):
+            # Observation executed and found no unique enabled next button.
+            return None, {"ok": False, "reason": "no_unique_enabled_next", "failed_stage": "mark_next", "mark": sanitize(mark)}
+        return mv, None
+
+    def _done(out: dict[str, Any]) -> dict[str, Any]:
+        out["stages"] = stages
+        out["resync_triggered"] = state["resync_used"]
+        return out
+
+    mark = _scroll_and_mark()
+    first_err = _bsk_error_payload(mark)
+    if first_err and is_sync_required_error(first_err):
+        s = _resync()
+        if not s.get("ok"):
+            return _done({"ok": False, "reason": "resync_failed", "failed_stage": "resync_settle",
+                          "error": sanitize(s.get("raw")), "first_error": sanitize(first_err)})
+        mark = _remark_with(s)
+    mv, fail = _mark_result(mark)
+    if fail:
+        if first_err and state["resync_used"]:
+            fail["first_error"] = sanitize(first_err)
+        return _done(fail)
+
     sel = str(mv.get("selector") or '[data-pr-next="1"]')
-    run_page_action(
-        client,
-        session_id,
-        ["scroll-to", "--session", session_id, "--selector", sel],
-        timeout=30,
-    )
-    native = run_page_action(
-        client,
-        session_id,
-        ["click", "--session", session_id, "--selector", sel],
-        timeout=45,
-    )
+    base = {"className": mv.get("className"), "selector": sel, "candidate_count": mv.get("candidate_count")}
+    run_page_action(client, session_id, ["scroll-to", "--session", session_id, "--selector", sel], timeout=30)
+    native = run_page_action(client, session_id, ["click", "--session", session_id, "--selector", sel], timeout=45)
+    n_err = _bsk_error_payload(native)
+    stages.append({"stage": "click_native", "ok": bool(native.get("ok")), "error": sanitize(n_err)})
     if native.get("ok"):
-        return {
-            "ok": True,
-            "path": "bsk_click_selector",
-            "className": mv.get("className"),
-            "selector": sel,
-            "candidate_count": mv.get("candidate_count"),
-        }
-    # Fallback DOM click
-    click_js = r"""(() => {
-      const el = document.querySelector('[data-pr-next="1"]');
-      if (!el) return { ok: false, reason: 'marker_gone' };
-      el.scrollIntoView({ block: 'center' });
-      el.click();
-      return { ok: true, path: 'js_click_fallback' };
-    })()"""
-    fb = eval_json(client, session_id, click_js)
+        return _done({"ok": True, "path": "bsk_click_selector", **base})
+
+    # Native click failed: verify page + ID set before any further click.
+    effect = _effect_state(n_err)
+    still_here = False
+    if from_page is not None and before_ids is not None:
+        st = _page_state(client, session_id)
+        stages.append({"stage": "verify_after_click_error", "page": st.get("page"),
+                       "ids": len(st.get("ids") or []), "effect_state": effect, "state_ok": st.get("ok")})
+        if st.get("ok"):
+            moved = (isinstance(st.get("page"), int) and st["page"] != from_page) or (
+                bool(st.get("ids")) and set(st["ids"]) != set(before_ids)
+            )
+            if moved:
+                return _done({"ok": True, "path": "native_effective_despite_error",
+                              "native_error": sanitize(n_err), **base})
+            still_here = st.get("page") == from_page and set(st.get("ids") or []) == set(before_ids)
+    if not (still_here and effect == "none"):
+        return _done({"ok": False, "reason": "click_outcome_uncertain", "failed_stage": "click_native",
+                      "effect_state": effect, "native_error": sanitize(n_err), **base})
+
+    # Verified: still on from_page and the first click had no effect -> one more attempt.
+    if is_sync_required_error(n_err) and not state["resync_used"]:
+        s = _resync()
+        if not s.get("ok"):
+            return _done({"ok": False, "reason": "resync_failed", "failed_stage": "resync_settle",
+                          "error": sanitize(s.get("raw")), **base})
+        mv2, fail2 = _mark_result(_remark_with(s))
+        if fail2:
+            return _done({**fail2, **base})
+        sel = str(mv2.get("selector") or sel)
+        again = run_page_action(client, session_id, ["click", "--session", session_id, "--selector", sel], timeout=45)
+        stages.append({"stage": "click_native_after_resync", "ok": bool(again.get("ok")),
+                       "error": sanitize(_bsk_error_payload(again))})
+        if again.get("ok"):
+            return _done({"ok": True, "path": "bsk_click_selector_after_resync", **base})
+        return _done({"ok": False, "reason": "click_failed_after_resync", "failed_stage": "click_native_after_resync",
+                      "error": sanitize(_bsk_error_payload(again)), **base})
+
+    # Existing single DOM-click fallback (only after verified no effect).
+    fb = eval_json(client, session_id, _JS_CLICK_FALLBACK)
     fv = fb.get("value") if isinstance(fb.get("value"), dict) else {}
-    return {
-        "ok": bool(fv.get("ok")),
-        "path": fv.get("path") or "js_click_fallback",
-        "className": mv.get("className"),
-        "selector": sel,
-        "native_error": sanitize(native),
-    }
+    ok_fb = bool(fb.get("ok") and fv.get("ok"))
+    stages.append({"stage": "click_js_fallback", "ok": ok_fb, "error": sanitize(_bsk_error_payload(fb))})
+    out = {"ok": ok_fb, "path": fv.get("path") or "js_click_fallback", "native_error": sanitize(n_err), **base}
+    if not ok_fb:
+        out.update({"reason": "click_js_fallback_failed", "failed_stage": "click_js_fallback"})
+    return _done(out)
 
 
 def turn_to_next_page(
@@ -1102,9 +1294,24 @@ def turn_to_next_page(
         # Soft: trust observed hint if we are locating; still require advance
         pass
     ids = before_ids or [str(x) for x in (bv.get("unique_ids") or [])]
-    click = click_next_page(client, session_id)
+    pre_turn = {
+        "document_visibility": (bv.get("card_stats") or {}).get("document_visibility"),
+        "has_focus": (bv.get("card_stats") or {}).get("has_focus"),
+        "current_page_hint": hint,
+        "next_control": sanitize(bv.get("next_control")),
+        "cards": len(ids),
+    }
+    click = click_next_page(client, session_id, from_page=from_page, before_ids=ids)
     if not click.get("ok"):
-        return {"ok": False, "reason": "click_failed", "click": click}
+        return {
+            "ok": False,
+            "reason": "click_failed",
+            "click_failure_reason": click.get("reason"),
+            "failed_stage": click.get("failed_stage"),
+            "resync_triggered": click.get("resync_triggered"),
+            "pre_turn": pre_turn,
+            "click": click,
+        }
     expect = from_page + 1
     wait = wait_grid_and_page(
         client,
@@ -1114,6 +1321,22 @@ def turn_to_next_page(
         expect_page=expect,
         timeout_s=timeout_s,
     )
+    if wait.get("reason") == PAGE_TURN_UNCONFIRMED:
+        # Click succeeded but no valid page state confirmed the turn: never count
+        # it as advanced or as the original page.
+        return {
+            "ok": False,
+            "reason": PAGE_TURN_UNCONFIRMED,
+            "reason_zh": "翻页未确认：页面状态读取被拒绝",
+            "page_after": None,
+            "ids_changed": None,
+            "read_stats": wait.get("read_stats"),
+            "last_read_error": wait.get("last_read_error"),
+            "resync_triggered": click.get("resync_triggered"),
+            "pre_turn": pre_turn,
+            "click": click,
+            "wait": sanitize(wait),
+        }
     v = wait.get("value") if isinstance(wait.get("value"), dict) else {}
     after_hint = v.get("current_page_hint")
     after_ids = [str(x) for x in (v.get("unique_ids") or [])]
@@ -1137,6 +1360,8 @@ def turn_to_next_page(
             "reason": "page_not_advanced",
             "page_after": after_hint,
             "ids_changed": grid_updated,
+            "read_stats": wait.get("read_stats"),
+            "pre_turn": pre_turn,
             "click": click,
             "wait": sanitize(wait),
         }
@@ -1154,10 +1379,196 @@ def turn_to_next_page(
         "page_after": after_hint,
         "ids_changed": True,
         "new_count": new_n,
+        "resync_triggered": click.get("resync_triggered"),
+        "pre_turn": pre_turn,
         "click": click,
         "wait_reason": wait.get("reason"),
         "after_ids_sample": after_ids[:10],
     }
+
+
+# Trimmed copy of the real protocol-1.9 refusal (batch 20261116T023222Z_batch_f43aa3,
+# B913AC page_turn_001.json, mark_next stage).
+_P19_REFUSAL = {
+    "code": "permission_denied",
+    "message": "The action's observed content changed; synchronize and replan",
+    "exit_code": 1,
+    "data": {
+        "effect_state": "none",
+        "observed_change": {"change": "added", "part": "region", "phase": "decision"},
+        "reason": "cooperation_sync_required",
+    },
+}
+
+
+class _ScriptedBsk:
+    """Offline fake BSK: per-expression scripted evaluate results (no browser)."""
+
+    def __init__(self, *, mark: list[Any], click: list[Any], states: list[dict[str, Any]] | None = None,
+                 state_default: dict[str, Any] | None = None):
+        self.exe = Path("fake-bsk")
+        self.calls: list[list[str]] = []
+        self._mark = list(mark)
+        self._click = list(click)
+        self._states = list(states or [])
+        self._state_default = state_default or {"current_page_hint": 1, "unique_ids": ["a", "b"]}
+        self._ctx = 0
+
+    def _next(self, q: list[Any], default: Any) -> Any:
+        return q.pop(0) if q else default
+
+    def run(self, args: list[str], *, timeout: int = 120) -> dict[str, Any]:
+        self.calls.append(list(args))
+        if args[:2] == ["cooperate", "sync"]:
+            self._ctx += 1
+            return {"ok": True, "data": {"context_id": f"CTX{self._ctx}", "observation_id": f"OBS{self._ctx}"}}
+        if args and args[0] == "evaluate":
+            expr = args[3] if len(args) > 3 else ""
+            if expr == MARK_NEXT_JS:
+                r = self._next(self._mark, {"ok": True, "selector": '[data-pr-next="1"]', "className": "n", "candidate_count": 1})
+                if isinstance(r, dict) and r.get("code"):
+                    return {"ok": False, "exit_code": 1, "data": r}
+                return {"ok": True, "data": {"value": r}}
+            if expr == EXTRACT_STATE_JS:
+                st = self._next(self._states, self._state_default)
+                if isinstance(st, dict) and st.get("code"):
+                    return {"ok": False, "exit_code": 1, "data": st}
+                return {"ok": True, "data": {"value": st}}
+            if "js_click_fallback" in expr:
+                return {"ok": True, "data": {"value": {"ok": True, "path": "js_click_fallback"}}}
+            return {"ok": True, "data": {"value": {"ok": True}}}
+        if args[:1] == ["wait-ms"]:
+            time.sleep(0.05)  # keep offline wait loops bounded
+            return {"ok": True, "data": {}}
+        if args and args[0] == "click":
+            r = self._next(self._click, None)
+            if isinstance(r, dict) and r.get("code"):
+                return {"ok": False, "exit_code": 1, "data": r}
+            return {"ok": True, "data": {}}
+        return {"ok": True, "data": {}}
+
+    def count(self, pred) -> int:
+        return sum(1 for c in self.calls if pred(c))
+
+
+def run_paging_recovery_offline_checks() -> list[str]:
+    """Offline: sync-refusal recovery on next-page (no browser, no JD)."""
+    fails: list[str] = []
+    is_click = lambda c: bool(c) and c[0] == "click"  # noqa: E731
+    is_sync = lambda c: c[:2] == ["cooperate", "sync"]  # noqa: E731
+    is_settled_sync = lambda c: c[:2] == ["cooperate", "sync"] and "--settle" in c  # noqa: E731
+    is_fallback = lambda c: bool(c) and c[0] == "evaluate" and "js_click_fallback" in " ".join(c)  # noqa: E731
+    before = ["a", "b"]
+
+    # 1) mark refused once -> one settled resync -> mark ok -> click ok
+    fb = _ScriptedBsk(mark=[_P19_REFUSAL], click=[None])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if not (r.get("ok") and r.get("resync_triggered") and r.get("path") == "bsk_click_selector"):
+        fails.append(f"paging: refusal then resync must click once: {r.get('reason')} {r.get('path')}")
+    if fb.count(is_click) != 1 or fb.count(is_settled_sync) < 1:
+        fails.append(f"paging: expected 1 click + settled resync, got clicks={fb.count(is_click)} settled={fb.count(is_settled_sync)}")
+    if r.get("reason") == "no_unique_enabled_next":
+        fails.append("paging: sync refusal must never be reported as no_unique_enabled_next")
+
+    # 2) refusal persists after the single resync -> real stage/error, no click
+    fb = _ScriptedBsk(mark=[_P19_REFUSAL, _P19_REFUSAL], click=[])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if r.get("ok") or r.get("reason") != "mark_sync_refused_after_resync" or r.get("failed_stage") != "mark_next":
+        fails.append(f"paging: persistent refusal must report mark_sync_refused_after_resync: {r.get('reason')}")
+    if fb.count(is_click) != 0 or fb.count(is_settled_sync) != 1:
+        fails.append(f"paging: persistent refusal: clicks={fb.count(is_click)} settled_syncs={fb.count(is_settled_sync)} (want 0/1)")
+    if not (r.get("error") or {}).get("code") == "permission_denied":
+        fails.append("paging: persistent refusal must carry the BSK error")
+
+    # 3) mark ran and found no button -> no_unique_enabled_next, no resync, no click
+    fb = _ScriptedBsk(mark=[{"ok": False, "reason": "no_markable_next"}], click=[])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if r.get("reason") != "no_unique_enabled_next" or r.get("resync_triggered") or fb.count(is_click):
+        fails.append(f"paging: genuine no-button must be no_unique_enabled_next without resync/click: {r.get('reason')}")
+
+    # 4) native click errors but page already advanced -> effective, never click again
+    fb = _ScriptedBsk(mark=[], click=[{"code": "timeout", "message": "click timed out"}],
+                      states=[{"current_page_hint": 2, "unique_ids": ["c", "d"]}])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if not (r.get("ok") and r.get("path") == "native_effective_despite_error"):
+        fails.append(f"paging: advanced page after click error must count as effective: {r.get('reason')} {r.get('path')}")
+    if fb.count(is_click) != 1 or fb.count(is_fallback):
+        fails.append("paging: effective click must not be repeated (no 2nd click / fallback)")
+
+    # 5) click error, still on page, effect unknown -> uncertain, no further click
+    fb = _ScriptedBsk(mark=[], click=[{"code": "timeout", "message": "click timed out"}],
+                      states=[{"current_page_hint": 1, "unique_ids": ["a", "b"]}])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if r.get("ok") or r.get("reason") != "click_outcome_uncertain" or fb.count(is_click) != 1 or fb.count(is_fallback):
+        fails.append(f"paging: uncertain click outcome must not re-click: {r.get('reason')}")
+
+    # 6) click refused (effect_state=none), still on page -> one resync + one more click
+    fb = _ScriptedBsk(mark=[], click=[_P19_REFUSAL, None],
+                      states=[{"current_page_hint": 1, "unique_ids": ["a", "b"]}])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if not (r.get("ok") and r.get("path") == "bsk_click_selector_after_resync") or fb.count(is_click) != 2:
+        fails.append(f"paging: verified no-effect click refusal must resync + click once more: {r.get('reason')} clicks={fb.count(is_click)}")
+
+    # 7) rate limit / other error on mark -> reported, no resync, no click
+    fb = _ScriptedBsk(mark=[{"code": "rate_limited", "message": "too many requests"}], click=[])
+    r = click_next_page(fb, "S", from_page=1, before_ids=before)
+    if r.get("reason") != "mark_eval_error" or r.get("resync_triggered") or fb.count(is_click) or fb.count(is_settled_sync):
+        fails.append(f"paging: non-sync error must stop without retry: {r.get('reason')}")
+
+    # 8) full turn: refusal -> recovery -> page 2 with new ids; diagnostics recorded
+    fb = _ScriptedBsk(mark=[_P19_REFUSAL], click=[None], states=[
+        {"current_page_hint": 1, "unique_ids": ["a", "b"], "card_stats": {"document_visibility": "visible"},
+         "next_control": {"status": "FOUND"}},
+        {"current_page_hint": 2, "unique_ids": ["c", "d", "e"], "loading_hint": False},
+    ])
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=3)
+    if not (nav.get("ok") and nav.get("page_after") == 2 and nav.get("new_count") == 3 and nav.get("resync_triggered")):
+        fails.append(f"paging: full turn after recovery must reach page 2: {nav.get('reason')} {nav.get('page_after')}")
+    if (nav.get("pre_turn") or {}).get("document_visibility") != "visible":
+        fails.append("paging: pre-turn visibility must be recorded")
+    if fb.count(is_click) != 1:
+        fails.append("paging: full turn must click exactly once")
+
+    # ---- post-click wait: refused state reads are NOT empty/original pages ----
+    is_scroll_nudge = lambda c: bool(c) and c[0] == "evaluate" and "scrollBy(0, Math.floor(innerHeight*0.8))" in " ".join(c)  # noqa: E731
+    pre = {"current_page_hint": 1, "unique_ids": ["a", "b"], "card_stats": {"document_visibility": "visible"}}
+    # W1: every read after the click refused (replays B911A2W 20261116T035638Z_collect_0efe2f)
+    fb = _ScriptedBsk(mark=[], click=[None], states=[pre], state_default=_P19_REFUSAL)
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=2)
+    rs = nav.get("read_stats") or {}
+    if nav.get("ok") or nav.get("reason") != PAGE_TURN_UNCONFIRMED or nav.get("page_after") is not None:
+        fails.append(f"wait: always-refused must be PAGE_TURN_UNCONFIRMED: {nav.get('reason')}")
+    if rs.get("valid_reads") != 0 or (rs.get("refused_reads") or 0) < 2 or rs.get("settled_resyncs", 99) > WAIT_MAX_SETTLED_RESYNCS:
+        fails.append(f"wait: always-refused stats wrong: {rs}")
+    if fb.count(is_click) != 1 or fb.count(is_scroll_nudge):
+        fails.append("wait: refused reads must not trigger re-click or scroll nudges")
+    if not (nav.get("last_read_error") or {}).get("code") == "permission_denied":
+        fails.append("wait: original refusal must be kept")
+    # W2: refused twice, then a valid page-2 read -> confirmed
+    fb = _ScriptedBsk(mark=[], click=[None], states=[pre, _P19_REFUSAL, _P19_REFUSAL,
+                      {"current_page_hint": 2, "unique_ids": ["c", "d"], "loading_hint": False}])
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=3)
+    if not (nav.get("ok") and nav.get("page_after") == 2 and nav.get("new_count") == 2):
+        fails.append(f"wait: refusal then valid page 2 must confirm: {nav.get('reason')} {nav.get('page_after')}")
+    # W3: valid reads that stay on page 1 -> page_not_advanced (genuine)
+    fb = _ScriptedBsk(mark=[], click=[None], states=[pre], state_default={"current_page_hint": 1, "unique_ids": ["a", "b"]})
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=1)
+    rs = nav.get("read_stats") or {}
+    if nav.get("reason") != "page_not_advanced" or rs.get("refused_reads") != 0 or not rs.get("valid_reads"):
+        fails.append(f"wait: valid same-page reads must be page_not_advanced: {nav.get('reason')} {rs}")
+    # W4: non-sync error during wait -> stop at once, no retry
+    fb = _ScriptedBsk(mark=[], click=[None], states=[pre, {"code": "rate_limited", "message": "too many"}])
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=3)
+    rs = nav.get("read_stats") or {}
+    if nav.get("reason") != PAGE_TURN_UNCONFIRMED or rs.get("reads") != 1 or rs.get("settled_resyncs") != 0:
+        fails.append(f"wait: non-sync error must stop without retry: {nav.get('reason')} {rs}")
+    # W5: valid same-page read, then refused until timeout -> unconfirmed (not page_not_advanced)
+    fb = _ScriptedBsk(mark=[], click=[None], states=[pre, {"current_page_hint": 1, "unique_ids": ["a", "b"]}],
+                      state_default=_P19_REFUSAL)
+    nav = turn_to_next_page(fb, "S", from_page=1, before_ids=before, timeout_s=1)
+    if nav.get("reason") != PAGE_TURN_UNCONFIRMED:
+        fails.append(f"wait: trailing refusals must stay unconfirmed: {nav.get('reason')}")
+    return fails
 
 
 PAGE_MAX_SCROLLS = 18

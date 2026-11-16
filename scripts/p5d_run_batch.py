@@ -190,12 +190,113 @@ def resolve_batch_budgets(
     }
 
 
+MISSING_CFG = "缺失（该SKU配置未提供）"
+DETAIL_STOP_ZH = {
+    "BUDGET_REACHED": "本SKU详情预算用完",
+    "DONE": "候选已全部处理",
+    "SESSION_PAUSED": "会话暂停（登录/验证/限流）",
+}
+
+
+def _rebase_into_batch(raw: Any, batch_dir: Path | None) -> Path | None:
+    """Map an absolute path recorded at run time onto this (possibly copied) batch dir."""
+    if not raw:
+        return None
+    p = Path(str(raw))
+    if batch_dir is None:
+        return p
+    parts = p.parts
+    if batch_dir.name in parts:
+        idx = len(parts) - 1 - list(reversed(parts)).index(batch_dir.name)
+        return batch_dir.joinpath(*parts[idx + 1 :])
+    return p
+
+
+def _read_json_or_none(path: Path | None) -> Any:
+    if path is None or not path.is_file():
+        return None
+    try:
+        return read_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def sku_report_facts(
+    ir: dict[str, Any], *, checkpoint: dict[str, Any], batch_dir: Path | None
+) -> dict[str, Any]:
+    """Per-SKU red line / unit (from that SKU's own config) and coverage split.
+
+    Never fills missing values with B913A defaults; never labels processed
+    (incl. model-skipped) candidates as verified.
+    """
+    item = ir.get("item") or {}
+    item_id = item.get("item_id")
+    summary = ir.get("sku_summary") or {}
+    cp_item = next(
+        (i for i in (checkpoint.get("items") or []) if i.get("item_id") == item_id), {}
+    )
+    cfg_path = None
+    if batch_dir is not None and item_id:
+        cand = batch_dir / "items" / str(item_id) / "business_config.json"
+        cfg_path = cand if cand.is_file() else None
+    if cfg_path is None:
+        cfg_path = _rebase_into_batch(cp_item.get("config_path"), batch_dir)
+    cfg = _read_json_or_none(cfg_path) or {}
+    job_dir = _rebase_into_batch(ir.get("sku_job_dir") or cp_item.get("sku_job_dir"), batch_dir)
+    progress = _read_json_or_none(job_dir / "job_progress.json") if job_dir else None
+    search_meta = _read_json_or_none(job_dir / "search" / "run_metadata.json") if job_dir else None
+    progress = progress or {}
+    search_meta = search_meta or {}
+
+    def cfg_val(key: str) -> str:
+        v = cfg.get(key)
+        return MISSING_CFG if v in (None, "") else str(v)
+
+    found = summary.get("candidates_found")
+    opened = summary.get("detail_pages_opened")
+    stage = str(progress.get("stage") or "")
+    detail_stop = DETAIL_STOP_ZH.get(stage, stage or "未记录")
+    if progress.get("pause_reason"):
+        detail_stop = f"{detail_stop}；pause={progress.get('pause_reason')}"
+    if stage == "BUDGET_REACHED" and progress.get("max_verify") is not None:
+        detail_stop = f"{detail_stop}（max_verify={progress.get('max_verify')}）"
+    collect_stop = search_meta.get("source_stop_reason") or search_meta.get("stop_reason")
+    cap_stop = search_meta.get("stop_reason")
+    before_cap = search_meta.get("candidates_collected_before_cap")
+    search_stop = str(collect_stop or "未记录")
+    if cap_stop and cap_stop != collect_stop:
+        search_stop += f"；候选截断={cap_stop}" + (
+            f"（采集{before_cap}→入选{found}）" if before_cap is not None else ""
+        )
+    return {
+        "red_line_cfg": cfg_val("red_line"),
+        "currency_cfg": cfg_val("currency"),
+        "comparison_unit_cfg": cfg_val("comparison_unit"),
+        "config_source": str(cfg_path) if cfg_path and cfg_path.is_file() else MISSING_CFG,
+        "candidates_selected": found,
+        "model_mismatch_skipped": summary.get(
+            "model_mismatch_skipped", summary.get("classification_skipped")
+        ),
+        "detail_navigations": opened,
+        "not_verified_budget": summary.get("not_verified_budget"),
+        "not_visited_not_exact_model": summary.get("not_visited_not_exact_model"),
+        "detail_verified_of_selected": (
+            f"{opened}/{found}" if opened is not None and found is not None else None
+        ),
+        "processed_incl_model_skip": summary.get("candidates_processed"),
+        "search_pages_visited": search_meta.get("pages_visited"),
+        "search_stop_reason": search_stop,
+        "detail_stop_reason": detail_stop,
+    }
+
+
 def aggregate_batch(
     *,
     batch_id: str,
     checkpoint: dict[str, Any],
     item_results: list[dict[str, Any]],
     parse_result: dict[str, Any],
+    batch_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build batch-level tables and stats. Per-SKU lowest only; no cross-SKU min."""
     sku_summaries: list[dict[str, Any]] = []
@@ -223,6 +324,7 @@ def aggregate_batch(
             price_options.append(o2)
 
         lowest = summary.get("lowest_comparable_take_home")
+        facts = sku_report_facts(ir, checkpoint=checkpoint, batch_dir=batch_dir)
         sku_summaries.append(
             {
                 "batch_id": batch_id,
@@ -233,8 +335,20 @@ def aggregate_batch(
                 "is_synthetic_test": item.get("is_synthetic_test"),
                 "status": status,
                 "search_query": item.get("search_query"),
-                "red_line": item.get("red_line"),
-                "currency": item.get("currency"),
+                # Red line / currency / unit from this SKU's own config file.
+                "red_line": facts["red_line_cfg"],
+                "currency": facts["currency_cfg"],
+                "comparison_unit": facts["comparison_unit_cfg"],
+                "config_source": facts["config_source"],
+                "candidates_selected": facts["candidates_selected"],
+                "model_mismatch_skipped": facts["model_mismatch_skipped"],
+                "detail_navigations": facts["detail_navigations"],
+                "not_visited_not_exact_model": facts["not_visited_not_exact_model"],
+                "detail_verified_of_selected": facts["detail_verified_of_selected"],
+                "processed_incl_model_skip": facts["processed_incl_model_skip"],
+                "search_pages_visited": facts["search_pages_visited"],
+                "search_stop_reason": facts["search_stop_reason"],
+                "detail_stop_reason": facts["detail_stop_reason"],
                 "candidates_found": summary.get("candidates_found"),
                 "detail_pages_opened": summary.get("detail_pages_opened"),
                 "not_verified_budget": summary.get("not_verified_budget"),
@@ -380,6 +494,31 @@ def aggregate_batch(
     }
 
 
+SKU_COLUMNS: list[tuple[str, str]] = [
+    ("excel_row", "原表行"),
+    ("business_sku", "业务SKU"),
+    ("red_line", "红线"),
+    ("currency", "币种"),
+    ("comparison_unit", "计价单位"),
+    ("status", "流程状态"),
+    ("coverage_status", "覆盖"),
+    ("candidates_selected", "入选候选数"),
+    ("model_mismatch_skipped", "型号不符跳过"),
+    ("detail_navigations", "实际详情导航"),
+    ("detail_verified_of_selected", "实际详情核验/入选"),
+    ("not_verified_budget", "预算未核验"),
+    ("not_visited_not_exact_model", "标题非精确型号未访问"),
+    ("search_pages_visited", "搜索页"),
+    ("search_stop_reason", "搜索停止原因"),
+    ("detail_stop_reason", "详情停止原因"),
+    ("products_possible_break", "疑似破价商品"),
+    ("products_review_required", "待核验商品"),
+    ("lowest_comparable_take_home", "本SKU最低可比到手价"),
+    ("sku_job_id", "SKU任务"),
+    ("error", "错误"),
+]
+
+
 def render_batch_html(agg: dict[str, Any]) -> str:
     esc = html.escape
     st = agg.get("stats") or {}
@@ -400,6 +539,21 @@ def render_batch_html(agg: dict[str, Any]) -> str:
                 + "</tr>"
             )
         return f"<table><tr>{head}</tr>{''.join(body)}</table>"
+
+    def labeled_table(rows_in: list[dict[str, Any]], cols: list[tuple[str, str]]) -> str:
+        if not rows_in:
+            return "<p>（无）</p>"
+        head = "".join(f"<th>{esc(label)}</th>" for _, label in cols)
+        body = "".join(
+            "<tr>"
+            + "".join(
+                f"<td>{esc(str(r.get(k) if r.get(k) is not None else ''))}</td>"
+                for k, _ in cols
+            )
+            + "</tr>"
+            for r in rows_in
+        )
+        return f"<table><tr>{head}</tr>{body}</table>"
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"/>
@@ -433,7 +587,9 @@ th{{background:#f5f5f5}}
  pause={esc(str(agg.get('pause_reason')))}</p>
 </div>
 <div class="card"><h2>SKU汇总（最低价不跨SKU）</h2>
-{table(rows, ['item_id','business_sku','status','coverage_status','sku_job_id','candidates_found','not_verified_budget','detail_pages_opened','products_possible_break','products_primary_low_price_signal','lowest_comparable_take_home','lowest_conditions','evidence_captured_at_utc','error'])}
+<p class="muted">红线/币种/计价单位读自各SKU自身配置；缺失即标注，不用其他SKU默认值补齐。
+「实际详情核验」只计打开详情的候选；型号不符跳过与预算未核验都不算已核验。</p>
+{labeled_table(rows, SKU_COLUMNS)}
 </div>
 <div class="card"><h2>输入错误</h2>
 {table(agg.get('input_errors') or [], ['excel_row','raw_sku','errors'])}
@@ -469,7 +625,10 @@ def write_batch_workbook(path: Path, agg: dict[str, Any], parse_result: dict[str
     default = wb.active
     wb.remove(default)
 
-    fill("SKU汇总", agg.get("sku_summaries") or [])
+    sku_rows = agg.get("sku_summaries") or []
+    lead = [k for k, _ in SKU_COLUMNS]
+    sku_keys = lead + [k for k in (sku_rows[0].keys() if sku_rows else []) if k not in lead]
+    fill("SKU汇总", sku_rows, sku_keys if sku_rows else None)
     fill("商品明细", agg.get("product_rows") or [])
     fill("价格方案", agg.get("price_options") or [])
     err_rows = []
@@ -625,6 +784,7 @@ def run_batch(
     backend: str | None = None,
     bsk_browser: str | None = None,
     model_scope_policy: Path | None = None,
+    exact_model_only: bool = False,
     focus_window: bool = False,
 ) -> dict[str, Any]:
     excel_path = Path(excel_path).resolve()
@@ -864,6 +1024,7 @@ def run_batch(
                     bsk_browser=bsk_browser,
                     model_scope_policy=model_scope_policy,
                     focus_window=focus_window,
+                    exact_model_only=exact_model_only,
                 )
                 summary = result.get("summary") or {}
                 # Restore manual overrides if any
@@ -1009,6 +1170,7 @@ def run_batch(
             checkpoint=checkpoint,
             item_results=item_results,
             parse_result=parsed,
+            batch_dir=batch_dir,
         )
         write_json_atomic(batch_dir / "batch_summary.json", agg)
         write_json_atomic(batch_dir / "sku_summaries.json", agg["sku_summaries"])
@@ -1038,6 +1200,38 @@ def run_batch(
         raise
     finally:
         lock.release()
+
+
+def rerender_batch_report(batch_dir: Path, out_dir: Path) -> dict[str, Any]:
+    """Offline: rebuild batch report/xlsx from an existing batch dir into out_dir.
+
+    Reads only the batch's own files (checkpoint, item_results, validation,
+    per-SKU configs/job files). Never writes into batch_dir; refuses to
+    overwrite an existing report in out_dir. No browser, no JD.
+    """
+    batch_dir = Path(batch_dir).resolve()
+    out_dir = Path(out_dir).resolve()
+    if out_dir == batch_dir or batch_dir in out_dir.parents:
+        raise ValueError("out_dir 不能位于原批次目录内（旧报告不覆盖）")
+    if (out_dir / "report.html").exists() or (out_dir / "batch_results.xlsx").exists():
+        raise FileExistsError(f"拒绝覆盖已有报告: {out_dir}")
+    checkpoint = read_json(batch_dir / "checkpoint.json")
+    item_results = read_json(batch_dir / "item_results.json")
+    parsed = _read_json_or_none(batch_dir / "validation_result.json") or {}
+    agg = aggregate_batch(
+        batch_id=str(checkpoint.get("batch_id") or batch_dir.name),
+        checkpoint=checkpoint,
+        item_results=item_results,
+        parse_result=parsed,
+        batch_dir=batch_dir,
+    )
+    agg["rerendered_offline_from"] = str(batch_dir)
+    agg["rerendered_at_utc"] = utc_iso()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(out_dir / "batch_summary.json", agg)
+    (out_dir / "report.html").write_text(render_batch_html(agg), encoding="utf-8")
+    write_batch_workbook(out_dir / "batch_results.xlsx", agg, parsed)
+    return {"out_dir": str(out_dir), "aggregate": agg}
 
 
 def run_offline_self_checks() -> int:
@@ -1685,12 +1879,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="BSK live-search: open the Agent Window in the foreground (default: background)",
     )
     p.add_argument("--model-scope-policy", type=Path, default=None)
+    p.add_argument(
+        "--exact-model-only",
+        action="store_true",
+        help="只对标题含完整型号的候选打开详情；其余记 NOT_VISITED_NOT_EXACT_MODEL（默认关闭）",
+    )
     p.add_argument("--self-check", action="store_true")
+    p.add_argument(
+        "--rerender-batch-dir",
+        type=Path,
+        default=None,
+        help="离线：从已有批次目录重建批量报告（不访问京东、不改原目录）",
+    )
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="--rerender-batch-dir 的输出目录（必须在原批次目录之外）",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.rerender_batch_dir:
+        if not args.out_dir:
+            print("参数错误: --rerender-batch-dir 需要 --out-dir")
+            return 2
+        try:
+            res = rerender_batch_report(args.rerender_batch_dir, args.out_dir)
+        except (ValueError, FileExistsError, FileNotFoundError) as exc:
+            print(f"参数/文件错误: {exc}")
+            return 2
+        for s in res["aggregate"].get("sku_summaries") or []:
+            print(
+                f"{s.get('business_sku')}: red_line={s.get('red_line')} {s.get('currency')}/"
+                f"{s.get('comparison_unit')} selected={s.get('candidates_selected')} "
+                f"model_skip={s.get('model_mismatch_skipped')} detail={s.get('detail_navigations')} "
+                f"budget_unverified={s.get('not_verified_budget')} "
+                f"search_stop={s.get('search_stop_reason')} detail_stop={s.get('detail_stop_reason')}"
+            )
+        print(f"report={Path(res['out_dir']) / 'report.html'}")
+        return 0
     if args.self_check:
         return run_offline_self_checks()
     if args.write_template:
@@ -1728,6 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
             bsk_browser=args.bsk_browser,
             focus_window=bool(args.focus_window),
             model_scope_policy=args.model_scope_policy,
+            exact_model_only=bool(args.exact_model_only),
         )
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         print(f"错误: {exc}")

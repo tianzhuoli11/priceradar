@@ -200,6 +200,31 @@ def _policy_allows_other_model(
     return True
 
 
+def _allowed_sheet_units(
+    packaging: dict[str, Any] | None, biz: dict[str, Any], biz_model: str
+) -> tuple[list[str], str]:
+    """Page units accepted for this SKU's sheets_per_pack.
+
+    - Confirmed packaging_basis for this exact model with page aliases → those
+      aliases (B913A: ["抽", "张"], confirmed 2026-10-19).
+    - Otherwise only the business unit itself (no automatic 张↔抽).
+    - No unit info at all → [] (caller falls back to legacy number-only).
+    """
+    if packaging and str(packaging.get("applicable_model") or "").upper() == biz_model:
+        aliases = [str(a) for a in (packaging.get("sheet_unit_page_aliases") or []) if a]
+        unit = packaging.get("sheet_unit_business")
+        if aliases:
+            extra = set(aliases) - ({str(unit)} if unit else set())
+            rule = "CONFIRMED_PACKAGING_PAGE_ALIASES" if extra else "BUSINESS_UNIT_ONLY"
+            return sorted(set(aliases)), rule
+        if unit:
+            return [str(unit)], "BUSINESS_UNIT_ONLY"
+    unit = biz.get("sheet_unit") or biz.get("sheet_unit_business")
+    if unit:
+        return [str(unit)], "BUSINESS_UNIT_ONLY"
+    return [], "NO_BUSINESS_UNIT"
+
+
 def analyze_spec_and_unit(
     specification_candidates: list[dict[str, Any]],
     model_candidates: list[dict[str, Any]],
@@ -306,15 +331,39 @@ def analyze_spec_and_unit(
         bool(biz_layers)
         and ocr_layers == [biz_layers]
     )
-    # Limited alias: for confirmed packaging, 抽/张 both map to sheets_per_pack.
-    alias_ok = False
-    if packaging and str(packaging.get("applicable_model") or "").upper() == biz_model:
-        aliases = packaging.get("sheet_unit_page_aliases") or []
-        if aliases and biz_sheets and ocr_sheets == [biz_sheets]:
-            alias_ok = True
-    sheets_match = bool(biz_sheets) and (
-        ocr_sheets == [biz_sheets] or alias_ok
+    # Sheet unit (抽 / 张) must also match. Page aliases apply only when this
+    # SKU's own confirmed packaging_basis lists them (e.g. B913A: 抽≡张);
+    # otherwise only the business unit itself is accepted.
+    allowed_units, unit_rule = _allowed_sheet_units(packaging, biz, biz_model)
+    observed_units = sorted(
+        {
+            str(s.get("sheet_unit"))
+            for s in specification_candidates
+            if s.get("sheets_or_pulls") is not None and s.get("sheet_unit")
+        }
     )
+    units_unknown = any(
+        s.get("sheets_or_pulls") is not None and not s.get("sheet_unit")
+        for s in specification_candidates
+    )
+    if not allowed_units:
+        unit_ok = True  # legacy config without any unit info: number-only
+        unit_rule = "NO_BUSINESS_UNIT_NUMBER_ONLY"
+    elif units_unknown:
+        # Unit not recorded (legacy candidate): parser only yields 抽/张, so it
+        # is acceptable only when both are explicitly allowed for this SKU.
+        unit_ok = {"抽", "张"} <= set(allowed_units)
+    else:
+        unit_ok = bool(observed_units) and set(observed_units) <= set(allowed_units)
+    sheets_match = (
+        bool(biz_sheets) and ocr_sheets == [biz_sheets] and unit_ok
+    )
+    unit_mismatch_reason = None
+    if bool(biz_sheets) and ocr_sheets == [biz_sheets] and not unit_ok:
+        unit_mismatch_reason = (
+            f"页面张/抽单位{observed_units or ['未知']}不在本SKU允许单位{sorted(allowed_units)}内；"
+            "未确认张抽等价，不按同规格换算"
+        )
 
     page_spec_matched = bool(
         model_ok_for_packaging
@@ -381,6 +430,10 @@ def analyze_spec_and_unit(
         ),
         "layers_match_business_config": layers_match,
         "sheets_match_business_config": sheets_match,
+        "sheet_unit_observed": observed_units,
+        "sheet_unit_allowed": sorted(allowed_units),
+        "sheet_unit_rule": unit_rule,
+        "sheet_unit_match": unit_ok,
         "page_spec_matched": page_spec_matched,
         "packaging_basis_applicable": packaging_applicable,
         "packaging_basis_note": packaging_reason,
@@ -415,8 +468,11 @@ def analyze_spec_and_unit(
         reasons.append(f"OCR层数{ocr_layers}与业务层数{biz_layers}未匹配")
     if not sheets_match:
         reasons.append(
-            f"OCR张/抽数{ocr_sheets}与业务{biz_sheets}未匹配"
-            "（抽/张仅在已确认箱规别名范围内互通）"
+            unit_mismatch_reason
+            or (
+                f"OCR张/抽数{ocr_sheets}与业务{biz_sheets}未匹配"
+                "（抽/张仅在已确认箱规别名范围内互通）"
+            )
         )
     if not box_evidence and not packaging_applicable:
         reasons.append(

@@ -785,6 +785,25 @@ def evaluate_clue_against_red_line(
     return out
 
 
+def ocr_price_amounts(candidates: list[dict[str, Any]]) -> set[str]:
+    """OCR amounts whose role maps to a price (excludes thresholds, coupon faces,
+    and unlabeled/unknown numbers)."""
+    out: set[str] = set()
+    for p in candidates or []:
+        if p.get("amount") is None:
+            continue
+        text = str(p.get("source_text") or "")
+        mapped = classify_ocr_amount_role(text, p.get("role"))
+        if mapped in {"EXCLUDED_THRESHOLD", "EXCLUDED_COUPON_FACE"}:
+            continue
+        # Unlabeled numbers (spec counts, review counts) are not price amounts,
+        # unless the OCR text itself carries a currency mark.
+        if mapped == "UNLABELED_OR_UNKNOWN" and not ("¥" in text or "￥" in text):
+            continue
+        out.add(str(p.get("amount")))
+    return out
+
+
 def build_price_clues_from_extraction(
     extraction: dict[str, Any] | None,
     *,
@@ -926,7 +945,10 @@ def build_price_clues_from_extraction(
             re_ev.get("after"),
             target_product_id=re_ev.get("target_product_id"),
             selected_spec_text=re_ev.get("selected_spec_text"),
-            ocr_amounts={str(p.get("amount")) for p in candidates if p.get("amount") is not None},
+            # Only OCR amounts recognised as prices (same filter as the OCR clue
+            # loop): unlabeled numbers such as spec counts (1层/200张/20包) are not
+            # "screenshot price amounts" and must not create a false DOM/OCR conflict.
+            ocr_amounts=ocr_price_amounts(candidates),
             evidence_source="capture:price_role_evidence",
             evidence_path=evidence_path,
             evidence_meta={
@@ -1644,6 +1666,22 @@ def run_local_take_home_checks() -> list[str]:
         failures.append("role: struck amount must be recorded as excluded")
     if aggregate_system_verdict(cl1).get("system_verdict") != SYSTEM_POSSIBLE_BREAK:
         failures.append("role: resolved unique take-home below red on comparable box keeps normal gates")
+
+    # 1a) unlabeled spec numbers from OCR (1层/200张/20包) are not screenshot price
+    #     amounts: they must not create a false DOM/OCR conflict (regression for
+    #     batch 20261116T023222Z_batch_f43aa3 rank3_100313575427).
+    spec_nums = [
+        {"amount": a, "role": "unlabeled_number_candidate", "source_text": None}
+        for a in ("1", "200", "20")
+    ]
+    cl1a, st1a = _role_run(ev1, ocr=spec_nums)
+    if st1a.get("status") != "RESOLVED" or len(_declared(cl1a)) != 1:
+        failures.append(f"role: unlabeled spec numbers must not conflict with DOM amount: {st1a}")
+    # ...but a real OCR price amount that differs still blocks resolution.
+    real_conflict = [{"amount": "135", "role": "currency_tagged_price_candidate", "source_text": "¥135"}]
+    _cl1c, st1c = _role_run(ev1, ocr=real_conflict)
+    if st1c.get("status") != "AMBIGUOUS":
+        failures.append(f"role: differing OCR price amount must stay ambiguous: {st1c}")
 
     # 1b) same, but gates not met (box not comparable) -> no break, gates unchanged
     st_b: dict[str, Any] = {}

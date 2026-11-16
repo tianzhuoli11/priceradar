@@ -238,6 +238,49 @@ def _row_dict_from_sheet(ws, excel_row: int, header_map: dict[int, str]) -> dict
     return out
 
 
+PRODUCT_CONFIG_DIR = PROJECT_ROOT / "config" / "products"
+
+
+def confirmed_sheet_unit_aliases(
+    model: str,
+    *,
+    sheet_unit: str,
+    layers: int | None,
+    sheets: int | None,
+    packs: int | None,
+) -> tuple[list[str] | None, str | None]:
+    """Page unit aliases confirmed for this exact model + spec, else (None, None).
+
+    Source of truth: config/products/*.json packaging_basis (user-confirmed),
+    e.g. B913A 张 with page aliases 抽/张 (2026-10-19). Never inferred.
+    """
+    if not model or not PRODUCT_CONFIG_DIR.is_dir():
+        return None, None
+    for path in sorted(PRODUCT_CONFIG_DIR.glob("*.json")):
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        basis = cfg.get("packaging_basis") if isinstance(cfg, dict) else None
+        if not isinstance(basis, dict):
+            continue
+        if str(basis.get("applicable_model") or "").upper() != str(model).upper():
+            continue
+        if str(basis.get("sheet_unit_business") or "") != sheet_unit:
+            continue
+        if (
+            basis.get("layers") != layers
+            or basis.get("sheets_per_pack") != sheets
+            or basis.get("packs_per_box") != packs
+        ):
+            continue
+        aliases = [str(a) for a in (basis.get("sheet_unit_page_aliases") or []) if a]
+        if aliases:
+            rel = path.relative_to(PROJECT_ROOT).as_posix()
+            return aliases, f"{rel}#packaging_basis(confirmed {basis.get('confirmed_date')})"
+    return None, None
+
+
 def _normalize_row(
     raw: dict[str, Any], *, excel_row: int
 ) -> tuple[dict[str, Any] | None, list[str]]:
@@ -320,13 +363,16 @@ def _normalize_row(
         search_query = " ".join(p for p in (brand, model) if p)
 
     packaging_complete = bool(packs and target_spec)
-    aliases = []
+    # No automatic 张↔抽: page aliases come only from a registered product
+    # config whose confirmed packaging_basis matches this exact model/spec.
+    aliases = [sheet_unit] if sheet_unit else []
+    alias_source = None
     if sheet_unit:
-        aliases.append(sheet_unit)
-        if sheet_unit == "张":
-            aliases.append("抽")
-        elif sheet_unit == "抽":
-            aliases.append("张")
+        confirmed, alias_source = confirmed_sheet_unit_aliases(
+            model, sheet_unit=sheet_unit, layers=layers, sheets=sheets, packs=packs
+        )
+        if confirmed:
+            aliases = confirmed
 
     packaging_basis = None
     if packaging_complete:
@@ -365,6 +411,7 @@ def _normalize_row(
         "sheets_or_pulls": sheets,
         "sheet_unit": sheet_unit or None,
         "sheet_unit_aliases": aliases or None,
+        "sheet_unit_alias_source": alias_source,
         "packs_per_box": packs,
         "target_spec": target_spec or "",
         "packaging_basis_text": packaging_basis_text or None,

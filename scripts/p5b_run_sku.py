@@ -32,6 +32,8 @@ MAX_VERIFY_CAP = 30
 STATUS_NOT_VERIFIED_BUDGET = "NOT_VERIFIED_BUDGET"
 STATUS_NOT_VISITED_BUDGET = "NOT_VISITED_BUDGET"  # alias in reports
 STATUS_CLASSIFICATION_SKIPPED = "CLASSIFICATION_SKIPPED"
+# Opt-in run mode: only titles carrying the exact full model get detail visits.
+STATUS_NOT_VISITED_NOT_EXACT = "NOT_VISITED_NOT_EXACT_MODEL"
 
 SOURCE_LIVE_SEARCH = "live-search"
 SOURCE_EXISTING_COLLECTION = "existing-collection"
@@ -305,8 +307,14 @@ def candidate_detail_plan(
     *,
     cfg: dict[str, Any],
     model_scope_policy: dict[str, Any] | None,
+    exact_model_only: bool = False,
 ) -> dict[str, Any]:
-    """Decide whether this candidate needs a detail navigation (budget-consuming)."""
+    """Decide whether this candidate needs a detail navigation (budget-consuming).
+
+    exact_model_only (opt-in): a candidate whose title is not the exact full
+    model (TARGET) is not opened; it is recorded as NOT_VISITED_NOT_EXACT_MODEL
+    (neither model-mismatch, nor budget, nor verified).
+    """
     expected_model = str(cfg.get("expected_model") or "")
     business_sku = str(cfg.get("business_sku") or expected_model)
     gate = cand.get("title_gate") or adapt.title_model_gate(
@@ -318,11 +326,19 @@ def candidate_detail_plan(
     skip_browse = bool(gate.get("skip_browse"))
     needs_detail = (not skip_browse) or bool(auth.get("allowed"))
     classification_skip = skip_browse and not auth.get("allowed")
+    exact_only_skip = bool(
+        exact_model_only
+        and not classification_skip
+        and gate.get("classification") != model_match.CLASS_TARGET
+    )
+    if exact_only_skip:
+        needs_detail = False
     return {
         "gate": gate,
         "title_auth": auth,
         "needs_detail": needs_detail,
         "classification_skip": classification_skip,
+        "exact_only_skip": exact_only_skip,
         "authorization_note": (
             auth.get("other_model_label_zh")
             if auth.get("allowed")
@@ -1215,7 +1231,10 @@ def build_sku_summary(
         or r.get("match_status") == "MODEL_MISMATCH_SKIPPED"
         or r.get("execution_status") == STATUS_CLASSIFICATION_SKIPPED
     )
-    visited = len(real_rows) - paused_unvisited - not_verified_budget
+    not_visited_not_exact = sum(
+        1 for r in real_rows if r.get("match_status") == STATUS_NOT_VISITED_NOT_EXACT
+    )
+    visited = len(real_rows) - paused_unvisited - not_verified_budget - not_visited_not_exact
     model_skip = classification_skipped
     comparable_products = sum(
         1
@@ -1349,6 +1368,7 @@ def build_sku_summary(
         "detail_pages_opened": detail_pages_opened,
         "model_mismatch_skipped": model_skip,
         "classification_skipped": classification_skipped,
+        "not_visited_not_exact_model": not_visited_not_exact,
         "not_verified_budget": not_verified_budget,
         "completed": completed,
         "failed": failed,
@@ -1404,6 +1424,7 @@ def build_sku_summary(
             "detail_pages_opened": detail_pages_opened,
             "model_mismatch_skipped": model_skip,
             "classification_skipped": classification_skipped,
+        "not_visited_not_exact_model": not_visited_not_exact,
             "not_verified_budget": not_verified_budget,
             "paused_unvisited": paused_unvisited,
             "completed": completed,
@@ -1555,7 +1576,9 @@ def render_report_html(
     exec_line = (
         f"任务执行完成={esc(str(summary.get('job_execution_complete')))} · "
         f"全部候选核验完毕={esc(str(summary.get('all_candidates_verified')))} · "
-        f"覆盖={esc(str(summary.get('verified_coverage_of_candidates')))}"
+        f"已处理(含型号不符跳过)={esc(str(summary.get('verified_coverage_of_candidates')))} · "
+        f"实际详情核验={esc(str(summary.get('detail_pages_opened')))}/"
+        f"{esc(str(summary.get('candidates_found')))}（型号跳过与预算未核验不算已核验）"
     )
     partial_flag = ""
     if cov.get("partial_or_restricted"):
@@ -1681,6 +1704,7 @@ def run_sku_job(
     job_dir: Path | None = None,
     job_id: str | None = None,
     focus_window: bool = False,
+    exact_model_only: bool = False,
 ) -> dict[str, Any]:
     started = utc_now()
     cfg, errs = adapt.load_business_baseline(business_config)
@@ -1879,6 +1903,7 @@ def run_sku_job(
         "existing_collection_dir": existing_dir_resolved,
         "backend": backend_norm,
         "bsk_browser": bsk_browser,
+        "exact_model_only": bool(exact_model_only),
         "model_scope_policy_id": (model_scope_policy or {}).get("policy_id")
         if model_scope_policy
         else None,
@@ -2055,7 +2080,8 @@ def run_sku_job(
                 continue
             rank = cand.get("rank")
             plan = candidate_detail_plan(
-                cand, cfg=cfg, model_scope_policy=model_scope_policy
+                cand, cfg=cfg, model_scope_policy=model_scope_policy,
+                exact_model_only=exact_model_only,
             )
 
             # Resume: skip completed; optionally retry failed; resume pause/budget.
@@ -2111,6 +2137,49 @@ def run_sku_job(
                     "synthetic": bool(cand.get("synthetic")),
                 }
                 attempts.append(att)
+                progress["completed_product_ids"].append(pid)
+                save_progress(job_dir, progress)
+                write_json(job_dir / "product_rows.json", product_rows)
+                write_json(job_dir / "candidate_attempts.json", attempts)
+                continue
+
+            if plan.get("exact_only_skip"):
+                row = not_verified_budget_row(
+                    business_sku=business_sku,
+                    red_line=red_line,
+                    candidate=cand,
+                    max_verify=max_ver,
+                    plan=plan,
+                )
+                row.update(
+                    {
+                        "take_home_status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "task_status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "match_status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "execution_status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "system_verdict": STATUS_NOT_VISITED_NOT_EXACT,
+                        "system_verdict_zh": (
+                            "本轮仅核验标题含完整型号的候选；该候选标题未见完整型号，"
+                            "未打开详情（不代表不匹配，也不代表未破价）"
+                        ),
+                    }
+                )
+                product_rows.append(row)
+                attempt_seq += 1
+                attempts.append(
+                    {
+                        "product_id": pid,
+                        "seq": attempt_seq,
+                        "attempt_id": new_attempt_id(attempt_seq),
+                        "status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "match_status": STATUS_NOT_VISITED_NOT_EXACT,
+                        "result_path": None,
+                        "discovered_at": cand.get("discovered_at_utc"),
+                        "navigation_consumed": False,
+                        "classification": plan.get("gate", {}).get("classification"),
+                        "synthetic": bool(cand.get("synthetic")),
+                    }
+                )
                 progress["completed_product_ids"].append(pid)
                 save_progress(job_dir, progress)
                 write_json(job_dir / "product_rows.json", product_rows)

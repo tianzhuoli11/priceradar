@@ -934,11 +934,18 @@ def failure_row(
     processed_at: str,
     product_id: str | None = None,
     capture_source: str = "unknown",
+    business: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # Use this run's business baseline (per-SKU override); p4b.BUSINESS is the
+    # legacy B913A default only when no baseline was supplied.
+    biz = business or p4b.BUSINESS
+    red = biz.get("red_line_price_cny_per_box")
+    if not isinstance(red, Decimal):
+        red = p4b.to_decimal(red) or p4b.BUSINESS["red_line_price_cny_per_box"]
     return {
         "pipeline_status": pipeline_status,
         "product_id": product_id or "",
-        "business_sku": p4b.BUSINESS["model"],
+        "business_sku": biz.get("business_sku") or biz.get("model") or p4b.BUSINESS["model"],
         "observed_model": "",
         "spec_raw": "",
         "spec_normalized": "",
@@ -951,7 +958,7 @@ def failure_row(
         "price": None,
         "currency": "",
         "price_basis": "",
-        "red_line_price": format(p4b.BUSINESS["red_line_price_cny_per_box"], "f"),
+        "red_line_price": format(red, "f"),
         "red_line_unit": "CNY_per_box",
         "price_delta": None,
         "verdict": "NOT_EVALUATED",
@@ -1018,6 +1025,7 @@ def process_capture_run(
             reason=reason,
             run_dir=run_dir,
             processed_at=processed_at,
+            business=biz,
         )
         detail["errors"].append(reason)
         detail["pipeline_status"] = "FAILED"
@@ -1034,6 +1042,7 @@ def process_capture_run(
             reason=reason,
             run_dir=run_dir,
             processed_at=processed_at,
+            business=biz,
         )
         detail["errors"].append(reason)
         detail["pipeline_status"] = "FAILED"
@@ -1069,6 +1078,7 @@ def process_capture_run(
             run_dir=run_dir,
             processed_at=processed_at,
             product_id=identity.get("metadata_product_id"),
+            business=biz,
         )
         detail["pipeline_status"] = "FAILED"
         detail["table_row"] = row
@@ -1106,6 +1116,7 @@ def process_capture_run(
             run_dir=run_dir,
             processed_at=processed_at,
             product_id=identity.get("metadata_product_id"),
+            business=biz,
         )
         detail["pipeline_status"] = "FAILED"
         detail["table_row"] = row

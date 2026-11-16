@@ -1,0 +1,3 @@
+6312d62534002bb507ab35fd0351eaba514f41b1061134a4de98cc855b1f9a55  priceradar-workbuddy-skill-v2.zip
+c4f66dd69541216a3078bb71c61660d704140eb08b91f361b9c1e5ead93c7acd  priceradar-project-v2.zip
+2ed7baa9166c77a1dd32d3589e53cd0fdee64b5084b4bb779a6d69ec5aeb66ba  PriceRadar-v2-macOS安装说明.md

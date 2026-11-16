@@ -22,7 +22,7 @@ PACKAGING_PASSED = "PASSED"
 PACK_RE = re.compile(r"(\d+)\s*包")
 LAYER_RE = re.compile(r"(\d+|单|双)\s*层")
 _LAYER_WORD = {"单": "1", "双": "2"}  # 单层=1层、双层=2层
-SHEET_RE = re.compile(r"(\d+)\s*(?:抽|张)")
+SHEET_RE = re.compile(r"(\d+)\s*(抽|张)")
 
 
 def parse_spec_tokens(text: str | None) -> dict[str, Any]:
@@ -32,6 +32,9 @@ def parse_spec_tokens(text: str | None) -> dict[str, Any]:
         "packs": None,
         "layers": None,
         "sheets_or_pulls": None,
+        # Observed page unit (抽 / 张). Kept separate: 抽≠张 unless the SKU's own
+        # confirmed packaging_basis lists both as page aliases.
+        "sheet_unit": None,
         "has_box_word": "箱" in t if t else False,
     }
     if not t:
@@ -45,6 +48,7 @@ def parse_spec_tokens(text: str | None) -> dict[str, Any]:
     m = SHEET_RE.search(t)
     if m:
         out["sheets_or_pulls"] = m.group(1)
+        out["sheet_unit"] = m.group(2)
     return out
 
 
@@ -150,6 +154,7 @@ def selected_spec_candidates_for_unit(
                 "packs": tok["packs"],
                 "layers": tok["layers"],
                 "sheets_or_pulls": tok["sheets_or_pulls"],
+                "sheet_unit": tok["sheet_unit"],
                 "unit_box_evidence": (
                     "text_contains_箱" if tok["has_box_word"] else None
                 ),

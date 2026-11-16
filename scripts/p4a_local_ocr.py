@@ -42,7 +42,7 @@ MODEL_RE = re.compile(
 )
 LAYER_RE = re.compile(r"(\d+|单|双)\s*层")
 _LAYER_WORD = {"单": "1", "双": "2"}  # 单层=1层、双层=2层
-SHEET_RE = re.compile(r"(\d+)\s*(?:抽|张)")
+SHEET_RE = re.compile(r"(\d+)\s*(抽|张)")
 PACK_RE = re.compile(r"(\d+)\s*包")
 QTY_RE = re.compile(r"(\d+)\s*个")
 PROMO_HINTS = (
@@ -376,6 +376,7 @@ def extract_from_blocks(
         m = SHEET_RE.search(text)
         if m:
             spec_obj["sheets_or_pulls"] = m.group(1)
+            spec_obj["sheet_unit"] = m.group(2)
             spec_hit = True
         m = PACK_RE.search(text)
         if m:

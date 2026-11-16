@@ -2435,6 +2435,11 @@ def run_offline_self_checks() -> int:
     if not any(i < click_idx for i in syncs_before_click):
         failures.append("a cooperate sync must precede the click")
 
+    # ---- next-page sync-refusal recovery (synthetic client, offline) ----
+    _pg = bsk_rt.run_paging_recovery_offline_checks()
+    failures.extend(_pg)
+    print(f"paging recovery checks: {'OK' if not _pg else _pg}")
+
     vis_fails, vis_status = run_card_visibility_fixture_check()
     failures.extend(vis_fails)
     print(f"card visibility fixture: {vis_status}")

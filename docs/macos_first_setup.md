@@ -1,157 +1,228 @@
-# PriceRadar macOS 首次设置指南（接收方）
+# PriceRadar v2 · macOS 安装与首次使用说明
 
-适用于：在 **Mac** 上用 **WorkBuddy** 运行本项目的第一版（已登记商品单次检查，当前真实验证商品为 **B913A**）。
+照着从上往下做即可。终端命令可以整段复制粘贴。
 
-**说明**
+你会收到两个 ZIP（文件名以实际收到的为准）：
 
-- 安装 WorkBuddy Skill **不会**自动安装 Python / Chrome / 项目依赖。
-- **不要**从 Windows 拷贝 `.venv` 或 `browser_profiles`。
-- 本指南中的命令需在 **项目根目录**执行（解压后的 `priceradar/`）。
-- Windows 历史验收价（例如 168.00）**不是**固定预期，也禁止当作实时兜底。
-- **macOS / WorkBuddy 实机运行尚未在本交付中验证**；以下为按项目现状整理的首次设置步骤。
+| 文件 | 怎么用 |
+| --- | --- |
+| `priceradar-workbuddy-skill-v2.zip` | **不要解压**，直接在 WorkBuddy 里“上传技能” |
+| `priceradar-project-v2.zip` | **解压**，得到 `priceradar` 文件夹，这是真正运行的程序 |
+
+> 说明：本版本在 Windows 上做过实测和离线检查，**在 Mac 和 WorkBuddy 里还没有实际跑过**。遇到和本说明不一致的地方，请截图发回给我，不要自己改程序。
 
 ---
 
-## 1. 解压项目到固定位置
+## 0. 先确认电脑条件
 
-1. 解压 `priceradar-project-v1.zip`。
-2. 建议放到固定路径，例如：`~/Projects/priceradar`（路径可含空格，但不建议过长）。
-3. 确认根目录能看到：`README.md`、`requirements.txt`、`scripts/p4d_run_product.py`、`config/products/b913a.json`。
-
-## 2. 在 WorkBuddy 中选定工作空间
-
-1. 打开 WorkBuddy。
-2. 将**项目根目录**设为当前工作空间 / 工作目录（以 WorkBuddy 界面为准）。
-3. 不要把 Skill 安装目录当成项目数据目录；Profile 与 `artifacts/` 必须留在项目运行目录。
-
-## 3. 导入并启用 PriceRadar Skill
-
-1. 使用 `priceradar-workbuddy-skill-v1.zip`。
-2. 在 WorkBuddy：**专家·技能·连接器** → **技能** → **添加技能** → **上传技能**。
-3. 上传 ZIP；确认顶层为 `priceradar/SKILL.md` 结构。
-4. 在「已安装」中**启用**该技能。
-
-> 包结构已按开放平台文档准备；**WorkBuddy 导入待你在本机验收**（本交付未替你完成真实导入）。
-
-可粘贴：
-
-> 请使用PriceRadar技能检查当前项目的Mac运行环境。先完成只读检查，列出缺失依赖和具体设置步骤；环境就绪后引导我在独立Chrome窗口登录京东。
-
-## 4. 检测系统、芯片架构与 Python
-
-在终端进入项目根目录后执行（先用系统里可用的 `python3`）：
+打开「终端」（启动台 → 其他 → 终端），粘贴：
 
 ```bash
-cd /path/to/priceradar
-uname -m
-python3 --version
-which python3
+uname -m; sw_vers -productVersion
 ```
 
-解读：
+- 第一行要是 `arm64`（Apple 芯片 M1/M2/M3/M4…）。如果是 `x86_64`（Intel Mac），OCR 组件装不上，先停下告诉我。
+- 第二行要是 `14` 或更高（macOS Sonoma 及以后）。低于 14 也先停下告诉我。
 
-- `arm64`：Apple Silicon
-- `x86_64`：Intel
+## 1. 解压项目 ZIP
 
-若没有 `python3`：从 [python.org](https://www.python.org/downloads/) 安装官方 macOS 安装包（**不要**默认假设已安装 Homebrew；也**不要**用 `sudo pip` 改系统 Python）。
-
-建议使用 **Python 3.12.x**（与 Windows 验证环境接近）。若仅有 3.11/3.13，需自行确认 `onnxruntime` / `rapidocr` 轮子是否可用；**未在本交付中验证**。
-
-## 5. 创建项目自己的 `.venv`
+1. 在「访达」里新建文件夹：你的用户目录下的 `PriceRadar`（即 `~/PriceRadar`，路径里不要有空格更省事）。
+2. 把 `priceradar-project-v2.zip` 放进去，双击解压，得到 `~/PriceRadar/priceradar/`。
+3. 在终端确认：
 
 ```bash
-cd /path/to/priceradar
-python3 -m venv .venv
+cd ~/PriceRadar/priceradar
+ls README.md requirements.txt scripts/p4d_run_product.py config/products/b913a.json
+```
+
+四个文件名都打印出来、没有 “No such file” 就对了。
+
+## 2. 安装 Python 3.12
+
+Mac 自带的 `python3` 往往版本太旧（3.9），**不能用**。
+
+1. 打开 <https://www.python.org/downloads/macos/>，下载 **Python 3.12.x 的 macOS 64-bit universal2 installer**，双击安装。
+2. 终端确认：
+
+```bash
+python3.12 --version
+```
+
+显示 `Python 3.12.x` 即可。
+
+## 3. 安装 Google Chrome
+
+如果还没有：从 <https://www.google.com/chrome/> 下载安装，拖进「应用程序」。路径应为 `/Applications/Google Chrome.app`。
+
+## 4. 创建虚拟环境并安装依赖
+
+```bash
+cd ~/PriceRadar/priceradar
+python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-```
-
-确认解释器：
-
-```bash
-.venv/bin/python -c "import sys; print(sys.executable); print(sys.version)"
-```
-
-## 6. 在该 `.venv` 内安装依赖
-
-以仓库锁定文件为准（勿静默升级 Windows 已验证组合）：
-
-```bash
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pip install -r requirements-ocr.txt
 ```
 
-当前锁定：
+- 需要联网下载（PyPI），几分钟。
+- 不要加 `sudo`，不要运行 `playwright install`（程序直接用你装好的 Chrome）。
+- 如果报错，把**最后 20 行**截图发给我，不要自己改版本号。
 
-- `playwright==1.64.0`
-- `rapidocr==3.10.0`
-- `onnxruntime==1.31.0`
-- `Pillow==13.0.0`
-
-**兼容性说明（未在 Mac 真机验证）**
-
-- `onnxruntime` / `rapidocr` 通常提供 macOS 轮子，但具体是否覆盖你的 Python 小版本 + `arm64`/`x86_64` 需安装时确认。
-- 若 `pip install` 失败：记录完整报错；不要擅自换库版本除非你知情并授权。
-- **不要**运行 `playwright install` 去下载捆绑 Chromium；本项目使用系统 Google Chrome（`channel="chrome"`）。
-
-只读环境检查（不访问京东、不启动浏览器）：
+## 5. 环境自检（不会打开浏览器，不访问京东）
 
 ```bash
+cd ~/PriceRadar/priceradar
 .venv/bin/python scripts/priceradar_env_check.py --project-root .
 ```
 
-若 `ready_for_live_check` 为 false，按输出的 `next_steps` 处理。
+看最后几行：
 
-## 7. 安装 / 检查 Google Chrome
+- `ready_for_live_check: True` → 可以继续。
+- `False` → 按下面 `next_steps:` 列出的缺项处理，处理完再跑一次。
 
-1. 若未安装：打开 [Google Chrome 官方下载页](https://www.google.com/chrome/) 安装。
-2. 常见路径：`/Applications/Google Chrome.app`
-3. 再次运行 `priceradar_env_check.py`，确认 `chrome_found: true`。
+## 6. 在 WorkBuddy 里导入技能、选工作空间
 
-## 8. 首次登录（独立 Profile，可见窗口）
+> 这一节的菜单名称**没有在真实 WorkBuddy 里核对过**，以你看到的界面为准。
 
-**必须在本机亲自登录**；不要在聊天里发送密码或 Cookie。
+1. **上传技能**：在 WorkBuddy 的技能管理处（上一版说明写的是「专家·技能·连接器 → 技能 → 添加技能 → 上传技能」）选择上传，选中 `priceradar-workbuddy-skill-v2.zip`（不用解压）。
+   - 这个 ZIP 打开后第一层就是 `SKILL.md` 和 `references/` 文件夹。
+   - 如果提示“找不到 SKILL.md / 结构不对 / 格式不支持”，截图发给我，我换一种打包结构。
+2. 在「已安装」里**启用** `priceradar` 技能。
+3. **选工作空间**：把 `~/PriceRadar/priceradar` 这个文件夹设为 WorkBuddy 的工作空间 / 工作目录（通常是“打开文件夹”或“选择工作空间”）。注意选的是**解压出来的 priceradar 文件夹**，不是 ZIP，也不是技能安装目录。
+
+可以先发这句话测试技能能不能找到项目：
+
+```text
+请用 PriceRadar 技能检查当前项目的 Mac 运行环境，只做只读检查，告诉我缺什么。
+```
+
+## 7. 首次登录京东（必须你自己操作）
+
+这一步要在终端里交互，建议直接在「终端」运行：
 
 ```bash
-cd /path/to/priceradar
+cd ~/PriceRadar/priceradar
 .venv/bin/python scripts/p1b_jd_login.py
 ```
 
-实际 CLI（经项目核实）：
+1. 输入 `1` 回车（首次登录）。
+2. 会弹出一个新的 Chrome 窗口（独立的，不影响你平时的 Chrome）。在里面**自己登录京东**（扫码或账号都可以）。
+3. 登录后回到终端，按提示回答几个问题（不要输入真实手机号、密码），回车关闭浏览器。
+4. 再运行一次同一命令，这次输入 `2`，确认不用重新登录也能看到已登录状态。
 
-- 交互选择：`1` 首次登录验证，或 `2` 重启复用验证。
-- 脚本会打开**可见** Chrome，使用项目内 `browser_profiles/jd_persistent/`。
-- 按终端提示在浏览器中完成登录，再回到终端回答非敏感核验问题（不要输入真实昵称/手机号/密码）。
-- **没有**已核实的「完全非交互、免人工确认」登录开关；请勿使用臆造参数。
+账号、密码、验证码、Cookie **不要**发到 WorkBuddy 聊天里，也不要发给我。
 
-建议顺序：先跑一次模式 `1`，关闭后再跑一次模式 `2` 确认复用。
+## 8. 第一次检查 B913A
 
-同一 Profile **不要**并发跑多个自动化任务。
+在 WorkBuddy 里输入：
 
-## 9. 运行一次 B913A 检查并打开报告
+```text
+使用 PriceRadar 检查已登记的清风 B913A，执行一次检查，输出中文比价表和本次报告路径。证据不足或需要登录时直接告诉我，不要下确定结论。
+```
 
-环境就绪且已登录后：
+会发生什么：
+
+- 弹出一个 Chrome 窗口，自动打开 B913A 商品页、截图，然后自己关闭（期间不要操作这个窗口）。
+- 一两分钟后（第一次识别文字可能更久），WorkBuddy 给出结果表和报告路径。
+
+不用 WorkBuddy，也可以在终端直接跑同一检查：
 
 ```bash
-cd /path/to/priceradar
+cd ~/PriceRadar/priceradar
 .venv/bin/python scripts/p4d_run_product.py --product-config config/products/b913a.json
 ```
 
-或在 WorkBuddy 粘贴：
+### 怎么看报告
 
-> 使用PriceRadar检查已登记的B913A，执行一次实时检查，输出比价表和本次报告路径。证据不足时标记待核验。
-
-关注终端中的：
-
-- `PRICERADAR_RUN_RESULT=.../run_result.json`（**本次**精确结果，勿猜「最新目录」）
-- `HTML 报告` 绝对路径
-- `verdict`：`BREAK` / `NOT_BREAK` / `REVIEW_REQUIRED`
-
-用浏览器打开报告 HTML。退出码 `0` **不等于**已获得可靠可比价。
+- 输出最后有一行 `PRICERADAR_RUN_RESULT=…/run_result.json`，还有 `HTML 报告: …/report.html`。
+- 打开报告：`open "<把 HTML 报告后面的路径粘贴到这里>"`，或在访达里进入 `priceradar/artifacts/end_to_end_runs/<本次的 run_id>/` 双击 `report.html`。
+- 结论含义：
+  - `NOT_BREAK`：这次检查的链接没有低于 127 元/箱。
+  - `BREAK`：**疑似**破价，请自己打开商品页确认后再处理。
+  - `REVIEW_REQUIRED`：证据不足，需要人工看截图，**不代表**没破价。
+- 以前看到过的价格（如 168 元/箱）只是历史，不代表这次应该是这个价。
 
 ---
 
-## 能力边界（第一版）
+## 常见问题
 
-**承诺**：已登记商品的单次检查（当前仅 B913A 有 Windows 真实验收）。
+### A. WorkBuddy 说找不到项目
 
-**不承诺 / 未实现**：自动搜索、批量、多店最低价、新商品自动登记、定时通知；不宣称 macOS 或 WorkBuddy 已跑通。
+- 确认工作空间选的是 `~/PriceRadar/priceradar`（里面直接能看到 `README.md` 和 `scripts` 文件夹），不是外层 `PriceRadar`、不是 ZIP。
+- 解压后如果出现 `priceradar/priceradar/` 两层，选**里面那层**。
+- 也可以直接告诉 WorkBuddy：“项目在 ~/PriceRadar/priceradar”。
+
+### B. 缺依赖 / 自检不是 True
+
+| 现象 | 处理 |
+| --- | --- |
+| `python3.12: command not found` | 第 2 步没装好，重新安装 python.org 的 3.12 |
+| `venv: exists=False` | 重新做第 4 步 |
+| `dep playwright: {'ok': False…}` | `.venv/bin/python -m pip install -r requirements.txt` |
+| `dep rapidocr / onnxruntime: {'ok': False…}` | `.venv/bin/python -m pip install -r requirements-ocr.txt`；若提示没有匹配版本，多半是 Intel 芯片或 macOS 低于 14，截图发我 |
+| `chrome_found: False` | 第 3 步，把 Chrome 装到「应用程序」 |
+| 第一次检查卡在识别文字 | OCR 首次可能要加载模型，等几分钟；仍失败把终端最后 20 行发我 |
+
+### C. 登录失效 / 验证码 / 访问受限
+
+- 结果里出现“需要登录 / LOGIN_REQUIRED / 验证 / 访问频繁 / REVIEW_REQUIRED（原因含登录）”：
+  1. 关掉所有 PriceRadar 打开的 Chrome 窗口；
+  2. 重新执行第 7 步（选 `1`）自己登录；
+  3. 过一会儿再检查一次。不要连续反复跑。
+- 提示 Profile 被占用 / Chrome 打不开：确认没有另一次检查正在跑，关掉 PriceRadar 打开的 Chrome 窗口后再试。
+- 程序不会自动登录、领券、加购或下单。
+
+---
+
+## 进阶（非首次使用，需要时再看）
+
+实时搜索京东上所有 B913A 商品、Excel 批量、续跑，需要另装 **BrowserSkill**（腾讯开源，用你日常 Chrome + 扩展）。这部分在 Windows 小样本测过，**Mac 上未测**，第一次使用不需要。
+
+1. 安装命令行工具（官方脚本，装到 `~/.local/bin`）：
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Tencent/BrowserSkill/main/install.sh | sh
+   export PATH="$HOME/.local/bin:$PATH"
+   bsk --version
+   ```
+
+2. 在日常 Chrome 里安装 BrowserSkill 扩展（Chrome 应用商店，或按 GitHub 说明加载），并按扩展提示完成配对。在这个日常 Chrome 里自己登录京东。
+3. 另开一个终端窗口启动 daemon，并保持这个窗口不关：
+
+   ```bash
+   ~/.local/bin/bsk daemon start --foreground --daemon-idle 2h
+   ```
+
+   默认端口在 Mac 上一般可用；若提示端口被占用，可加 `--port 54100`（Windows 上就是这么处理的）。以上参数来自 Windows 用法，Mac 上待验证。
+4. 回到原终端做连接检查（四条都要成功）：
+
+   ```bash
+   export BSK_AUTO_START=0
+   ~/.local/bin/bsk --json status
+   ~/.local/bin/bsk --json doctor
+   ~/.local/bin/bsk --json browsers
+   ```
+
+   `browsers` 里应能看到你的 Chrome。多个实例时记下要用的 instance id。
+5. 运行单 SKU 实时搜索（**必须**先设置 `BSK_EXE`，因为程序默认找的是 Windows 的 `bsk.exe`）：
+
+   ```bash
+   cd ~/PriceRadar/priceradar
+   export BSK_EXE="$HOME/.local/bin/bsk"
+   .venv/bin/python scripts/p5b_run_sku.py --business-config config/products/b913a.json --backend bsk --max-candidates 20 --max-pages 2 --max-verify 3
+   ```
+
+   输出里的 `job_dir=` 和 `report=` 就是本次结果。报告只代表“本次搜索范围内”。若提示运行 `start_bsk_daemon.ps1`，那是 Windows 脚本，Mac 上按第 3 步处理。
+
+更多命令（续跑、批量、可选的 B913A OTHER 型号策略）见技能里的 `references/advanced.md`。
+
+## 离线自检（可选，不开浏览器、不访问京东）
+
+```bash
+cd ~/PriceRadar/priceradar
+.venv/bin/python scripts/p4d_run_product.py --self-test
+.venv/bin/python scripts/p5b_run_sku.py --self-check
+.venv/bin/python scripts/p5d_run_batch.py --self-check
+```
+
+最后分别看到 `self_test_failures=[]`、`OK: all offline checks passed` 类字样即通过。

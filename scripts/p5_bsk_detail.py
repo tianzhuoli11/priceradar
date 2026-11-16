@@ -17,11 +17,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from p5_bsk_runtime import (  # type: ignore
+    SYNC_REQUIRED_REASONS,
     BskClient,
     check_prereqs,
     cooperate_policy_from_prereqs,
     cooperate_sync,
     eval_json,
+    is_sync_required_error,
     observe_page,
     pick_browser,
     sanitize,
@@ -504,6 +506,10 @@ def classify_session_block(page_info: dict[str, Any]) -> str | None:
     return None
 
 
+# Sync-required refusal recognizer is shared with paging: see p5_bsk_runtime
+# (SYNC_REQUIRED_REASONS / is_sync_required_error).
+
+
 def page_info_is_observation_error(page_info: dict[str, Any] | None) -> bool:
     """BSK strict observation_changed / permission_denied is not page identity."""
     if not isinstance(page_info, dict):
@@ -519,14 +525,14 @@ def page_info_is_observation_error(page_info: dict[str, Any] | None) -> bool:
         )
         or ""
     )
-    if reason == "observation_changed":
+    if reason in SYNC_REQUIRED_REASONS:
         return True
     msg = str(page_info.get("message") or "")
     if "observation changed" in msg.lower():
         return True
     # Nested evaluate failure payloads stored as page_classify.
     blob = json.dumps(page_info, ensure_ascii=False)
-    if "observation_changed" in blob and not page_info.get("href"):
+    if is_sync_required_error(blob) and not page_info.get("href"):
         return True
     if '"code": "permission_denied"' in blob and not page_info.get("url_product_id"):
         return True
@@ -799,9 +805,7 @@ def eval_selection_state_with_one_resync(
         )
 
     val, err = _once()
-    if isinstance(err, dict) and "observation_changed" in json.dumps(
-        err, ensure_ascii=False
-    ):
+    if isinstance(err, dict) and is_sync_required_error(err):
         cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
         time.sleep(0.35)
         val, err = _once()
@@ -819,7 +823,7 @@ def _capture_price_role_evidence(
         )
 
     val, err = _once()
-    if isinstance(err, dict) and "observation_changed" in json.dumps(err, ensure_ascii=False):
+    if isinstance(err, dict) and is_sync_required_error(err):
         cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
         time.sleep(0.35)
         val, err = _once()
@@ -1079,8 +1083,7 @@ def capture_region_bsk(
                 )
                 or ""
             )
-            blob = json.dumps(err, ensure_ascii=False)
-            if "observation_changed" in blob or reason == "observation_changed":
+            if is_sync_required_error(err) or reason in SYNC_REQUIRED_REASONS:
                 cooperate_sync(
                     client, session_id, policy=cooperate_policy, settle=True
                 )
@@ -1173,56 +1176,107 @@ def capture_region_bsk(
         "stale_discover_box_refused": stale_discover_box,
     }
 
+    # Screenshot receipt: taken AFTER scroll / first box re-read. Between this
+    # receipt and the screenshot nothing may refresh the observation, so the
+    # pre-screenshot box read is bound to the SAME receipt (eval_json given both
+    # context and observation does not sync). Same observation => crop box and
+    # viewport correspond. A refused read stays BOX_STALE_BEFORE_SCREENSHOT (no
+    # resync here: a resync would supersede the receipt again).
     sync_vp = cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
-    # Re-read box once more under the screenshot observation to avoid stale crop.
-    box_info2, box_err2, _ = _eval_with_one_resync(box_js)
-    if isinstance(box_info2, dict) and box_info2.get("ok") and isinstance(
-        box_info2.get("box"), dict
-    ):
-        live_box = box_info2["box"]
-        dpr = float(box_info2.get("dpr") or dpr)
-        info["box"] = live_box
-        info["box_refresh_pre_screenshot"] = sanitize(box_info2)
-        info["geometry"]["device_pixel_ratio"] = dpr
-        info["geometry"]["box_css"] = live_box
-    elif box_err2:
-        info["status"] = "BOX_STALE_BEFORE_SCREENSHOT"
-        info["box_error_pre_screenshot"] = box_err2
-        info["note"] = "截图前 DOM box 未能在当前观察下刷新；拒绝用旧坐标裁切"
-        return info
-
-    vp_tmp = out_path.parent / f"_tmp_viewport_{meta_key}.png"
-    shot_vp = screenshot_session(
-        client,
-        session_id,
-        vp_tmp,
-        ref=None,
-        context_id=sync_vp.get("context_id"),
-        observation_id=sync_vp.get("observation_id"),
-        cooperate_policy=cooperate_policy,
-    )
-    info["viewport_shot"] = {
-        "ok": bool(shot_vp.get("ok")),
-        "path": shot_vp.get("path"),
-        "file_saved": bool(vp_tmp.is_file()),
+    info["screenshot_receipt"] = {
+        "context_id": sync_vp.get("context_id"),
+        "observation_id": sync_vp.get("observation_id"),
     }
-    crop = _crop_viewport_to_dom_box(
-        vp_tmp, out_path, live_box if isinstance(live_box, dict) else {},
-        device_pixel_ratio=dpr,
-    )
-    info["crop"] = sanitize(crop)
-    info["content_valid"] = bool(
-        crop.get("ok")
-        and out_path.is_file()
-        and (crop.get("out_size_px") or [0, 0])[0] >= 8
-        and (crop.get("out_size_px") or [0, 0])[1] >= 8
-    )
-    info["file_saved"] = bool(out_path.is_file())
-    try:
-        if vp_tmp.is_file():
-            vp_tmp.unlink()
-    except OSError:
-        pass
+    primary_skip = None
+    if not sync_vp.get("context_id"):
+        primary_skip = "SCREENSHOT_RECEIPT_UNAVAILABLE"
+        info["note"] = "未取得截图观察收据（context）；不做主截图裁切，转入现有兜底"
+    else:
+        # Box read bound to the SAME receipt via a direct evaluate (eval_json would
+        # re-sync when the receipt has no observation id, superseding it).
+        from p5_bsk_runtime import _append_cooperate_receipt  # noqa: PLC0415
+        _args = ["evaluate", "--session", session_id, box_js]
+        _append_cooperate_receipt(_args, sync_vp, include_observation=bool(sync_vp.get("observation_id")))
+        _res = client.run(_args, timeout=60)
+        _data = _res.get("data")
+        _val = _data.get("value") if isinstance(_data, dict) and "value" in _data else _data
+        if isinstance(_val, str):
+            try:
+                _val = json.loads(_val)
+            except json.JSONDecodeError:
+                pass
+        box_info2, box_err2 = eval_value_or_error(
+            {"ok": _res.get("ok"), "value": _val, "raw": sanitize(_res)}
+        )
+        if isinstance(box_info2, dict) and box_info2.get("ok") and isinstance(
+            box_info2.get("box"), dict
+        ):
+            live_box = box_info2["box"]
+            dpr = float(box_info2.get("dpr") or dpr)
+            info["box"] = live_box
+            info["box_refresh_pre_screenshot"] = sanitize(box_info2)
+            info["geometry"]["device_pixel_ratio"] = dpr
+            info["geometry"]["box_css"] = live_box
+        elif box_err2:
+            info["status"] = "BOX_STALE_BEFORE_SCREENSHOT"
+            info["box_error_pre_screenshot"] = box_err2
+            info["note"] = "截图前 DOM box 未能在当前观察下刷新；拒绝用旧坐标裁切"
+            return info
+        else:
+            # Read ran under the receipt but gave no usable box: correspondence to
+            # the screenshot viewport cannot be confirmed -> no primary crop.
+            primary_skip = "BOX_NOT_CONFIRMED_UNDER_RECEIPT"
+            info["box_result_pre_screenshot"] = sanitize(box_info2)
+            info["note"] = "截图观察下未取得有效元素位置；不使用其他观察的坐标裁切，转入现有兜底"
+    info["primary_skipped_reason"] = primary_skip
+
+    if primary_skip:
+        info["viewport_shot"] = {"ok": False, "skipped": primary_skip}
+        crop = {"ok": False, "reason": primary_skip}
+        info["crop"] = crop
+    else:
+        vp_tmp = out_path.parent / f"_tmp_viewport_{meta_key}.png"
+        shot_vp = screenshot_session(
+            client,
+            session_id,
+            vp_tmp,
+            ref=None,
+            context_id=sync_vp.get("context_id"),
+            observation_id=sync_vp.get("observation_id"),
+            cooperate_policy=cooperate_policy,
+        )
+        _vp_raw = shot_vp.get("raw") if isinstance(shot_vp.get("raw"), dict) else {}
+        _vp_data = _vp_raw.get("data") if isinstance(_vp_raw.get("data"), dict) else {}
+        info["viewport_shot"] = {
+            "ok": bool(shot_vp.get("ok")),
+            "path": shot_vp.get("path"),
+            "file_saved": bool(vp_tmp.is_file()),
+            # Diagnostics only (behaviour unchanged): what BSK actually returned.
+            "expected_path": str(vp_tmp),
+            "exit_code": _vp_raw.get("exit_code"),
+            "error_code": _vp_data.get("code"),
+            "error_reason": (_vp_data.get("data") or {}).get("reason") if isinstance(_vp_data.get("data"), dict) else _vp_data.get("reason"),
+            "error_message": str(_vp_data.get("message") or "")[:200] or None,
+            "stderr": str(_vp_raw.get("stderr") or "")[:300] or None,
+            "had_receipt": bool(sync_vp.get("context_id")),
+        }
+        crop = _crop_viewport_to_dom_box(
+            vp_tmp, out_path, live_box if isinstance(live_box, dict) else {},
+            device_pixel_ratio=dpr,
+        )
+        info["crop"] = sanitize(crop)
+        info["content_valid"] = bool(
+            crop.get("ok")
+            and out_path.is_file()
+            and (crop.get("out_size_px") or [0, 0])[0] >= 8
+            and (crop.get("out_size_px") or [0, 0])[1] >= 8
+        )
+        info["file_saved"] = bool(out_path.is_file())
+        try:
+            if vp_tmp.is_file():
+                vp_tmp.unlink()
+        except OSError:
+            pass
 
     # Audit-only: resolve VOM leaf ref (often yen digit) — not used as primary crop.
     obs = observe_page(client, session_id, cooperate_policy=cooperate_policy, settle=False)
@@ -1357,10 +1411,16 @@ def run_bsk_detail_capture(
     out_dir: Path | None = None,
     browser: str | None = None,
     keep_session_on_block: bool = True,
+    extra_capture: Any = None,
 ) -> dict[str, Any]:
     """
     Navigate desktop detail in Agent Window via BrowserSkill.
     Returns capture-compatible dict for p5a pause/identity gates.
+
+    extra_capture (optional, default None = unchanged behaviour): callable run in
+    the SAME session after region screenshots and BEFORE the "after" selection /
+    price snapshots, so before/after consistency brackets it. Never called on a
+    session block (login / verification / rate limit return earlier).
     """
     pid = str(product_id).strip()
     url = (product_url or DESKTOP_ITEM_TMPL.format(pid=pid)).strip()
@@ -1726,6 +1786,19 @@ def run_bsk_detail_capture(
             regions_out["viewport_diagnostic"] = vp
             write_json(out_dir / "region_viewport_diagnostic.json", vp)
 
+        if extra_capture is not None:
+            try:
+                result["extra_capture"] = sanitize(
+                    extra_capture(
+                        client=client,
+                        session_id=session_id,
+                        out_dir=out_dir,
+                        cooperate_policy=cooperate_policy,
+                        product_id=pid,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - record, keep capture
+                result["extra_capture"] = {"status": "EXCEPTION", "error": f"{type(exc).__name__}: {exc}"}
         selection_after, sel_after_err, _sel_a_retry = eval_selection_state_with_one_resync(
             client, session_id, cooperate_policy=cooperate_policy
         )
@@ -1919,6 +1992,54 @@ def run_offline_bsk_detail_checks() -> list[str]:
             failures.append("selection_state non-observation error must not retry")
     finally:
         _g["eval_json"], _g["cooperate_sync"] = _orig_eval, _orig_sync
+
+    # Protocol 1.9 (extension 0.5.x) refusal, verbatim shape from batch
+    # 20261116T023222Z_batch_f43aa3: permission_denied + cooperation_sync_required.
+    _p19 = {
+        "ok": False,
+        "raw": {
+            "code": "permission_denied",
+            "message": "The action's observed content changed; synchronize and replan",
+            "data": {"effect_state": "none", "reason": "cooperation_sync_required",
+                     "observed_change": {"change": "added", "part": "region"}},
+        },
+    }
+    if not is_sync_required_error(_p19) or not page_info_is_observation_error(_p19["raw"]):
+        failures.append("protocol 1.9 cooperation_sync_required must be a sync-required error")
+    for _bad in ({"code": "x", "data": {"reason": "rate_limited"}}, {"code": "LOGIN_REQUIRED"}):
+        if is_sync_required_error(_bad):
+            failures.append(f"non-sync error must not match: {_bad}")
+    _g2 = globals()
+    _oe, _os = _g2["eval_json"], _g2["cooperate_sync"]
+    try:
+        _c2 = {"eval": 0, "sync": 0}
+
+        def _fe(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _c2["eval"] += 1
+            return _p19 if _c2["eval"] == 1 else {"ok": True, "value": {"selected_status": "SELECTED_SPEC_EXTRACTED"}}
+
+        def _fs(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _c2["sync"] += 1
+            return {"ok": True}
+
+        _g2["eval_json"], _g2["cooperate_sync"] = _fe, _fs
+        _v, _e, _r = eval_selection_state_with_one_resync(None, "s", cooperate_policy="strict")
+        if _e or not _r or _c2 != {"eval": 2, "sync": 1}:
+            failures.append(f"selection_state protocol-1.9 refusal must resync once: {_c2} {_e}")
+        _c2.update(eval=0, sync=0)
+
+        def _fe_role(*_a: Any, **_k: Any) -> dict[str, Any]:
+            _c2["eval"] += 1
+            return _p19 if _c2["eval"] == 1 else {"ok": True, "value": {"schema": "price-role-evidence-v1", "status": "CAPTURED", "amount_nodes": []}}
+
+        _g2["eval_json"] = _fe_role
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as _td:
+            _pr = _capture_price_role_evidence(None, "s", "strict", Path(_td) / "pr.json")
+        if _c2 != {"eval": 2, "sync": 1} or _pr.get("status") != "CAPTURED":
+            failures.append(f"price-role probe protocol-1.9 refusal must resync once: {_c2} {_pr.get('status')}")
+    finally:
+        _g2["eval_json"], _g2["cooperate_sync"] = _oe, _os
 
     # Recovered classify after resync → normal identity path
     recovered = {
