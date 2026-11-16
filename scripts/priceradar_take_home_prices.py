@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 RULES_VERSION_TAKE_HOME = "p5a-take-home-v4"
@@ -336,6 +337,18 @@ def _role_signature(ev: dict[str, Any]) -> list[tuple[str, Any]]:
     )
 
 
+def _compare_spec_selection():
+    """Shared group-wise comparator from priceradar_selected_spec (same dir)."""
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location(
+        "priceradar_selected_spec_shared", Path(__file__).resolve().parent / "priceradar_selected_spec.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.compare_spec_selection
+
+
 def resolve_price_roles_from_dom_evidence(
     evidence_before: dict[str, Any] | None,
     evidence_after: dict[str, Any] | None,
@@ -343,6 +356,7 @@ def resolve_price_roles_from_dom_evidence(
     target_product_id: str | None,
     selected_spec_text: str | None,
     ocr_amounts: set[str] | None = None,
+    spec_selection: dict[str, Any] | None = None,
     evidence_source: str,
     evidence_path: str | None = None,
     evidence_meta: dict[str, Any] | None = None,
@@ -372,16 +386,39 @@ def resolve_price_roles_from_dom_evidence(
         st["reasons"].append("无可用的同次 DOM 价格角色证据（未采集或采集失败）")
         return None, st
     st["status"] = "INVALID"
+    structured = isinstance(spec_selection, dict) and bool(spec_selection.get("groups")) and all(
+        isinstance(e.get("spec_selection"), dict) and e["spec_selection"].get("groups") for e in evs
+    )
+    st["spec_compare_mode"] = "structured_groups" if structured else "legacy_text"
+    if structured:
+        _cmp = _compare_spec_selection()
     for e in evs:
         if target_product_id and str(e.get("url_product_id") or "") != str(target_product_id):
             st["reasons"].append("价格角色证据的商品 ID 与目标不一致")
             return None, st
-        if selected_spec_text and str(e.get("selected_spec_text") or "") != str(selected_spec_text):
+        if structured:
+            res = _cmp(e["spec_selection"], spec_selection, expected_product_id=target_product_id)
+            st.setdefault("spec_compare", []).append(res)
+            if res["status"] == "OPTIONS_NOT_CAPTURED":
+                # Price role may still be resolved, but it is NOT bound to a full spec.
+                st["spec_binding"] = "UNBOUND_OPTIONS_NOT_CAPTURED"
+                continue
+            if res["status"] != "MATCH":
+                st["reasons"].append("价格角色证据的选中规格与当前选中规格不一致: " + "; ".join(res["reasons"]))
+                return None, st
+        elif selected_spec_text and str(e.get("selected_spec_text") or "") != str(selected_spec_text):
             st["reasons"].append("价格角色证据的选中规格与当前选中规格不一致")
+            return None, st
+    if len(evs) == 2 and structured:
+        res = _cmp(evs[0]["spec_selection"], evs[1]["spec_selection"], expected_product_id=target_product_id)
+        if res["status"] == "OPTIONS_NOT_CAPTURED":
+            st["spec_binding"] = "UNBOUND_OPTIONS_NOT_CAPTURED"
+        elif res["status"] != "MATCH":
+            st["reasons"].append("前后两次价格角色证据的选中规格不一致: " + "; ".join(res["reasons"]))
             return None, st
     if len(evs) == 2 and (
         _role_signature(evs[0]) != _role_signature(evs[1])
-        or evs[0].get("selected_spec_text") != evs[1].get("selected_spec_text")
+        or (not structured and evs[0].get("selected_spec_text") != evs[1].get("selected_spec_text"))
     ):
         st["reasons"].append("前后两次价格角色证据金额/划线状态不一致（页面不稳定）")
         return None, st
@@ -945,6 +982,7 @@ def build_price_clues_from_extraction(
             re_ev.get("after"),
             target_product_id=re_ev.get("target_product_id"),
             selected_spec_text=re_ev.get("selected_spec_text"),
+            spec_selection=re_ev.get("spec_selection"),
             # Only OCR amounts recognised as prices (same filter as the OCR clue
             # loop): unlabeled numbers such as spec counts (1层/200张/20包) are not
             # "screenshot price amounts" and must not create a false DOM/OCR conflict.
@@ -972,6 +1010,25 @@ def build_price_clues_from_extraction(
                 if key in seen:
                     continue
                 seen.add(key)
+                if role_status.get("spec_binding") == "UNBOUND_OPTIONS_NOT_CAPTURED":
+                    # Observed price only: no box conversion, no red line, no low-price hint.
+                    clue = dict(clue)
+                    clue.update({
+                        "observed_price_only": True,
+                        "spec_binding": "UNBOUND_OPTIONS_NOT_CAPTURED",
+                        "normalized_price": None,
+                        "price_delta": None,
+                        "red_line": None,
+                        "red_line_not_applied": True,
+                        "low_price_hint": False,
+                        "manual_verdict": None,
+                        "system_verdict": SYSTEM_REVIEW_REQUIRED,
+                        "system_verdict_zh": "观察到的价格（规格选项未采到，未绑定完整规格）",
+                        "review_reasons": list(dict.fromkeys(list(clue.get("review_reasons") or []) + [
+                            "规格选项未采到：价格未绑定完整规格，不做箱价换算与红线判断"])),
+                    })
+                    clues.append(clue)
+                    continue
                 clue = evaluate_clue_against_red_line(
                     clue,
                     red_line=red_line,

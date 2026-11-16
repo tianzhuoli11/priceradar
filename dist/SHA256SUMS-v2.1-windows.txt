@@ -1,0 +1,3 @@
+44a399b8fb571daa9a295e0bafa2dcb1a328eb710ad00939f909f34644b95db0  priceradar-workbuddy-skill-v2-windows.zip
+ea33ade4aa1af89077a855d64413c0b09ce98ad5f5bbfb0b59def7cd10a2a69f  priceradar-project-v2.1-windows.zip
+82037e531c5afa425dbc4016715eee29b77918ba0ab357ee8acaffb383ff611d  PriceRadar-v2.1-Windows安装说明.md

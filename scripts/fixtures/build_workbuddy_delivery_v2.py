@@ -260,15 +260,35 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", default="", help="optional JSON report path")
     ap.add_argument("--platform", choices=sorted(PLATFORMS), default="macos")
+    ap.add_argument("--tag", default=TAG, help="file-name tag (new tag = new file names; never overwrites)")
+    ap.add_argument("--version", default=VERSION, help="VERSION written into the project zip")
+    ap.add_argument("--project-only", action="store_true",
+                    help="build only the project zip + guide; reuse the existing (unchanged) skill zip of --skill-tag")
+    ap.add_argument("--skill-tag", default=TAG, help="tag of the existing skill zip referenced with --project-only")
     args = ap.parse_args(argv)
 
     plat = PLATFORMS[args.platform]
     SKILL_SRC = PROJECT_ROOT / plat["skill_src"]
     sfx = plat["suffix"]
-    SKILL_ZIP = DIST / f"priceradar-workbuddy-skill-{TAG}{sfx}.zip"
-    PROJECT_ZIP = DIST / f"priceradar-project-{TAG}{sfx}.zip"
-    GUIDE_OUT = DIST / plat["guide_out"]
-    SUMS_OUT = DIST / f"SHA256SUMS-{TAG}{sfx}.txt"
+    tag, version = args.tag, args.version
+    if not SEMVER_RE.match(version):
+        print(f"REFUSE: bad version {version}")
+        return 2
+    SKILL_ZIP = DIST / f"priceradar-workbuddy-skill-{(args.skill_tag if args.project_only else tag)}{sfx}.zip"
+    PROJECT_ZIP = DIST / f"priceradar-project-{tag}{sfx}.zip"
+    GUIDE_OUT = DIST / plat["guide_out"].replace(f"-{TAG}-", f"-{tag}-")
+    SUMS_OUT = DIST / f"SHA256SUMS-{tag}{sfx}.txt"
+    # Shipped docs must name the files actually delivered in this build.
+    subs = [(f"priceradar-project-{TAG}{sfx}.zip", PROJECT_ZIP.name),
+            (f"priceradar-workbuddy-skill-{TAG}{sfx}.zip", SKILL_ZIP.name),
+            (f"v{VERSION}", f"v{version}"),
+            (f"PriceRadar {TAG} ·", f"PriceRadar {tag} ·")]
+
+    def doc_bytes(src: Path) -> bytes:
+        text = src.read_text(encoding="utf-8")
+        for a, b in subs:
+            text = text.replace(a, b)
+        return text.encode("utf-8")
     MAC_GUIDE = PROJECT_ROOT / plat["guide"]
     allowlist = (
         (plat["readme"], "README.md"),
@@ -282,9 +302,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"REFUSE: shell script {arc} not in platform extra list")
             return 2
 
-    for out in (SKILL_ZIP, PROJECT_ZIP, GUIDE_OUT, SUMS_OUT):
+    new_outputs = (PROJECT_ZIP, GUIDE_OUT, SUMS_OUT) if args.project_only else (SKILL_ZIP, PROJECT_ZIP, GUIDE_OUT, SUMS_OUT)
+    for out in new_outputs:
         if out.exists():
             print(f"REFUSE: {out} already exists (bump TAG instead of overwriting)")
+            return 2
+    if args.project_only:
+        if not SKILL_ZIP.is_file():
+            print(f"REFUSE: --project-only needs existing {SKILL_ZIP}")
+            return 2
+        with zipfile.ZipFile(SKILL_ZIP) as zf:  # reused skill zip must equal the current skill source
+            stale = [n for n in zf.namelist() if not (SKILL_SRC / n).is_file() or (SKILL_SRC / n).read_bytes() != zf.read(n)]
+            extra_src = sorted(p.relative_to(SKILL_SRC).as_posix() for p in SKILL_SRC.rglob("*") if p.is_file()
+                               and p.relative_to(SKILL_SRC).as_posix() not in zf.namelist())
+        if stale or extra_src:
+            print(f"REFUSE: skill source changed since {SKILL_ZIP.name}: {stale + extra_src}")
             return 2
     DIST.mkdir(parents=True, exist_ok=True)
 
@@ -298,18 +330,27 @@ def main(argv: list[str] | None = None) -> int:
     if skill_errs:
         print("skill source invalid:", skill_errs)
         return 1
-    skill_members = write_zip(SKILL_ZIP, skill_pairs)
+    if args.project_only:
+        with zipfile.ZipFile(SKILL_ZIP) as zf:
+            skill_members = zf.namelist()
+    else:
+        skill_members = write_zip(SKILL_ZIP, skill_pairs)
 
+    doc_arcs = {"README.md", plat["guide"]}
     project_pairs = [
-        (PROJECT_ROOT / src, PROJECT_PREFIX + arc) for src, arc in allowlist
+        (PROJECT_ROOT / src, PROJECT_PREFIX + arc) for src, arc in allowlist if arc not in doc_arcs
     ]
     project_members = write_zip(
         PROJECT_ZIP,
         project_pairs,
-        extra={PROJECT_PREFIX + "VERSION": f"{VERSION}\n".encode()},
+        extra={
+            PROJECT_PREFIX + "README.md": doc_bytes(PROJECT_ROOT / plat["readme"]),
+            PROJECT_PREFIX + plat["guide"]: doc_bytes(MAC_GUIDE),
+            PROJECT_PREFIX + "VERSION": f"{version}\n".encode(),
+        },
     )
 
-    shutil.copyfile(MAC_GUIDE, GUIDE_OUT)
+    GUIDE_OUT.write_bytes(doc_bytes(MAC_GUIDE))
 
     sums = {p.name: sha256(p) for p in (SKILL_ZIP, PROJECT_ZIP, GUIDE_OUT)}
     SUMS_OUT.write_text(
@@ -318,7 +359,9 @@ def main(argv: list[str] | None = None) -> int:
 
     report = {
         "built_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "version": VERSION,
+        "version": version,
+        "tag": tag,
+        "skill_zip_reused_unchanged": bool(args.project_only),
         "platform": args.platform,
         "skill_zip": str(SKILL_ZIP),
         "project_zip": str(PROJECT_ZIP),

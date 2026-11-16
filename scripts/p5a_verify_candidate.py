@@ -383,6 +383,7 @@ def load_capture_panel_contexts(capture_dir: Path) -> list[dict[str, Any]]:
     product_id = None
     captured_at = None
     selected_spec = None
+    spec_selection = None
     purchase_qty = None
     meta_path = capture_dir / "metadata.json"
     if meta_path.is_file():
@@ -401,6 +402,8 @@ def load_capture_panel_contexts(capture_dir: Path) -> list[dict[str, Any]]:
             if isinstance(st, dict):
                 product_id = product_id or st.get("url_product_id")
                 selected_spec = selected_spec or st.get("selected_spec_text")
+                if spec_selection is None and isinstance(st.get("spec_selection"), dict):
+                    spec_selection = st.get("spec_selection")
                 if purchase_qty is None:
                     purchase_qty = st.get("purchase_quantity")
         except (OSError, json.JSONDecodeError):
@@ -468,6 +471,7 @@ def load_capture_panel_contexts(capture_dir: Path) -> list[dict[str, Any]]:
                 "after": role_files.get("after"),
                 "target_product_id": product_id,
                 "selected_spec_text": selected_spec,
+                "spec_selection": spec_selection,
             }
     return contexts
 

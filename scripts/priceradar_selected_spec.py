@@ -25,6 +25,78 @@ _LAYER_WORD = {"单": "1", "双": "2"}  # 单层=1层、双层=2层
 SHEET_RE = re.compile(r"(\d+)\s*(抽|张)")
 
 
+def compare_spec_selection(
+    a: dict[str, Any] | None,
+    b: dict[str, Any] | None,
+    *,
+    expected_product_id: str | None = None,
+) -> dict[str, Any]:
+    """Compare two structured selections (spec-selection-v1) group by group.
+
+    Groups are matched by group_key (title, else option-set), never by position
+    or by joined/deduplicated text. Returns status MATCH / MISMATCH / UNKNOWN
+    with reasons; anything but MATCH must stay 待复核.
+    """
+    out: dict[str, Any] = {"status": "UNKNOWN", "reasons": [], "groups": []}
+    if not isinstance(a, dict) or not isinstance(b, dict) or not a.get("groups") or not b.get("groups"):
+        out["reasons"].append("缺少分组选择证据")
+        return out
+
+    def no_options(sel: dict[str, Any]) -> bool:
+        # Spec area present but no option was captured: NOT an empty selection.
+        # A group with a selected value has evidently captured options.
+        return all(
+            not (g.get("option_texts") or []) and not (g.get("selected") or [])
+            for g in sel.get("groups") or []
+        )
+
+    na, nb = no_options(a), no_options(b)
+    if na or nb:
+        # Product identity is still checked first; missing options never match.
+        pa0, pb0 = str(a.get("url_product_id") or ""), str(b.get("url_product_id") or "")
+        if pa0 and pb0 and (pa0 != pb0 or (expected_product_id and pa0 != str(expected_product_id))):
+            out["status"] = "MISMATCH"
+            out["reasons"].append(f"商品ID不同: {pa0} vs {pb0}")
+            return out
+        out["status"] = "OPTIONS_NOT_CAPTURED"
+        out["reasons"].append("规格选项未采到" + ("（双方）" if na and nb else "（前者）" if na else "（后者）"))
+        return out
+    pa, pb = str(a.get("url_product_id") or ""), str(b.get("url_product_id") or "")
+    if not pa or pa != pb or (expected_product_id and pa != str(expected_product_id)):
+        out["status"] = "MISMATCH"
+        out["reasons"].append(f"商品ID不同: {pa or '空'} vs {pb or '空'}" + (
+            f"（目标 {expected_product_id}）" if expected_product_id else ""))
+        return out
+
+    def index(sel: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        keys = [str(g.get("group_key") or "") for g in sel["groups"]]
+        dup = sorted({k for k in keys if keys.count(k) > 1 or not k})
+        return {str(g.get("group_key") or ""): g for g in sel["groups"]}, dup
+
+    ia, da = index(a)
+    ib, db = index(b)
+    if da or db:
+        out["reasons"].append(f"组身份不唯一或为空: {da or db}")
+        return out
+    only_a, only_b = sorted(set(ia) - set(ib)), sorted(set(ib) - set(ia))
+    if only_a or only_b:
+        out["reasons"].append(f"规格组不一致（缺组/多组）: 仅前者 {only_a} 仅后者 {only_b}")
+        return out
+    changed = False
+    for k in sorted(ia):
+        sa, sb = list(ia[k].get("selected") or []), list(ib[k].get("selected") or [])
+        rec = {"group_key": k, "dimension": ia[k].get("dimension"), "a": sa, "b": sb}
+        out["groups"].append(rec)
+        if len(sa) != 1 or len(sb) != 1:
+            out["reasons"].append(f"组 {k} 选中项不明确: {sa} / {sb}")
+            return out
+        if sa != sb:
+            changed = True
+            out["reasons"].append(f"组 {k} 选中值变化: {sa[0]} → {sb[0]}")
+    out["status"] = "MISMATCH" if changed else "MATCH"
+    return out
+
+
 def parse_spec_tokens(text: str | None) -> dict[str, Any]:
     t = (text or "").strip()
     out: dict[str, Any] = {

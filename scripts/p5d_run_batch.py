@@ -715,6 +715,63 @@ def _row_is_session_pause(r: dict[str, Any]) -> bool:
     )
 
 
+BROWSER_READ_PAUSE_PREFIX = "BROWSER_READ_ERROR_REPEATED"
+_REGION_READ_FAIL = {"DISCOVER_SYNC_REFUSED", "DISCOVER_EVAL_ERROR", "BOX_STALE_BEFORE_SCREENSHOT",
+                     "BOX_REFRESH_FAILED", "SCREENSHOT_RECEIPT_UNAVAILABLE", "BOX_NOT_CONFIRMED_UNDER_RECEIPT"}
+# Diagnostic-only regions never count as business evidence; NOT_FOUND is "no such region", not a read.
+_NON_EVIDENCE_REGIONS = {"viewport_diagnostic"}
+
+
+def candidate_browser_read_failure(candidate_run_dir: str | None) -> str | None:
+    """Browser-side read failure of ONE visited candidate (not product-evidence shortage).
+
+    Returns an error class, or None when the page produced usable capture evidence or the
+    failure is a session block (login / verification / rate limit, handled by the pause path).
+    """
+    if not candidate_run_dir:
+        return None
+    meta_p = Path(candidate_run_dir) / "capture" / "metadata.json"
+    if not meta_p.is_file():
+        return "CAPTURE_METADATA_MISSING"
+    try:
+        meta = read_json(meta_p)
+    except (OSError, json.JSONDecodeError):
+        return "CAPTURE_METADATA_UNREADABLE"
+    ident = meta.get("identity") if isinstance(meta.get("identity"), dict) else {}
+    reason = str(ident.get("reason") or "")
+    if reason in {"LOGIN_REQUIRED", "VERIFICATION_REQUIRED", "DETAIL_RATE_LIMITED"}:
+        return None
+    if reason == "OBSERVATION_FAILED":
+        return "PAGE_CLASSIFY_OBSERVATION_FAILED"
+    if meta.get("images"):
+        return None  # evidence was captured; any shortage is product evidence, not browser reading
+    regions = meta.get("regions") if isinstance(meta.get("regions"), dict) else {}
+    sts = {str((r or {}).get("status") or "") for k, r in regions.items()
+           if isinstance(r, dict) and k not in _NON_EVIDENCE_REGIONS}
+    sts.discard("NOT_FOUND")
+    if sts and sts <= _REGION_READ_FAIL:
+        return "REGION_READ_REFUSED"
+    if str(meta.get("capture_status") or meta.get("overall_capture_status") or "").upper() == "FAILED" and not ident.get("ok"):
+        return "CAPTURE_FAILED_BEFORE_IDENTITY"
+    return None
+
+
+def sku_browser_read_failure(result: dict[str, Any]) -> dict[str, Any] | None:
+    """A SKU 'cannot collect evidence because of browser reading' only if it visited at least
+    one detail page and EVERY visited candidate failed with the same browser-read class."""
+    visited = [r for r in (result.get("product_rows") or [])
+               if r.get("candidate_run_dir") and r.get("execution_status") not in {
+                   p5b.STATUS_CLASSIFICATION_SKIPPED, p5b.STATUS_NOT_VISITED_BUDGET,
+                   p5b.STATUS_NOT_VISITED_NOT_EXACT, "NOT_VISITED_SESSION_PAUSE"}]
+    if not visited:
+        return None
+    classes = [candidate_browser_read_failure(r.get("candidate_run_dir")) for r in visited]
+    if all(classes) and len(set(classes)) == 1:
+        return {"class": classes[0], "visited": len(visited),
+                "candidates": [str(r.get("jd_product_id")) for r in visited]}
+    return None
+
+
 def prepare_resume_checkpoint(batch_dir: Path, checkpoint: dict[str, Any]) -> list[str]:
     """
     Validate a checkpoint before resuming. Never writes to disk.
@@ -786,6 +843,7 @@ def run_batch(
     model_scope_policy: Path | None = None,
     exact_model_only: bool = False,
     focus_window: bool = False,
+    stop_on_repeated_browser_read_error: bool = False,
 ) -> dict[str, Any]:
     excel_path = Path(excel_path).resolve()
     parsed = excel_in.parse_batch_excel(excel_path)
@@ -849,6 +907,7 @@ def run_batch(
     lock = BatchLock(batch_dir)
     lock.acquire()
     detail_used_total = 0
+    prev_read_failure: dict[str, Any] | None = None
     item_results: list[dict[str, Any]] = []
     # Load prior results for DONE items when resuming
     prior_results_path = batch_dir / "item_results.json"
@@ -1095,6 +1154,16 @@ def run_batch(
                     "products_possible_break": summary.get("products_possible_break"),
                 }
                 cp_item["error"] = None
+                if stop_on_repeated_browser_read_error and status == "DONE":
+                    rf = sku_browser_read_failure(result)
+                    cp_item["browser_read_failure"] = rf
+                    ir["browser_read_failure"] = rf
+                    if rf and prev_read_failure and rf["class"] == prev_read_failure["class"]:
+                        # Two consecutive SKUs could not collect evidence for the SAME browser
+                        # reason: keep results, stop here (resumable), do not retry.
+                        checkpoint["status"] = "PAUSED_SESSION"
+                        checkpoint["pause_reason"] = f"{BROWSER_READ_PAUSE_PREFIX}:{rf['class']}"
+                    prev_read_failure = rf
             except Exception as exc:  # noqa: BLE001
                 err = f"{type(exc).__name__}: {exc}"
                 print(f"item failed: {err}")
@@ -1884,6 +1953,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="只对标题含完整型号的候选打开详情；其余记 NOT_VISITED_NOT_EXACT_MODEL（默认关闭）",
     )
+    p.add_argument(
+        "--stop-on-repeated-browser-read-error",
+        action="store_true",
+        help="连续 2 条 SKU 因同一类浏览器读取错误（非商品证据不足）无法采证时，保存结果并暂停（可续跑）；默认关闭",
+    )
     p.add_argument("--self-check", action="store_true")
     p.add_argument(
         "--rerender-batch-dir",
@@ -1959,6 +2033,7 @@ def main(argv: list[str] | None = None) -> int:
             focus_window=bool(args.focus_window),
             model_scope_policy=args.model_scope_policy,
             exact_model_only=bool(args.exact_model_only),
+            stop_on_repeated_browser_read_error=bool(args.stop_on_repeated_browser_read_error),
         )
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         print(f"错误: {exc}")

@@ -45,7 +45,7 @@ import p5_bsk_detail as bd  # noqa: E402
 import p5_bsk_runtime as rt  # noqa: E402
 
 PROBE_ROOT = PROJECT_ROOT / "artifacts" / "param_probes"
-RULES_VERSION = "p5k-params-probe-v2.2"
+RULES_VERSION = "p5k-params-probe-v2.3"
 MAX_SCROLL_STEPS = 10
 TAB_TEXTS = ("规格与包装", "商品参数", "规格参数", "参数")
 HEADINGS = ("规格参数", "商品参数", "规格与包装", "产品参数", "参数信息")
@@ -247,9 +247,31 @@ def params_capture(*, client: Any, session_id: str, out_dir: Path, cooperate_pol
     scans: list[dict[str, Any]] = []
     actions: dict[str, Any] = {"scroll_steps": 0, "tab_clicks": 0, "expand_clicks": 0}
     state = {"summary_found": False, "expand_entry_found": False, "expand_clicked": False,
-             "expand_confirmed": False, "full_text_read": False, "required_fields_found": False}
+             "expand_confirmed": False, "full_text_read": False, "required_fields_found": False,
+             "login_required": False}
     summary = None
     stopped_on_error = None
+    login_checks: list[dict[str, Any]] = []
+
+    def login_stop(stage: str) -> dict[str, Any] | None:
+        lw = bd.check_login_wall(client, session_id, cooperate_policy=cooperate_policy)
+        login_checks.append({"stage": stage, "login_wall": lw.get("login_wall"), "checked": lw.get("checked"),
+                             "covering": lw.get("covering")})
+        if not lw.get("login_wall"):
+            return None
+        state["login_required"] = True
+        conclusion = f"需要登录（{stage}检测到登录弹窗）：全文未读到"
+        payload = {"rules_version": RULES_VERSION, "product_id": product_id,
+                   "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "state": state, "conclusion": conclusion, "actions": actions, "login_checks": login_checks,
+                   "summary_block": _top(summary) if summary else None, "scans": scans, "eval_log": log,
+                   "note": "登录拦截：不点击、不关闭弹窗、不自动登录；本次参数结果不进入比价验收"}
+        bd.write_json(out_dir / "params_probe.json", payload)
+        return {"conclusion": conclusion, "state": state, "actions": actions, "crop_status": None, "viewport_shot_ok": None}
+
+    stop = login_stop("探针开始")
+    if stop:
+        return stop
 
     def scan(stage: str) -> dict[str, Any] | None:
         nonlocal stopped_on_error
@@ -302,6 +324,9 @@ def params_capture(*, client: Any, session_id: str, out_dir: Path, cooperate_pol
             actions["expand_clicks"] = 1
             state["expand_clicked"] = True
             client.run(["wait-ms", "1500"], timeout=15)
+            stop = login_stop("点击查看全部参数后")
+            if stop:
+                return stop
             for i in range(3):  # re-read only (no further clicks)
                 v = scan(f"scan_after_expand_{i}")
                 b = _top(v)
@@ -360,7 +385,11 @@ def params_capture(*, client: Any, session_id: str, out_dir: Path, cooperate_pol
         "scans": scans,
         "eval_log": log,
         "screenshots": {"crop_status": (crop or {}).get("status"), "crop_viewport_shot": (crop or {}).get("viewport_shot"),
-                        "viewport": vp},
+                        "crop_evidence_valid": (crop or {}).get("evidence_valid"),
+                        "crop_evidence_invalid_reason": (crop or {}).get("evidence_invalid_reason"),
+                        "crop_visibility": (crop or {}).get("visibility"),
+                        "viewport": vp, "viewport_note": "整页视口图仅作诊断，不作为参数证据"},
+        "login_checks": login_checks,
         "note": "raw evidence only; binding to current SKU/option and price is judged separately",
     }
     bd.write_json(out_dir / "params_probe.json", payload)
@@ -401,6 +430,9 @@ def run_self_check() -> list[str]:
                     if isinstance(v, dict) and v.get("code"):
                         return {"ok": False, "exit_code": 1, "data": v}
                     return {"ok": True, "data": {"value": v}}
+                if expr == bd.LOGIN_WALL_JS:
+                    wall = bool(self.walls.pop(0)) if getattr(self, "walls", None) else False
+                    return {"ok": True, "data": {"value": {"ok": True, "login_wall": wall, "covering": {"markers": ["扫码登录", "短信登录"]} if wall else None}}}
                 if expr == MARK_TAB_JS:
                     return {"ok": True, "data": {"value": {"ok": False, "reason": "no_tab"}}}
                 return {"ok": True, "data": {"value": {"ok": True}}}
@@ -456,6 +488,20 @@ def run_self_check() -> list[str]:
             r = params_capture(client=f, session_id="S", out_dir=out, cooperate_policy="strict", product_id="1")
             if f.clicks() or r["state"]["summary_found"]:
                 fails.append(f"G non-sync error must stop without clicks: {r}")
+        with tempfile.TemporaryDirectory() as td2:
+            # J) login wall appears only after the expand click -> stop, no rescans, no crop
+            f = Fake([summ])
+            f.walls = [False, True]
+            r = params_capture(client=f, session_id="S", out_dir=Path(td2), cooperate_policy="strict", product_id="1")
+            scans_after = sum(1 for c in f.calls if c and c[0] == "evaluate" and c[3] == PARAMS_SCAN_JS)
+            if not r["state"]["login_required"] or r["state"]["full_text_read"] or f.clicks() != 1 or scans_after != 1 or "需要登录" not in r["conclusion"]:
+                fails.append(f"J login after click must stop: {r} clicks={f.clicks()} scans={scans_after}")
+            # K) login wall at probe start -> nothing scanned or clicked
+            f = Fake([summ])
+            f.walls = [True]
+            r = params_capture(client=f, session_id="S", out_dir=Path(td2), cooperate_policy="strict", product_id="1")
+            if not r["state"]["login_required"] or f.clicks() or any(c and c[0] == "evaluate" and c[3] == PARAMS_SCAN_JS for c in f.calls):
+                fails.append(f"K login at start must stop before scanning: {r}")
         # H) field matcher: '50张' under a generic key is NOT a per-pack field; '72包' alone NOT per-box
         fr = required_fields([{"k": "规格", "v": "2层50张"}, {"k": "包装", "v": "72包"}])
         if fr["sheets_per_pack"] or fr["layers"] or fr["packs_per_box"] or len(fr["spec_like_values"]) != 2:

@@ -421,6 +421,9 @@ def resolve_registered_images(
                 errors.append(f"图片路径越界已拒绝: {raw_path or filename}")
                 continue
 
+            if entry.get("evidence_valid") is False:
+                warnings.append(f"images[{filename}] 截图证据无效，跳过")
+                continue
             role = entry.get("role") or role_from_filename(str(filename))
             item = {
                 "filename": str(filename),
@@ -444,6 +447,11 @@ def resolve_registered_images(
             filename = entry.get("filename")
             if not filename:
                 warnings.append(f"regions.{region_key} 无 filename，跳过")
+                continue
+            if entry.get("evidence_valid") is False:
+                warnings.append(
+                    f"regions.{region_key} 截图证据无效（{entry.get('evidence_invalid_reason')}），跳过"
+                )
                 continue
             if status not in CAPTURED_STATUSES:
                 warnings.append(

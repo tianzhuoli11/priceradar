@@ -45,6 +45,142 @@ CAPTURE_METHOD_VOM_ELEMENT = "bsk_dom_vom_element"
 # Desktop first — do not silently rewrite to m.jd.
 DESKTOP_ITEM_TMPL = "https://item.jd.com/{pid}.html"
 
+# ---------------------------------------------------------------------------
+# Login wall on the product page + region occlusion (evidence validity).
+# A login wall = a VISIBLE overlay-like element (fixed/absolute or dialog/modal
+# class), covering >= 15% of the viewport, whose text has >= 2 distinct login
+# markers, and which actually wins a hit-test at a product-area point.
+# Header "你好，请登录", hidden login widgets and single-marker promos do not count.
+# ---------------------------------------------------------------------------
+LOGIN_MARKERS_JS = (
+    r"/(扫码登录|手机扫码|密码登录|短信登录|账户登录|账号登录|获取验证码|请输入手机号|"
+    r"请输入验证码|立即登录|企业用户登录|微信登录|QQ登录|忘记密码)/g"
+)
+
+# Shared JS helpers (inlined into evaluate expressions).
+PR_DOM_HELPERS_JS = r"""
+  const __prLoginRe = %s;
+  const __prVis = (e) => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0.05; };
+  const __prLoginMarkers = (e) => Array.from(new Set(((e.innerText || '').match(__prLoginRe) || [])));
+  const __prOverlayLike = (e) => { const s = getComputedStyle(e);
+    return s.position === 'fixed' || s.position === 'absolute' || e.getAttribute('role') === 'dialog'
+      || /modal|dialog|popup|login|layer|mask|drawer/i.test(String(e.className || '')); };
+  const __prLoginContainer = (el) => {
+    for (let n = el; n && n !== document.body; n = n.parentElement) {
+      if (__prOverlayLike(n) && __prVis(n) && __prLoginMarkers(n).length >= 2) return n;
+    }
+    return null;
+  };
+  const __prDesc = (el) => el ? { tag: el.tagName, cls: String(el.className || '').slice(0, 80),
+    text: String(el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80) } : null;
+  // Hit-test centre + inner corners (inset 20%%) of the target, inside the viewport only.
+  const __prHitTest = (target) => {
+    const r = target.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const pts = [[0.5, 0.5], [0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]]
+      .map(([fx, fy]) => [r.left + r.width * fx, r.top + r.height * fy]);
+    const out = []; let inVp = 0, self = 0, login = null, cover = null;
+    for (const [x, y] of pts) {
+      const iv = x >= 0 && y >= 0 && x < vw && y < vh;
+      if (!iv) { out.push({ x, y, in_viewport: false }); continue; }
+      inVp++;
+      const el = document.elementFromPoint(x, y);
+      const ok = !!el && (el === target || target.contains(el));
+      if (ok) self++;
+      else if (el) { const lc = __prLoginContainer(el); if (lc && !login) login = lc; if (!cover) cover = el; }
+      out.push({ x: Math.round(x), y: Math.round(y), in_viewport: true, hit_self: ok, hit: ok ? null : __prDesc(el) });
+    }
+    let status = 'VISIBLE';
+    if (inVp === 0) status = 'UNCONFIRMED';
+    else if (login) status = 'LOGIN_OVERLAY';
+    else if (self < inVp) status = 'OCCLUDED';
+    return { status, points: out, in_viewport_points: inVp, self_hits: self,
+             covering: __prDesc(cover), login_container: login ? { ...__prDesc(login), markers: __prLoginMarkers(login) } : null };
+  };
+""" % LOGIN_MARKERS_JS
+
+LOGIN_WALL_JS = r"""(() => {
+""" + PR_DOM_HELPERS_JS + r"""
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const cands = [];
+  for (const e of Array.from(document.querySelectorAll('body *'))) {
+    if (!__prOverlayLike(e) || !__prVis(e)) continue;
+    const r = e.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+    const frac = (w * h) / (vw * vh);
+    if (frac < 0.15) continue;
+    const markers = __prLoginMarkers(e);
+    if (markers.length < 2) continue;
+    cands.push({ e, frac, markers, r });
+  }
+  cands.sort((a, b) => b.frac - a.frac);
+  const probes = [[0.5, 0.5], [0.35, 0.4], [0.65, 0.4], [0.5, 0.3]].map(([fx, fy]) => [vw * fx, vh * fy]);
+  let covering = null;
+  for (const c of cands) {
+    const hitPts = probes.filter(([x, y]) => { const el = document.elementFromPoint(x, y); return el && (el === c.e || c.e.contains(el)); });
+    if (hitPts.length) { covering = { ...__prDesc(c.e), markers: c.markers, viewport_fraction: Math.round(c.frac * 100) / 100,
+      box: { x: c.r.x, y: c.r.y, w: c.r.width, h: c.r.height }, hit_points: hitPts.length }; break; }
+  }
+  return { ok: true, login_wall: !!covering, covering, overlay_candidates: cands.length,
+           header_login_hint: /你好，请登录/.test(document.body.innerText || ''), href: location.href };
+})()"""
+
+
+def region_box_js(mark_key: str, selector: Any) -> str:
+    """Element position re-read + hit test (used under the screenshot receipt)."""
+    return f"""(() => {{
+{PR_DOM_HELPERS_JS}
+      const el = document.querySelector('[data-pr-region="{mark_key}"]')
+        || document.querySelector({json.dumps(selector)});
+      if (!el) return {{ ok: false, reason: 'element_missing' }};
+      const r = el.getBoundingClientRect();
+      return {{
+        ok: true,
+        text: String(el.innerText||'').replace(/\\s+/g,' ').trim().slice(0,240),
+        box: {{ x:r.x, y:r.y, w:r.width, h:r.height, width:r.width, height:r.height }},
+        dpr: window.devicePixelRatio || 1,
+        hit: __prHitTest(el),
+      }};
+    }})()"""
+
+
+EVIDENCE_REASON_ZH = {
+    "VISIBLE": None,
+    "LOGIN_OVERLAY": "需要登录：登录弹窗遮挡目标区域",
+    "OCCLUDED": "区域被遮挡",
+    "UNCONFIRMED": "可见性未确认",
+}
+
+
+def _direct_eval_with_receipt(client: Any, session_id: str, expression: str, receipt: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+    """Evaluate bound to an existing receipt WITHOUT any new sync (does not refresh the observation)."""
+    from p5_bsk_runtime import _append_cooperate_receipt  # noqa: PLC0415
+
+    args = ["evaluate", "--session", session_id, expression]
+    _append_cooperate_receipt(args, receipt, include_observation=bool(receipt.get("observation_id")))
+    res = client.run(args, timeout=60)
+    data = res.get("data")
+    val = data.get("value") if isinstance(data, dict) and "value" in data else data
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except json.JSONDecodeError:
+            pass
+    return eval_value_or_error({"ok": res.get("ok"), "value": val, "raw": sanitize(res)})
+
+
+def check_login_wall(client: Any, session_id: str, *, cooperate_policy: str) -> dict[str, Any]:
+    """Read-only login-wall check (one resync on a sync refusal). Never clicks or closes."""
+    val, err = eval_value_or_error(eval_json(client, session_id, LOGIN_WALL_JS, cooperate_policy=cooperate_policy))
+    if err and is_sync_required_error(err):
+        cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
+        val, err = eval_value_or_error(eval_json(client, session_id, LOGIN_WALL_JS, cooperate_policy=cooperate_policy))
+    if err or not isinstance(val, dict):
+        return {"login_wall": False, "checked": False, "error": sanitize(err)}
+    return {"login_wall": bool(val.get("login_wall")), "checked": True, **sanitize(val)}
+
 CLASSIFY_PAGE_JS = r"""(() => {
   const href = String(location.href || '');
   const path = String(location.pathname || '');
@@ -254,7 +390,48 @@ DISCOVER_REGIONS_JS = r"""(() => {
   };
 })()"""
 
-SELECTION_STATE_JS = r"""(() => {
+# Shared "current selected spec" reader (all spec groups). Inlined into BOTH the
+# selection snapshot and the price-role probe so each reads the live page itself
+# with identical rules. group_key = group title when present, else the sorted
+# set of that group's option texts (order-independent; distinct groups stay
+# distinct even when they share an option text).
+SPEC_SELECTION_READER_JS = r"""
+  const __prReadSpecSelection = () => {
+    const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+    const SEL = /specification-item-sku--selected|--selected\b/;
+    const m = String(location.href || '').match(/item\.jd\.com\/(\d+)\.html/i);
+    const root = document.querySelector('.page-right-spec');
+    const out = { schema: 'spec-selection-v1', url_product_id: m ? m[1] : null, root_present: !!root, groups: [] };
+    if (!root) return out;
+    const gEls = Array.from(root.querySelectorAll('.specification-group'));
+    const scan = gEls.length ? gEls : [root];
+    scan.forEach((g, i) => {
+      const titleEl = g.querySelector('.specification-group-title, .specification-group-name, .title');
+      const dim = titleEl ? norm(titleEl.innerText || titleEl.textContent) : null;
+      const opts = Array.from(g.querySelectorAll('.specification-item-sku')).map((el) => ({
+        text: norm(el.innerText || el.textContent).slice(0, 120),
+        selected: SEL.test(String(el.className || ''))
+          || ['aria-checked', 'aria-selected', 'aria-pressed'].some((a) => el.getAttribute(a) === 'true'),
+      })).filter((o) => o.text);
+      const optionTexts = Array.from(new Set(opts.map((o) => o.text))).sort();
+      out.groups.push({
+        index: i,
+        dimension: dim || null,
+        group_key: dim ? ('dim:' + dim) : ('opts:' + optionTexts.join('‖')),
+        option_texts: optionTexts,
+        selected: opts.filter((o) => o.selected).map((o) => o.text),
+      });
+    });
+    return out;
+  };
+  const __prJoinSelected = (s) => {
+    const parts = [];
+    (s.groups || []).forEach((g) => (g.selected || []).forEach((t) => parts.push(t)));
+    return parts.length ? parts.join(' | ') : null;
+  };
+"""
+
+SELECTION_STATE_JS = r"""(() => {""" + SPEC_SELECTION_READER_JS + r"""
   const textOf = (el) => el ? String(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim() : null;
   const pickId = () => {
     const m = String(location.href||'').match(/item\.jd\.com\/(\d+)\.html/i);
@@ -346,6 +523,7 @@ SELECTION_STATE_JS = r"""(() => {
   const variant_ids = selected_options.map(o => o.variant_id).filter(Boolean);
   return {
     url_product_id: pickId(),
+    spec_selection: __prReadSpecSelection(),
     selected_status,
     selected_spec_text,
     selected_options,
@@ -364,7 +542,7 @@ SELECTION_STATE_JS = r"""(() => {
   };
 })()"""
 
-PRICE_ROLE_EVIDENCE_JS = r"""(() => {
+PRICE_ROLE_EVIDENCE_JS = r"""(() => {""" + SPEC_SELECTION_READER_JS + r"""
   // Same-observation price-role evidence inside the price panel only.
   // Records visible amount nodes, take-home label nodes, DOM adjacency and
   // line-through evidence. Does not infer roles; resolution happens offline.
@@ -372,11 +550,14 @@ PRICE_ROLE_EVIDENCE_JS = r"""(() => {
   const AMT = /^[¥￥]\s*\d+(?:\.\d+)?$/;
   const LABEL = /(到手价|首单|新人|会员|PLUS|plus|券后|预估|优惠后|折后)/;
   const m = String(location.href || '').match(/item\.jd\.com\/(\d+)\.html/i);
-  const sel = document.querySelector('.specification-item-sku--selected');
+  // All spec groups, read independently from the live page at probe time
+  // (previously only the FIRST selected node, which broke multi-group pages).
+  const specSel = __prReadSpecSelection();
   const out = {
     schema: 'price-role-evidence-v1',
     url_product_id: m ? m[1] : null,
-    selected_spec_text: sel ? norm(sel.innerText || sel.textContent) : null,
+    selected_spec_text: __prJoinSelected(specSel),
+    spec_selection: specSel,
     captured_at_ms: Date.now(),
     panel_selector: null,
     panel_text: null,
@@ -1103,19 +1284,8 @@ def capture_region_bsk(
     else:
         time.sleep(0.35)
 
-    # Re-read box after scroll/layout settle (same observation cycle).
-    box_js = f"""(() => {{
-      const el = document.querySelector('[data-pr-region="{mark_key}"]')
-        || document.querySelector({json.dumps(selector)});
-      if (!el) return {{ ok: false, reason: 'element_missing' }};
-      const r = el.getBoundingClientRect();
-      return {{
-        ok: true,
-        text: String(el.innerText||'').replace(/\\s+/g,' ').trim().slice(0,240),
-        box: {{ x:r.x, y:r.y, w:r.width, h:r.height, width:r.width, height:r.height }},
-        dpr: window.devicePixelRatio || 1,
-      }};
-    }})()"""
+    # Re-read box after scroll/layout settle (same observation cycle) + hit test.
+    box_js = region_box_js(mark_key, selector)
     box_info, box_err, box_retried = _eval_with_one_resync(box_js)
     info["box_refresh"] = sanitize(box_info)
     info["box_resync_retry"] = box_retried
@@ -1194,20 +1364,7 @@ def capture_region_bsk(
     else:
         # Box read bound to the SAME receipt via a direct evaluate (eval_json would
         # re-sync when the receipt has no observation id, superseding it).
-        from p5_bsk_runtime import _append_cooperate_receipt  # noqa: PLC0415
-        _args = ["evaluate", "--session", session_id, box_js]
-        _append_cooperate_receipt(_args, sync_vp, include_observation=bool(sync_vp.get("observation_id")))
-        _res = client.run(_args, timeout=60)
-        _data = _res.get("data")
-        _val = _data.get("value") if isinstance(_data, dict) and "value" in _data else _data
-        if isinstance(_val, str):
-            try:
-                _val = json.loads(_val)
-            except json.JSONDecodeError:
-                pass
-        box_info2, box_err2 = eval_value_or_error(
-            {"ok": _res.get("ok"), "value": _val, "raw": sanitize(_res)}
-        )
+        box_info2, box_err2 = _direct_eval_with_receipt(client, session_id, box_js, sync_vp)
         if isinstance(box_info2, dict) and box_info2.get("ok") and isinstance(
             box_info2.get("box"), dict
         ):
@@ -1217,6 +1374,9 @@ def capture_region_bsk(
             info["box_refresh_pre_screenshot"] = sanitize(box_info2)
             info["geometry"]["device_pixel_ratio"] = dpr
             info["geometry"]["box_css"] = live_box
+            if isinstance(box_info2.get("hit"), dict):
+                info["visibility"] = sanitize(box_info2["hit"])
+                info["visibility"]["observation"] = "screenshot_receipt"
         elif box_err2:
             info["status"] = "BOX_STALE_BEFORE_SCREENSHOT"
             info["box_error_pre_screenshot"] = box_err2
@@ -1229,6 +1389,10 @@ def capture_region_bsk(
             info["box_result_pre_screenshot"] = sanitize(box_info2)
             info["note"] = "截图观察下未取得有效元素位置；不使用其他观察的坐标裁切，转入现有兜底"
     info["primary_skipped_reason"] = primary_skip
+    vis_status = str((info.get("visibility") or {}).get("status") or "UNCONFIRMED")
+    if not info.get("visibility"):
+        info["visibility"] = {"status": "UNCONFIRMED", "observation": None,
+                              "note": "未在截图观察下取得命中检测"}
 
     if primary_skip:
         info["viewport_shot"] = {"ok": False, "skipped": primary_skip}
@@ -1298,10 +1462,24 @@ def capture_region_bsk(
         "VOM --ref 仅审计（价区常落到数字子节点，不足以覆盖首单/参考金额）"
     )
 
+    def _evidence(path_ok: bool, vstat: str, source: str) -> None:
+        # Three separate facts: BSK screenshot command result / image file / evidence validity.
+        cmd = info.get("viewport_shot") if source == "primary_crop" else info.get("screenshot_fallback_ref")
+        info["screenshot_command_ok"] = bool((cmd or {}).get("ok"))
+        info["image_file"] = str(out_path) if out_path.is_file() else None
+        info["evidence_valid"] = bool(path_ok and vstat == "VISIBLE")
+        info["evidence_source"] = source
+        info["evidence_invalid_reason"] = None if info["evidence_valid"] else (
+            EVIDENCE_REASON_ZH.get(vstat) or ("截图未成功" if not path_ok else "可见性未确认")
+        )
+        if vstat == "LOGIN_OVERLAY":
+            info["login_overlay"] = True
+
     if crop.get("ok") and out_path.is_file():
         info["status"] = "CAPTURED"
         info["file_bytes"] = out_path.stat().st_size
         info["capture_method"] = CAPTURE_METHOD_DOM_BOX_CROP
+        _evidence(True, vis_status, "primary_crop")
         # Guard: price/title crop should not be tiny leaf-sized if discover was wide.
         disc_box = discover.get("box") if isinstance(discover.get("box"), dict) else {}
         try:
@@ -1318,6 +1496,12 @@ def capture_region_bsk(
             pass
         return info
 
+    _evidence(False, vis_status, "primary_crop")
+    if vis_status in {"OCCLUDED", "LOGIN_OVERLAY"}:
+        # A covered region cannot be made valid by another screenshot.
+        info["status"] = "SCREENSHOT_FAILED" if not out_path.is_file() else info.get("status") or "SCREENSHOT_FAILED"
+        info["fallback"] = "skipped_region_covered"
+        return info
     # Fallback: element ref (may be leaf) — last resort, annotated.
     if not ref:
         info["status"] = "SCREENSHOT_FAILED"
@@ -1337,6 +1521,14 @@ def capture_region_bsk(
     )
     time.sleep(0.3)
     sync_shot = cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
+    fb_vis = "UNCONFIRMED"
+    if sync_shot.get("context_id"):
+        fb_box, fb_err = _direct_eval_with_receipt(client, session_id, box_js, sync_shot)
+        if isinstance(fb_box, dict) and isinstance(fb_box.get("hit"), dict):
+            info["fallback_visibility"] = sanitize(fb_box["hit"])
+            fb_vis = str(fb_box["hit"].get("status") or "UNCONFIRMED")
+        else:
+            info["fallback_visibility"] = {"status": "UNCONFIRMED", "error": sanitize(fb_err)}
     shot = screenshot_session(
         client,
         session_id,
@@ -1352,8 +1544,10 @@ def capture_region_bsk(
     if shot.get("ok") and out_path.is_file():
         info["status"] = "CAPTURED_REF_FALLBACK"
         info["file_bytes"] = out_path.stat().st_size
+        _evidence(True, fb_vis, "fallback_ref")
     else:
         info["status"] = "SCREENSHOT_FAILED"
+        _evidence(False, fb_vis, "fallback_ref")
     return info
 
 
@@ -1402,6 +1596,63 @@ def offline_self_checks() -> list[str]:
     except Exception as exc:  # noqa: BLE001
         failures.append(f"crop helper offline check: {exc}")
     return failures
+
+
+def discover_regions_with_one_resync(
+    client: Any, session_id: str, *, cooperate_policy: str
+) -> tuple[Any, dict[str, Any] | None, dict[str, Any]]:
+    """Region discovery. ONLY a sync-required refusal gets one settled resync and
+    one re-read bound to that receipt; anything else (login / verification / rate
+    limit / disconnect / other) is returned unchanged, with no retry.
+    A persistent refusal keeps the original diagnostics (never "no region")."""
+    discover, err = eval_value_or_error(
+        eval_json(client, session_id, DISCOVER_REGIONS_JS, cooperate_policy=cooperate_policy, cooperate_settle=True)
+    )
+    info: dict[str, Any] = {"attempted": False}
+    if err and is_sync_required_error(err):
+        s = cooperate_sync(client, session_id, policy=cooperate_policy, settle=True)
+        info = {"attempted": True, "sync_ok": bool(s.get("context_id")), "first_error": sanitize(err),
+                "sync_error": None if s.get("context_id") else sanitize(s.get("raw"))}
+        if s.get("context_id"):
+            discover, err = _direct_eval_with_receipt(client, session_id, DISCOVER_REGIONS_JS, s)
+        info["recovered"] = err is None
+        if err:
+            info["second_error"] = sanitize(err)
+    return discover, err, info
+
+
+def login_block_result(
+    result: dict[str, Any],
+    *,
+    stage: str,
+    evidence: dict[str, Any] | None,
+    url: str,
+    keep_session_on_block: bool,
+) -> dict[str, Any]:
+    """Reuse the existing LOGIN_REQUIRED session-block fields for an on-page login wall.
+
+    Evidence captured from this point is excluded from price acceptance (images
+    cleared); diagnostics already written to disk are kept. No click / close / login.
+    """
+    result.update(
+        {
+            "navigation_status": "LOGIN_REQUIRED",
+            "capture_status": "FAILED",
+            "error": "LOGIN_REQUIRED",
+            "session_block": "LOGIN_REQUIRED",
+            "login_wall": {"stage": stage, "evidence": sanitize(evidence), "url_still_detail": True},
+            "images": [],
+            "evidence_after_login_block_excluded": True,
+            "ended_at_utc": utc_iso_now(),
+            "user_action_required": (
+                "商品页出现登录弹窗遮挡（地址栏仍是商品页）。未点击、未关闭、未自动登录；"
+                f"如需继续请人工登录后在同一 Chrome Agent 标签页打开: {url}"
+                if keep_session_on_block
+                else None
+            ),
+        }
+    )
+    return result
 
 
 def run_bsk_detail_capture(
@@ -1672,6 +1923,25 @@ def run_bsk_detail_capture(
 
         result["product_identity_ok"] = True
         result["navigation_status"] = "DETAIL_OK"
+
+        def _stop_on_login(stage: str, evidence: dict[str, Any] | None) -> dict[str, Any]:
+            login_block_result(result, stage=stage, evidence=evidence, url=url,
+                               keep_session_on_block=keep_session_on_block)
+            result["regions"] = locals_regions.get("regions") or result.get("regions")
+            write_json(out_dir / "metadata.json", result)
+            if not keep_session_on_block:
+                stop_session(client, session_id)
+                result["session_stopped"] = True
+            else:
+                result["session_kept_for_manual"] = True
+            return result
+
+        locals_regions: dict[str, Any] = {}
+        lw0 = check_login_wall(client, session_id, cooperate_policy=cooperate_policy)
+        write_json(out_dir / "login_wall_check_start.json", lw0)
+        result["login_wall_checks"] = [{"stage": "capture_start", **{k: lw0.get(k) for k in ("login_wall", "checked")}}]
+        if lw0.get("login_wall"):
+            return _stop_on_login("capture_start", lw0)
         result["identity_scope_note"] = (
             "URL_ID_MATCH 仅表示地址栏商品 ID 与候选一致；"
             "页面标题/规格/价格/店铺仍依赖分区证据。"
@@ -1687,14 +1957,10 @@ def run_bsk_detail_capture(
             client, session_id, cooperate_policy, out_dir / "price_role_evidence_before.json"
         )
 
-        disc_raw = eval_json(
-            client,
-            session_id,
-            DISCOVER_REGIONS_JS,
-            cooperate_policy=cooperate_policy,
-            cooperate_settle=True,
+        discover, disc_err, disc_resync = discover_regions_with_one_resync(
+            client, session_id, cooperate_policy=cooperate_policy
         )
-        discover, disc_err = eval_value_or_error(disc_raw)
+        result["discover_resync"] = disc_resync
         if disc_err:
             discover = {"_discover_eval_error": disc_err}
         if not isinstance(discover, dict):
@@ -1735,7 +2001,8 @@ def run_bsk_detail_capture(
             if not isinstance(d, dict) or d.get("status") != "FOUND":
                 st = region_status_from_discover(d if isinstance(d, dict) else None)
                 if disc_err and st == "NOT_FOUND":
-                    st = "DISCOVER_EVAL_ERROR"
+                    # Discovery itself failed: never report it as "no region".
+                    st = "DISCOVER_SYNC_REFUSED" if is_sync_required_error(disc_err) else "DISCOVER_EVAL_ERROR"
                 regions_out[meta_key] = {
                     "region": meta_key,
                     "filename": filename,
@@ -1760,9 +2027,16 @@ def run_bsk_detail_capture(
             captured["filename"] = filename
             captured["path"] = str(path)
             regions_out[meta_key] = captured
+            locals_regions["regions"] = regions_out
             write_json(out_dir / f"region_{meta_key}.json", captured)
+            if captured.get("login_overlay"):
+                return _stop_on_login(f"region_{meta_key}", captured.get("visibility"))
             cap_st = str(captured.get("status") or "")
-            if cap_st in {"CAPTURED", "CAPTURED_REF_FALLBACK"} and path.is_file():
+            if (
+                cap_st in {"CAPTURED", "CAPTURED_REF_FALLBACK"}
+                and path.is_file()
+                and captured.get("evidence_valid") is True
+            ):
                 images_list.append(
                     {
                         "filename": filename,
@@ -1786,6 +2060,12 @@ def run_bsk_detail_capture(
             regions_out["viewport_diagnostic"] = vp
             write_json(out_dir / "region_viewport_diagnostic.json", vp)
 
+        lw1 = check_login_wall(client, session_id, cooperate_policy=cooperate_policy)
+        write_json(out_dir / "login_wall_check_after_regions.json", lw1)
+        result["login_wall_checks"].append({"stage": "after_regions", **{k: lw1.get(k) for k in ("login_wall", "checked")}})
+        if lw1.get("login_wall"):
+            return _stop_on_login("after_regions", lw1)
+
         if extra_capture is not None:
             try:
                 result["extra_capture"] = sanitize(
@@ -1799,6 +2079,11 @@ def run_bsk_detail_capture(
                 )
             except Exception as exc:  # noqa: BLE001 - record, keep capture
                 result["extra_capture"] = {"status": "EXCEPTION", "error": f"{type(exc).__name__}: {exc}"}
+            lw2 = check_login_wall(client, session_id, cooperate_policy=cooperate_policy)
+            write_json(out_dir / "login_wall_check_after_extra.json", lw2)
+            result["login_wall_checks"].append({"stage": "after_extra_capture", **{k: lw2.get(k) for k in ("login_wall", "checked")}})
+            if lw2.get("login_wall"):
+                return _stop_on_login("after_extra_capture", lw2)
         selection_after, sel_after_err, _sel_a_retry = eval_selection_state_with_one_resync(
             client, session_id, cooperate_policy=cooperate_policy
         )
@@ -1817,6 +2102,13 @@ def run_bsk_detail_capture(
             consistency["spec_unchanged"] = (
                 selection_before.get("selected_spec_text") == selection_after.get("selected_spec_text")
             )
+            _sb, _sa = selection_before.get("spec_selection"), selection_after.get("spec_selection")
+            if isinstance(_sb, dict) and isinstance(_sa, dict) and _sb.get("groups") and _sa.get("groups"):
+                from priceradar_selected_spec import compare_spec_selection  # noqa: PLC0415
+
+                _cmp = compare_spec_selection(_sb, _sa, expected_product_id=pid)
+                consistency["spec_selection_compare"] = _cmp
+                consistency["spec_unchanged"] = _cmp["status"] == "MATCH"
             b_status = selection_before.get("selected_status")
             a_status = selection_after.get("selected_status")
             if (
@@ -1828,6 +2120,13 @@ def run_bsk_detail_capture(
                 )
             ):
                 consistency["spec_evidence"] = "SELECTED_SPEC_UNKNOWN"
+            elif consistency.get("spec_selection_compare") is not None:
+                _st = consistency["spec_selection_compare"]["status"]
+                consistency["spec_evidence"] = (
+                    "OBSERVED_CONSISTENT" if _st == "MATCH"
+                    else "SELECTED_OPTION_CHANGED" if _st == "MISMATCH"
+                    else "SELECTED_SPEC_UNKNOWN"
+                )
             elif selection_before.get("selected_spec_text") != selection_after.get(
                 "selected_spec_text"
             ) or (
